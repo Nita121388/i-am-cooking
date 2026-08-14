@@ -7,7 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
-- **user-editable rules**: `/i-am-cooking rules` + `/i-am-cooking edit-rules`; rules live in `~/.pi/i-am-cooking-rules.md`, read fresh every turn, fall back to built-in defaults, guard rail always appended
+- **autonomy levels**: `conservative`（遇墙就喊）/ `balanced`（有点难度才喊，默认）/ `autonomous`（能不喊就不喊）— 控制遇到阻塞（人类墙：验证码/登录/手动点击等）时 agent 该不该喊用户。`/i-am-cooking level` 命令 + `set_autonomy_level` tool + 文字匹配保险丝 + `on` 备注均可切换；持久化到 config.json；`agent_settled` 安全网在 autonomous 等级下不再自动喊普通问题（报错仍喊）。
+
+### Changed
+- **single-rule model**: rules are now ONE fully-editable file (`~/.pi/i-am-cooking/rules.md`) instead of separate built-in + user layers; the built-in default lives in the repo at `extensions/i-am-cooking/rules.default.md` (source of truth, ships with the plugin) and is only copied into the user file on first run. Added `/i-am-cooking reset-rules` to restore the factory default.
+- **user-editable rules**: `/i-am-cooking rules` + `/i-am-cooking edit-rules`; rules live in `~/.pi/i-am-cooking/rules.md`, read fresh every turn, guard rail always appended
 
 ## [0.1.0] - 2025-07-08
 

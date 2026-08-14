@@ -11,6 +11,9 @@
  *   /i-am-cooking off         — 我回来了（agent 收到"我不在时喊了你X件事"的汇报）
  *   /i-am-cooking status      — 查看模式/待处理呼喊/通道状态
  *   /i-am-cooking test        — 测试所有通道（不用先开模式）
+ *   /i-am-cooking rules       — 查看当前生效规则
+ *   /i-am-cooking edit-rules  — 编辑规则文件（保存即生效）
+ *   /i-am-cooking reset-rules — 规则恢复出厂默认（内置规则）
  *
  * 工具 (LLM 调用):
  *   shout_for_user           — 卡住且只有用户能解决时调用
@@ -37,29 +40,50 @@ const execFileAsync = promisify(execFile);
 const HOME       = homedir();
 // scripts 与 index.ts 同目录：本地开发 / pi install / git clone 任何安装方式都能正确定位
 const SCRIPTS    = fileURLToPath(new URL("./scripts", import.meta.url));
+// 出厂默认规则文件（仓库内，进 git）：随插件版本更新，运行时首次创建用户文件时从它拷贝
+const DEFAULT_RULES_PATH = fileURLToPath(new URL("./rules.default.md", import.meta.url));
 const CONFIG_DIR  = join(HOME, ".pi", "i-am-cooking");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const RULES_PATH  = join(CONFIG_DIR, "rules.md");
 const TMP_DIR     = join(CONFIG_DIR, "tmp");
 
-// ── 内置默认规则（用户规则文件不存在时使用） ────────────────────────────────
-const DEFAULT_RULES = `## 自主推进
-- 能自己决断的就自己决断，采用最合理的默认方案，并在回复里注明你的假设。
-- 不要停下来等，除非真的被卡住。
-
-## 什么时候需要喊我
-- 需要决策 / 凭据 / 审批 / 澄清，且只有我能解决时。
-
-## 完成通知
-- 任务全部完成或达到重要里程碑时通知我（category=completion, urgency=info）。
-- 普通小步骤不值得喊。`;
-
 // 底线规则（不可删除，永远追加在用户规则后面）
 const GUARD_RAIL = "- 绝不要默默结束回合等用户回复。";
+
+// ── 自主等级指南（按当前等级动态注入 system prompt） ───────────────────────
+const AUTONOMY_GUIDE: Record<AutonomyLevel, string> = {
+  conservative: `## 当前自主等级：谨慎（conservative）—— 遇到阻塞就喊我
+- 遇到任何必须人工处理的阻塞（人类墙：验证码 / 登录 / 手动点击 / 真实设备操作等）→ 立即调用 shout_for_user 喊我。
+- 需要决策 / 审批 / 凭据 / 澄清时，先喊我确认，不要擅自选择。
+- 需求模糊、假设不确定时，先问清楚。
+- 自主只做完全确定、无风险的部分。
+- 保证质量：拿不准的方案宁可不做，也不要用降低质量的方式推进。`,
+  balanced: `## 当前自主等级：平衡（balanced）—— 有点难度才喊我（默认）
+- 遇到必须人工处理的阻塞（人类墙：验证码 / 登录 / 手动点击 / 真实设备操作等）→ 调用 shout_for_user 喊我。
+- 普通决策 / 模糊处 / 小选择 → 用最合理的默认方案自主推进，并在回复里注明你的假设。
+- 只有"自主尝试后仍无法推进"或"选错代价很大"时才喊我。
+- 保证质量：自主推进不等于降低标准，拿不准时选最稳妥方案。`,
+  autonomous: `## 当前自主等级：放手（autonomous）—— 能不喊就不喊
+- 尽量不喊我。所有决策、假设、选择自己定，记录在案即可。
+- 只有任务彻底无法继续（无权限 / 外部服务故障 / 违反硬性约束）才调用 shout_for_user 喊我。
+- 保证质量：自主不等于降低标准，拿不准时选最稳妥方案，并在回复里说明。`,
+};
+
+const AUTONOMY_LABEL: Record<AutonomyLevel, string> = {
+  conservative: "谨慎（遇墙就喊）",
+  balanced: "平衡（有点难度才喊，默认）",
+  autonomous: "放手（能不喊就不喊）",
+};
 
 type Urgency = "info" | "normal" | "urgent";
 
 type CallingMode = "normal" | "silence" | "completion_only" | "urgent_only" | "eager";
+
+// 自主等级：遇到阻塞时「该不该喊用户」的阈值
+//   conservative —— 遇墙就喊（人类墙：验证码/登录/手动点击等必须人手动的阻塞）
+//   balanced     —— 有点难度才喊（默认；普通决策自主推进，人类墙/代价大才喊）
+//   autonomous   —— 能不喊就不喊（尽量自决，只有彻底无法继续才喊）
+type AutonomyLevel = "conservative" | "balanced" | "autonomous";
 
 interface Alert {
   id: string;
@@ -104,6 +128,7 @@ interface Config {
   boostVolume: boolean;          // 离开时自动提升系统音量（需用户允许）
   boostLevel: number;            // 提升到多少（0-100，默认 80）
   callingMode: CallingMode;      // 呼喊偏好（agent 依据用户原话动态设置）
+  autonomyLevel: AutonomyLevel;  // 自主等级（持久化；遇到阻塞时该不该喊）
   maxCompletionNotices: number;  // 每次离开最多喊几次完成（防打扰）
   ttsTemplateCompletion: string; // 完成时的 TTS 文案
 }
@@ -135,6 +160,7 @@ const DEFAULTS: Config = {
   boostVolume: false, // 默认关，需在 setup 里允许
   boostLevel: 80,
   callingMode: "normal",
+  autonomyLevel: "balanced", // 默认：有点难度才喊
   maxCompletionNotices: 3,
   ttsTemplateCompletion: "主人，好消息！任务完成了！{message}",
 };
@@ -168,66 +194,72 @@ function pendingAlerts(): Alert[] {
   return config.alerts.filter((a) => !a.acked);
 }
 
-// ── 用户规则加载 ──────────────────────────────────────────────────────────
+// ── 规则加载（单一来源）──────────────────────────────────────────────────
 /**
- * 读取用户规则文件（只读用户的增量部分，可能为空字符串）。
- * 每次调用都重新读文件 → 外部编辑器修改后立即生效。
+ * 剥掉规则文本中的 HTML 注释块（`<!-- ... -->`，用于放开发说明，不等同于规则），
+ * 并去除首尾空白，只保留实际生效的规则内容。
  */
-async function loadUserRules(): Promise<string> {
+function stripMeta(raw: string): string {
+  const withoutComments = raw.replace(/<!--[\s\S]*?-->/g, "").trim();
+  return withoutComments;
+}
+
+/**
+ * 读取出厂默认规则文件（仓库内 rules.default.md，进 git，随版本更新）。
+ * 文件缺失（异常情况）时回退到内联兜底文本。
+ */
+async function loadDefaultRules(): Promise<string> {
+  try {
+    const raw = await readFile(DEFAULT_RULES_PATH, "utf8");
+    return stripMeta(raw);
+  } catch {
+    return (
+      "## 自主推进\n" +
+      "- 能自己决断的就自己决断，采用最合理的默认方案，并在回复里注明你的假设。\n" +
+      "- 不要停下来等，除非真的被卡住。\n\n" +
+      "## 什么时候需要喊我\n" +
+      "- 需要决策 / 凭据 / 审批 / 澄清，且只有我能解决时。\n\n" +
+      "## 完成通知\n" +
+      "- 任务全部完成或达到重要里程碑时通知我（category=completion, urgency=info）。\n" +
+      "- 普通小步骤不值得喊。"
+    );
+  }
+}
+
+/**
+ * 规则现在是「唯一且完整可编辑」的，用户改的就是唯一生效的那份。
+ * 出厂默认只作为首次创建时的"种子"填入 `rules.md`，之后完全由用户接管。
+ * 已存在则直接读取；文件缺失（异常情况）才回退出厂默认。
+ */
+async function loadRules(): Promise<string> {
   try {
     const raw = await readFile(RULES_PATH, "utf8");
     return raw.trim();
   } catch {
-    return "";
+    return loadDefaultRules();
   }
 }
 
-/** 用户规则文件模板（只放用户增量，默认规则内置在源码里） */
-const USER_RULES_TEMPLATE = `# I am cooking 用户规则
-
-> 这里的规则会**叠加**在内置规则（随插件版本更新）之上。
-> 每回合实时读取，外部编辑保存后立即生效。
-> 只写你自己的规则即可；内置默认规则无需复制。
-
-## 内置默认规则（参考，跟随插件版本，无需在此维护）
-<!--
-## 自主推进
-- 能自己决断的就自己决断，采用最合理的默认方案，并在回复里注明你的假设。
-- 不要停下来等，除非真的被卡住。
-
-## 什么时候需要喊我
-- 需要决策 / 凭据 / 审批 / 澄清，且只有我能解决时。
-
-## 完成通知
-- 任务全部完成或达到重要里程碑时通知我（category=completion, urgency=info）。
-- 普通小步骤不值得喊。
--->
-
-## 你的自定义规则
-- （自由发挥，任何你想让 agent 遵守的规则，例如：不修改生产代码 / 每天 22 点必须停止工作）
-`;
-
-/** 组装注入 system prompt 的规则文本（内置默认 + 用户增量 + 机制提示 + 底线） */
+/** 组装注入 system prompt 的规则文本（生效规则 + 自主等级指南 + 机制提示 + 底线） */
 async function buildRulesPrompt(): Promise<string> {
-  const userRules = await loadUserRules();
+  const rules = await loadRules();
+  const level = config.autonomyLevel || "balanced";
   return (
     `\n\n[IAM COOKING MODE] 用户不在电脑前（去做饭了）。\n\n` +
-    `[内置规则（来自插件源码）]\n${DEFAULT_RULES}\n\n` +
-    (userRules
-      ? `[用户自定义规则（来自 ${RULES_PATH}）]\n${userRules}\n\n`
-      : `[用户自定义规则]\n（无，用户未添加）\n\n`) +
-    `[机制提示]\n- 用户明确表达偏好时（如"别喊了""完成后喊我""只有紧急才找我""随时汇报"），调用 set_calling_preference 调整呼喊方式。\n\n` +
-    `[底线规则]\n${GUARD_RAIL}`
+    `[生效规则（来自 ${RULES_PATH}，首次创建时以出厂默认填充，之后完全由你接管）]\n${rules}\n\n` +
+    `[自主等级指南（当前等级：${level}，由机制控制，用户可在 rules 之外单独设置）]\n${AUTONOMY_GUIDE[level]}\n\n` +
+    `[机制提示]\n- 用户明确表达偏好时（如"别喊了""完成后喊我""只有紧急才找我""随时汇报"），调用 set_calling_preference 调整呼喊方式。\n- 用户明确表达自主程度时（如"拿不准就问我"→谨慎 / "能不喊就不喊"→放手），调用 set_autonomy_level 调整自主等级。\n\n` +
+    `[底线规则（系统强制，无法从规则文件删除）]\n${GUARD_RAIL}`
   );
 }
 
-/** 确保规则文件存在（不存在则写入用户增量模板） */
+/** 确保规则文件存在（首次创建时从出厂默认拷贝；之后完全由用户接管） */
 async function ensureRulesFile(): Promise<void> {
   try {
     await readFile(RULES_PATH, "utf8");
   } catch {
     await mkdir(CONFIG_DIR, { recursive: true });
-    await writeFile(RULES_PATH, USER_RULES_TEMPLATE, "utf8");
+    await writeFile(RULES_PATH, await loadDefaultRules(), "utf8");
   }
 }
 
@@ -517,6 +549,48 @@ function detectPreference(text: string): CallingMode | null {
   return null;
 }
 
+// ── 自主等级文字匹配（保险丝："遇墙就喊/能不喊就不喊"这类直接指令一定生效） ──
+const AUTONOMY_PATTERNS: { level: AutonomyLevel; patterns: RegExp[] }[] = [
+  {
+    level: "conservative",
+    patterns: [
+      /遇(到|见)?(人类墙|墙|阻塞|卡住|难关|problem\s+wall|human\s+wall).*?(喊|叫我|问我|找我|通知)/i,
+      /谨慎(点|一些)?|小心(点|些)?|保守(点|些)?|拿不准就(喊|问|找)我|不确定就(喊|问|找)我|先问我|问清楚再(做|干)|重要的事先(问|喊)我/i,
+    ],
+  },
+  {
+    level: "balanced",
+    patterns: [
+      /平衡(点|一些)?|恢复默认|默认就好|正常做|balanced|back\s+to\s+normal/i,
+      /有(点)?难度才(喊|找|叫)我|难度大?才(喊|找|叫)我/i,
+    ],
+  },
+  {
+    level: "autonomous",
+    patterns: [
+      /能不喊就不喊|尽量(别|不要)(喊|吵|打扰)我|少喊(我)?|非(常|常)?紧要勿扰|自主(处理|解决|推进|决定|搞定)|自己搞定|别来烦我|除非(真|彻底|完全)?没法(继续|推进)才(喊|叫|找)我/i,
+    ],
+  },
+];
+
+/** 从用户原话中文字匹配自主等级，命中返回等级，否则 null */
+function detectAutonomyLevel(text: string): AutonomyLevel | null {
+  for (const rule of AUTONOMY_PATTERNS) {
+    if (rule.patterns.some((p) => p.test(text))) return rule.level;
+  }
+  return null;
+}
+
+/** 切换自主等级并提示（持久化：跨离开会话保留） */
+function setAutonomyLevel(level: AutonomyLevel, reason: string, ctx: { ui: any }): void {
+  const prev = config.autonomyLevel || "balanced";
+  config.autonomyLevel = level;
+  void saveConfig();
+  if (level !== prev) {
+    ctx.ui.notify(`🚀 自主等级已切换：${AUTONOMY_LABEL[level]}（依据：${reason}）`, "info");
+  }
+}
+
 const CALLING_MODE_LABEL: Record<CallingMode, string> = {
   normal: "默认（需要你 + 完成都喊）",
   silence: "安静模式（全部静音，只留横幅）",
@@ -659,15 +733,20 @@ function turnOn(ctx: { ui: any }, note: string): void {
   if (note) {
     const mode = detectPreference(note);
     if (mode) setCallingMode(mode, `你在 on 备注里说了："${note.slice(0, 40)}"`, ctx);
+    // 备注里带自主等级关键词 → 立即切换（如 /i-am-cooking on 谨慎点继续）
+    const level = detectAutonomyLevel(note);
+    if (level) setAutonomyLevel(level, `你在 on 备注里说了："${note.slice(0, 40)}"`, ctx);
   }
 
   const noteText = note ? `备注：${note}` : "";
+  const level = config.autonomyLevel || "balanced";
   void api.sendUserMessage(
     `[I am cooking] 我离开去做饭了，不在电脑前。${noteText}\n` +
-    `请自主推进任务：能自己解决的就自己解决（采用最合理的默认方案，并在回复里注明你的假设）；` +
-    `只有真正被卡住、必须我本人处理（决策/凭据/审批/澄清）时才调用 shout_for_user 工具大声喊我，` +
-    `喊完继续用合理默认值推进，绝不要干等我。` +
-    `\n任务全部完成或达到重要里程碑时，调用 shout_for_user（category="completion", urgency="info"）通知我。`,
+    `当前自主等级：${AUTONOMY_LABEL[level]}。具体行动指南见注入的 [自主等级指南]（含人类墙等场景的喊我阈值）。\n` +
+    `请自主推进任务：能自己解决的就自己解决（采用最合理的默认方案，并在回复里注明你的假设），保证质量，不要降低标准；` +
+    `只有达到当前等级的喊我阈值（见 [自主等级指南]）时才调用 shout_for_user 工具大声喊我，` +
+    `喊完继续用合理默认值推进，绝不要干等我。\n` +
+    `任务全部完成或达到重要里程碑时，调用 shout_for_user（category="completion", urgency="info"）通知我。`,
     { deliverAs: "followUp" },
   );
 }
@@ -714,6 +793,7 @@ function showStatus(ctx: { ui: any }): void {
     `通道: 声音${config.sound ? "✓" : "✗"} TTS${config.tts ? "✓" : "✗"} Toast${config.toast ? "✓" : "✗"} 手机推送(${phoneState})`,
     `音量: ${config.boostVolume ? `离开自动拉高到 ${config.boostLevel}%` : "未启用"}`,
     `呼喊偏好: ${CALLING_MODE_LABEL[config.callingMode || "normal"]}`,
+    `自主等级: ${AUTONOMY_LABEL[config.autonomyLevel || "balanced"]}`,
     `配置: ${CONFIG_PATH}（首次使用请运行 /i-am-cooking setup 配置手机推送）`,
   ];
   ctx.ui.notify(lines.join("\n"), "info");
@@ -977,8 +1057,10 @@ export default function (pi: ExtensionAPI) {
         { value: "status", label: "status", description: "查看模式 / 待处理呼喊 / 通道 / token 状态" },
         { value: "setup", label: "setup", description: "配置手机推送（首次使用，交互式向导）" },
         { value: "test", label: "test", description: "测试所有通道（声音/TTS/Toast/手机）" },
-        { value: "rules", label: "rules", description: "查看当前生效规则（内置或用户文件）" },
+        { value: "rules", label: "rules", description: "查看当前生效规则" },
         { value: "edit-rules", label: "edit-rules", description: "编辑规则文件（保存即生效）" },
+        { value: "reset-rules", label: "reset-rules", description: "规则恢复出厂默认（内置规则）" },
+        { value: "level", label: "level", description: "自主等级：conservative 谨慎(遇墙就喊) / balanced 平衡(默认) / autonomous 放手(能不喊就不喊)" },
       ];
       const filtered = subs.filter((s) => s.value.startsWith(prefix));
       return filtered.length > 0 ? filtered : null;
@@ -990,13 +1072,20 @@ export default function (pi: ExtensionAPI) {
       if (arg === "setup") { await setupWizard(ctx); return; }
       if (arg === "test") { await testShout(ctx); return; }
       if (arg === "rules") {
-        const userRules = await loadUserRules();
+        const rules = await loadRules();
         ctx.ui.notify(
-          `📋 当前生效规则：\n\n[内置规则]（源码，随插件更新）\n${DEFAULT_RULES}\n\n` +
-          `[用户自定义]（${await fileExists(RULES_PATH) ? RULES_PATH : "未创建"}）\n${userRules || "（无）"}\n\n` +
-          `— 编辑：/i-am-cooking edit-rules`,
+          `📋 当前生效规则：\n\n${rules}\n\n` +
+          `[底线规则（系统强制，无法从此文件删除）]\n${GUARD_RAIL}\n\n` +
+          `— 来源：${await fileExists(RULES_PATH) ? RULES_PATH : "（尚未创建，首次离开时自动用内置默认填充）"}\n` +
+          `— 编辑：/i-am-cooking edit-rules（或直接改该文件）\n— 恢复出厂默认：/i-am-cooking reset-rules\n— 出厂默认模板：仓库内 ${DEFAULT_RULES_PATH}（进 git，随版本更新）`,
           "info",
         );
+        return;
+      }
+      if (arg === "reset-rules") {
+        await mkdir(CONFIG_DIR, { recursive: true });
+        await writeFile(RULES_PATH, await loadDefaultRules(), "utf8");
+        ctx.ui.notify("♻️ 规则已恢复为出厂默认（来自仓库 rules.default.md）。", "info");
         return;
       }
       if (arg === "edit-rules") {
@@ -1006,12 +1095,34 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const initial = await readFile(RULES_PATH, "utf8");
-        const saved = await ctx.ui.editor(`编辑规则文件（保存后立即生效）: ${RULES_PATH}`, initial);
+        const saved = await ctx.ui.editor(`编辑规则文件（保存后立即生效，这部分就是唯一生效的规则）: ${RULES_PATH}`, initial);
         if (saved !== undefined && saved !== null) {
           await writeFile(RULES_PATH, saved, "utf8");
           ctx.ui.notify("✅ 规则已保存，下次离开模式回合立即生效。", "info");
         } else {
           ctx.ui.notify("已取消编辑，规则未修改。", "info");
+        }
+        return;
+      }
+      if (arg === "level") {
+        const cur = config.autonomyLevel || "balanced";
+        // 无参数 → 查看当前等级和选项
+        if (!arg.split(/\s+/)[1]) {
+          ctx.ui.notify(
+            `🚀 当前自主等级：${AUTONOMY_LABEL[cur]}\n\n可选：\n` +
+            `  conservative —— 谨慎（遇墙就喊：验证码/登录/手动点击等人类墙，需要决策/审批/澄清先喊我）\n` +
+            `  balanced     —— 平衡（有点难度才喊，默认：普通决策自主推进，人类墙/选错代价大才喊）\n` +
+            `  autonomous   —— 放手（能不喊就不喊：尽量自决，只有彻底无法继续才喊）\n\n` +
+            `用法：/i-am-cooking level conservative|balanced|autonomous\n也可以在 on 备注里说（如：on 谨慎点继续）、或直接说"遇墙就喊我"，我都会听懂。`,
+            "info",
+          );
+          return;
+        }
+        const target = arg.split(/\s+/)[1].toLowerCase() as AutonomyLevel;
+        if (target === "conservative" || target === "balanced" || target === "autonomous") {
+          setAutonomyLevel(target, "你执行了 /i-am-cooking level 命令", ctx);
+        } else {
+          ctx.ui.notify("❌ 未知等级，可选：conservative / balanced / autonomous", "warning");
         }
         return;
       }
@@ -1087,10 +1198,37 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // 工具：根据用户原话调整自主等级（agent 语义理解入口）
+  pi.registerTool({
+    name: "set_autonomy_level",
+    label: "Set Autonomy Level",
+    description:
+      "根据用户的原话或意图调整自主等级：遇到阻塞时「该不该喊用户」的阈值。" +
+      "conservative 谨慎：遇墙就喊（人类墙：验证码/登录/手动点击等必须人手动的阻塞；需要决策/审批/凭据/澄清先喊我）。" +
+      "balanced 平衡（默认）：有点难度才喊（普通决策自主推进并注明假设，只有人类墙或选错代价大才喊）。" +
+      "autonomous 放手：能不喊就不喊（尽量自决，只有任务彻底无法继续才喊）。" +
+      "用户明确表达时（如\"拿不准就问我\"→conservative，\"能不喊就不喊\"→autonomous）必须调用。",
+    promptSnippet: "Adjust how much autonomy the agent has when the away user is blocked (when to call for them)",
+    promptGuidelines: [
+      "Use set_autonomy_level when the user explicitly expresses how much they want to be asked/troubled: \"拿不准就问我\"→conservative, \"有难度才喊我\"→balanced, \"能不喊就不喊\"→autonomous.",
+    ],
+    parameters: Type.Object({
+      level: StringEnum(["conservative", "balanced", "autonomous"] as const),
+      reason: Type.String({ description: "依据的用户原话或推理，例如：\"用户说：遇墙就喊我\"" }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      setAutonomyLevel(params.level, params.reason, ctx);
+      return {
+        content: [{ type: "text", text: `自主等级已切换为：${AUTONOMY_LABEL[params.level]}（依据：${params.reason}）` }],
+        details: { level: params.level, applied: true, reason: params.reason },
+      };
+    },
+  });
+
   // ── events ──
   pi.on("session_start", async (_event, ctx) => {
     await loadConfig();
-    await ensureRulesFile(); // 首次启动创建规则文件模板，已存在则不动
+    await ensureRulesFile(); // 首次启动用内置默认创建规则文件，已存在则不动
     if (config.cooking) {
       ctx.ui.setStatus("i-am-cooking", "🍳 离开中（I am cooking）");
       updateWidget(ctx);
@@ -1146,12 +1284,14 @@ export default function (pi: ExtensionAPI) {
       if (!lastAssistant || trailingWork) return;
       const text = lastAssistant.text;
 
-      // 回合报错 → 需要用户看一眼
+      // 回合报错 → 需要用户看一眼（任何等级都喊）
       if (lastAssistant.stopReason === "error") {
         queueAlert(`Agent 回合报错，可能需要你处理：${text.slice(0, 300)}`, "urgent", "auto-error", ctx);
         return;
       }
-      // 以"？"结尾的短问题 → 在等你回复
+      // 以"？"结尾的短问题 → 在等你回复（autonomous 放手等级不自动喊：用户已说能不喊就不喊）
+      const level = config.autonomyLevel || "balanced";
+      if (level === "autonomous") return;
       if (text.length <= 600 && /[?？]\s*$/.test(text)) {
         queueAlert(`Agent 在等你回复：${text.slice(0, 200)}`, "normal", "auto-question", ctx);
       }
@@ -1170,6 +1310,12 @@ export default function (pi: ExtensionAPI) {
     const mode = detectPreference(event.text);
     if (mode) {
       setCallingMode(mode, `你说了："${event.text.slice(0, 40)}"`, ctx);
+    }
+
+    // ①-b 文字匹配：用户原话里带自主等级关键词 → 立即切换（持久化，跨会话保留）
+    const level = detectAutonomyLevel(event.text);
+    if (level) {
+      setAutonomyLevel(level, `你说了："${event.text.slice(0, 40)}"`, ctx);
     }
 
     // ② 用户打字 = 回来了 → 退出离开模式并让 agent 汇报
