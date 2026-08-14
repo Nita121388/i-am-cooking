@@ -62,11 +62,11 @@ flowchart TD
 # from GitHub
 pi install git:github.com/Nita121388/i-am-cooking
 
+# or from npm (published)
+pi install npm:i-am-cooking
+
 # or local path during development (from source)
 pi install /path/to/your/local/checkout
-
-# or from npm (after publish)
-pi install npm:i-am-cooking
 ```
 
 Reload pi (`/reload`) after installing.

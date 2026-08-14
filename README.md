@@ -59,11 +59,11 @@ flowchart TD
 # GitHub 安装（推荐）
 pi install git:github.com/Nita121388/i-am-cooking
 
+# npm 已发布
+pi install npm:i-am-cooking
+
 # 本地开发路径（从源码调试时用）
 pi install /path/to/your/local/checkout
-
-# npm 发布后
-pi install npm:i-am-cooking
 ```
 
 安装后 `/reload` 或重启 pi 生效。
