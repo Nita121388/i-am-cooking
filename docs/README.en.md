@@ -7,7 +7,7 @@
 > sound, Chinese TTS, desktop notifications, and **phone push**, so you can come back from the kitchen.
 
 The name "I am cooking" describes **your** status: the user is away. The agent is the one calling:
-_"pi 需要你！" (pi needs you!)_
+_"Agent 需要你！" (Agent needs you!)_
 
 ## ✨ Features
 

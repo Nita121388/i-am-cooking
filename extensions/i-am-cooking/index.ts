@@ -1674,7 +1674,7 @@ export default function (pi: ExtensionAPI) {
       const queued = queueAlert(params.message, params.urgency, params.category ?? "other", ctx, params.ttsText);
       return {
         content: [{ type: "text", text: queued
-          ? `呼喊已发出（${params.urgency}）${params.ttsText ? `，语音：${params.ttsText}` : ""}。继续用最合理的默认方案推进，并在回复里注明你的假设；用户回来后会自动收到你的汇报。`
+          ? `呼喊已发出（${params.urgency}）${params.ttsText ? `，语音：${params.ttsText}` : ""}。\n交接内容已包含在呼喊消息里。**现在请停止自主推进，暂停当前回合，等待用户回来处理**——不要再继续处理其他任务，也不要再次调用本工具；用户回来后会自动收到你的汇报并给你新指令。`
           : "已有同内容的未确认呼喊，不重复发送。" }],
         details: { fired: queued, urgency: params.urgency, category: params.category ?? "other", ttsText: params.ttsText ?? null },
       };
