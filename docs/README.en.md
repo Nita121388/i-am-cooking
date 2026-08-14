@@ -58,7 +58,22 @@ Reload pi (`/reload`) after installing.
 | `/i-am-cooking off` | Leave cooking mode; agent receives a debrief of what it shouted |
 | `/i-am-cooking status` | Mode, pending shouts, channels, token state, current preference |
 | `/i-am-cooking setup` | Interactive wizard: ntfy / webhook, token, volume boost permission |
+| `/i-am-cooking rules` | Show currently active rules (built-in or user file) |
+| `/i-am-cooking edit-rules` | Edit the rules file (saves instantly) |
 | `/i-am-cooking test` | Fire a test shout on all channels (no mode needed) |
+
+## 🧠 User-editable rules
+
+The behavior rules while you're away are not hard-coded — you can edit them:
+
+```
+/i-am-cooking edit-rules    # open editor, save = immediately effective
+/i-am-cooking rules         # show currently active rules
+```
+
+The rules file is `~/.pi/i-am-cooking-rules.md` (Markdown). When missing, built-in defaults apply
+(autonomy, when to shout, completion notices). A guard rail is always appended:
+"never end your turn silently waiting for user input".
 
 ## 🧠 Dynamic calling preferences
 

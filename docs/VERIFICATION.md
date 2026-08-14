@@ -36,7 +36,15 @@
 - [ ] Live test push arrives on phone
 - [ ] Token with `${ENV_VAR}` resolves from environment
 
-## 6. Robustness
+## 6. User-editable rules
+
+- [ ] `/i-am-cooking edit-rules` creates `~/.pi/i-am-cooking-rules.md` template
+- [ ] Editing the file (custom rule added) → injected into next cooking-mode turn
+- [ ] `/i-am-cooking rules` shows the user file as source once it exists
+- [ ] Deleting the rules file → falls back to built-in defaults
+- [ ] Guard rail ("绝不要默默结束回合") is always appended even with custom rules
+
+## 7. Robustness
 
 - [ ] `/reload` after config edit — no errors
 - [ ] Removing the package → pi starts clean, no dangling errors

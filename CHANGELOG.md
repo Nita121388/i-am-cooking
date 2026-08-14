@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **user-editable rules**: `/i-am-cooking rules` + `/i-am-cooking edit-rules`; rules live in `~/.pi/i-am-cooking-rules.md`, read fresh every turn, fall back to built-in defaults, guard rail always appended
+
 ## [0.1.0] - 2025-07-08
 
 ### Added

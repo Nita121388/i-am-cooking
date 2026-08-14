@@ -39,6 +39,22 @@ const HOME       = homedir();
 const SCRIPTS    = fileURLToPath(new URL("./scripts", import.meta.url));
 const CONFIG_PATH = join(HOME, ".pi", "i-am-cooking.json");
 const TMP_DIR    = join(HOME, ".pi", "i-am-cooking-tmp");
+const RULES_PATH  = join(HOME, ".pi", "i-am-cooking-rules.md");
+
+// ── 内置默认规则（用户规则文件不存在时使用） ────────────────────────────────
+const DEFAULT_RULES = `## 自主推进
+- 能自己决断的就自己决断，采用最合理的默认方案，并在回复里注明你的假设。
+- 不要停下来等，除非真的被卡住。
+
+## 什么时候需要喊我
+- 需要决策 / 凭据 / 审批 / 澄清，且只有我能解决时。
+
+## 完成通知
+- 任务全部完成或达到重要里程碑时通知我（category=completion, urgency=info）。
+- 普通小步骤不值得喊。`;
+
+// 底线规则（不可删除，永远追加在用户规则后面）
+const GUARD_RAIL = "- 绝不要默默结束回合等用户回复。";
 
 type Urgency = "info" | "normal" | "urgent";
 
@@ -149,6 +165,50 @@ async function saveConfig(): Promise<void> {
 
 function pendingAlerts(): Alert[] {
   return config.alerts.filter((a) => !a.acked);
+}
+
+// ── 用户规则加载 ──────────────────────────────────────────────────────────
+/**
+ * 读取用户规则文件；不存在或读取失败时回退到内置默认规则。
+ * 每次调用都重新读文件 → 外部编辑器修改后立即生效。
+ */
+async function loadRules(): Promise<string> {
+  try {
+    const raw = await readFile(RULES_PATH, "utf8");
+    const trimmed = raw.trim();
+    if (trimmed) return trimmed;
+  } catch { /* 文件不存在，用默认 */ }
+  return DEFAULT_RULES;
+}
+
+/** 组装注入 system prompt 的规则文本（用户规则 + 机制提示 + 底线） */
+async function buildRulesPrompt(): Promise<string> {
+  const rules = await loadRules();
+  return (
+    `\n\n[IAM COOKING MODE] 用户不在电脑前（去做饭了）。以下是用户设定的行为规则：\n${rules}\n\n` +
+    `[机制提示]\n- 用户明确表达偏好时（如"别喊了""完成后喊我""只有紧急才找我""随时汇报"），调用 set_calling_preference 调整呼喊方式。\n\n` +
+    `[底线规则]\n${GUARD_RAIL}`
+  );
+}
+
+/** 确保规则文件存在（不存在则写入模板） */
+async function ensureRulesFile(): Promise<void> {
+  try {
+    await readFile(RULES_PATH, "utf8");
+  } catch {
+    const template = `# I am cooking 规则\n\n> 修改此文件可自定义 pi 离开时的行为规则。\n> 保存后下次 /i-am-cooking on 生效（每回合实时读取，外部改也生效）。\n\n${DEFAULT_RULES}\n\n## 你的自定义规则\n- （自由发挥，任何你想让 agent 遵守的规则，例如：不修改生产代码 / 每天 22 点必须停止工作）\n`;
+    await mkdir(join(HOME, ".pi"), { recursive: true });
+    await writeFile(RULES_PATH, template, "utf8");
+  }
+}
+
+async function fileExists(p: string): Promise<boolean> {
+  try {
+    await readFile(p, "utf8");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ── notification channels ────────────────────────────────────────────────
@@ -888,6 +948,8 @@ export default function (pi: ExtensionAPI) {
         { value: "status", label: "status", description: "查看模式 / 待处理呼喊 / 通道 / token 状态" },
         { value: "setup", label: "setup", description: "配置手机推送（首次使用，交互式向导）" },
         { value: "test", label: "test", description: "测试所有通道（声音/TTS/Toast/手机）" },
+        { value: "rules", label: "rules", description: "查看当前生效规则（内置或用户文件）" },
+        { value: "edit-rules", label: "edit-rules", description: "编辑规则文件（保存即生效）" },
       ];
       const filtered = subs.filter((s) => s.value.startsWith(prefix));
       return filtered.length > 0 ? filtered : null;
@@ -898,6 +960,31 @@ export default function (pi: ExtensionAPI) {
       if (arg === "status") { showStatus(ctx); return; }
       if (arg === "setup") { await setupWizard(ctx); return; }
       if (arg === "test") { await testShout(ctx); return; }
+      if (arg === "rules") {
+        const source = await fileExists(RULES_PATH);
+        const rules = await loadRules();
+        ctx.ui.notify(
+          `📋 当前生效规则（来源：${source ? RULES_PATH : "内置默认（未创建规则文件）"}）：\n\n${rules}\n\n— 编辑：/i-am-cooking edit-rules`,
+          "info",
+        );
+        return;
+      }
+      if (arg === "edit-rules") {
+        await ensureRulesFile();
+        if (ctx.mode !== "tui" || !ctx.hasUI) {
+          ctx.ui.notify(`请直接编辑 ${RULES_PATH}`, "warning");
+          return;
+        }
+        const initial = await readFile(RULES_PATH, "utf8");
+        const saved = await ctx.ui.editor(`编辑规则文件（保存后立即生效）: ${RULES_PATH}`, initial);
+        if (saved !== undefined && saved !== null) {
+          await writeFile(RULES_PATH, saved, "utf8");
+          ctx.ui.notify("✅ 规则已保存，下次离开模式回合立即生效。", "info");
+        } else {
+          ctx.ui.notify("已取消编辑，规则未修改。", "info");
+        }
+        return;
+      }
       const note = arg.startsWith("on") ? arg.slice(2).trim() : arg;
       turnOn(ctx, note);
     },
@@ -1000,13 +1087,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, _ctx) => {
     if (!config.cooking) return;
     return {
-      systemPrompt: event.systemPrompt +
-        "\n\n[IAM COOKING MODE] 用户不在电脑前（去做饭了）。" +
-        "\n- 自主推进，不要停下来等。能自己决断的就自己决断，采用最合理的默认方案并在回复里注明假设。" +
-        "\n- 只有真正被卡住（需要用户决策/凭据/审批/澄清）时，调用 shout_for_user 大声喊用户，给出简短可执行的消息；喊完继续用默认值推进。" +
-        "\n- 任务全部完成或达到重要里程碑时，调用 shout_for_user（category=\"completion\", urgency=\"info\"）通知用户完成了什么；普通小步骤不值得喊。" +
-        "\n- 用户明确表达偏好时（如\"别喊了\"\"完成后喊我\"\"只有紧急才找我\"\"随时汇报\"），调用 set_calling_preference 调整呼喊方式。" +
-        "\n- 绝不要默默结束回合等用户回复。",
+      systemPrompt: event.systemPrompt + (await buildRulesPrompt()),
     };
   });
 
