@@ -32,12 +32,17 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, readFile, rm, writeFile, readdir, open, rename } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile, readdir, rename } from "node:fs/promises";
 import { watch } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+// 纯逻辑模块（可测试）
+import { suggestTopic as suggestTopicImpl } from "./lib/topic.ts";
+import { acquireAudioLock as acquireAudioLockImpl, releaseAudioLock as releaseAudioLockImpl, isProcessAlive as isProcessAliveImpl } from "./lib/audio-lock.ts";
+import { renderTts as renderTtsImpl } from "./lib/tts.ts";
+import { writeSharedState as writeSharedStateImpl, readSharedState as readSharedStateImpl } from "./lib/state-sync.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -52,18 +57,6 @@ const RULES_PATH  = join(CONFIG_DIR, "rules.md");
 const TMP_DIR     = join(CONFIG_DIR, "tmp");
 const AUDIO_LOCK_PATH = join(CONFIG_DIR, "audio.lock"); // 跨 Agent 音频互斥锁
 const STATE_PATH      = join(CONFIG_DIR, "state.json");  // 跨 Agent 离开状态（联动关闭）
-
-// ── 可爱 topic 词池（编程/算法/LLM 风，原创）──────────────────────────────
-const TOPIC_ADJ = [
-  "递归的", "贪心的", "并发的", "异步的", "迭代的", "哈希的", "分治的", "回溯的",
-  "动态的", "懒惰的", "原子的", "鲁棒的", "优雅的", "熵增的", "收敛的", "涌现的",
-  "幻觉的", "对齐的", "蒸馏的", "微调的", "自举的", "深夜炼丹的",
-];
-const TOPIC_NOUN = [
-  "递归", "栈", "队列", "堆", "哈希", "梯度", "向量", "张量", "词元", "提示词",
-  "注意力", "神经元", "权重", "参数", "嵌入", "协程", "信号量", "守护进程",
-  "管道", "缓存", "缓冲区", "编译器", "字节", "剪枝",
-];
 
 // 底线规则（不可删除，永远追加在用户规则后面）
 const GUARD_RAIL = "- 绝不要默默结束回合等用户回复。";
@@ -436,47 +429,13 @@ function stopAllAudio(): void {
   activeAudioProcs = [];
 }
 
-// ── 跨 Agent 音频互斥锁（多个 pi 进程同时离开时，只放一个声音）─────────────
-// 锁文件含 pid + createdAt：pid 死了立即抢占；超时(75s=60播放+15余量)兜底防 pid 复用
-const AUDIO_LOCK_MAX_MS = 75_000;
-
-function isProcessAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
-}
-
-/** 尝试获取音频锁。force=true 抢占（用户主动 test 优先）。返回是否拿到锁。 */
+// ── 跨 Agent 音频互斥锁（逻辑在 lib/audio-lock.ts，可测试）────────────────────
+function isProcessAlive(pid: number): boolean { return isProcessAliveImpl(pid); }
 async function acquireAudioLock(force: boolean): Promise<boolean> {
-  try {
-    if (force) await rm(AUDIO_LOCK_PATH, { force: true });
-    const handle = await open(AUDIO_LOCK_PATH, "wx"); // 原子创建：只有一个进程能成功
-    await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now() }), "utf8");
-    await handle.close();
-    return true;
-  } catch {
-    // 锁已存在 → 检查是否 stale（崩溃/超时）
-    try {
-      const raw = await readFile(AUDIO_LOCK_PATH, "utf8");
-      const lock = JSON.parse(raw) as { pid: number; createdAt: number };
-      const stale = !isProcessAlive(lock.pid) || Date.now() - lock.createdAt > AUDIO_LOCK_MAX_MS;
-      if (stale) {
-        await rm(AUDIO_LOCK_PATH, { force: true });
-        return acquireAudioLock(false); // 抢占后重试一次
-      }
-      return false; // 其他 Agent 正在播 → 本 Agent 跳过声音
-    } catch {
-      return false;
-    }
-  }
+  return acquireAudioLockImpl(AUDIO_LOCK_PATH, force);
 }
-
-/** 释放音频锁（仅当锁还属于本进程时才删，避免误删别人新拿到的锁） */
 async function releaseAudioLock(): Promise<void> {
-  try {
-    const raw = await readFile(AUDIO_LOCK_PATH, "utf8");
-    const lock = JSON.parse(raw) as { pid: number };
-    if (lock.pid === process.pid) await rm(AUDIO_LOCK_PATH, { force: true });
-  } catch { /* 锁已不存在或被抢占，无需处理 */ }
+  await releaseAudioLockImpl(AUDIO_LOCK_PATH);
 }
 
 // ── 跨 Agent 离开状态（联动关闭：任一 Agent 回来，其他都关）───────────────
@@ -487,10 +446,7 @@ let statePollTimer: ReturnType<typeof setInterval> | null = null;
 
 async function writeSharedState(cooking: boolean): Promise<void> {
   try {
-    await mkdir(CONFIG_DIR, { recursive: true });
-    const tmp = `${STATE_PATH}.tmp`;
-    await writeFile(tmp, JSON.stringify({ cooking, since: cooking ? Date.now() : undefined, updatedAt: Date.now() }), "utf8");
-    await rename(tmp, STATE_PATH);
+    await writeSharedStateImpl(STATE_PATH, CONFIG_DIR, cooking);
   } catch (e) {
     console.error("[i-am-cooking] writeSharedState failed:", (e as Error).message);
   }
@@ -773,18 +729,16 @@ async function pushWebhook(alert: Alert): Promise<boolean> {
 }
 
 function renderTts(alert: Alert): string {
-  // Agent 提供了自由语音 → 原样念，不走模板
-  if (alert.ttsText) return alert.ttsText;
-  const template =
-    alert.category === "milestone"
-      ? (config.ttsTemplateMilestone || "小进展：{message}")
-      : alert.category === "completion"
-        ? (config.ttsTemplateCompletion || "主人，好消息！任务完成了！{message}")
-        : config.ttsTemplate;
-  // 先替换 {shoutPhrase}（用户自定义呼喊短语），再替换 {message}
-  return template
-    .replaceAll("{shoutPhrase}", config.shoutPhrase || "agent 需要你")
-    .replaceAll("{message}", alert.message);
+  // 逻辑在 lib/tts.ts（可测试）
+  return renderTtsImpl(
+    {
+      ttsTemplate: config.ttsTemplate,
+      ttsTemplateCompletion: config.ttsTemplateCompletion,
+      ttsTemplateMilestone: config.ttsTemplateMilestone,
+      shoutPhrase: config.shoutPhrase,
+    },
+    alert,
+  );
 }
 
 /**
@@ -1186,15 +1140,10 @@ function maskToken(token: string): string {
 
 /**
  * 生成建议的随机 topic 名：可爱词池（编程/算法/LLM 风）+ 6 位随机数字。
- * 唯一性靠 6 位数字（528 组合 × 1,000,000 = 5.28 亿种），前缀只是装饰。
+ * 逻辑在 lib/topic.ts（可测试）。
  */
 function suggestTopic(): string {
-  const adj = TOPIC_ADJ[Math.floor(Math.random() * TOPIC_ADJ.length)];
-  const noun = TOPIC_NOUN[Math.floor(Math.random() * TOPIC_NOUN.length)];
-  // 从 uuid 里取 6 位纯数字（crypto 随机，非 Math.random）
-  const digits = randomUUID().replace(/\D/g, "");
-  const num = (digits + "000000").slice(0, 6);
-  return `i-am-cooking-${adj}${noun}-${num}`;
+  return suggestTopicImpl();
 }
 
 /**
