@@ -170,36 +170,64 @@ function pendingAlerts(): Alert[] {
 
 // ── 用户规则加载 ──────────────────────────────────────────────────────────
 /**
- * 读取用户规则文件；不存在或读取失败时回退到内置默认规则。
+ * 读取用户规则文件（只读用户的增量部分，可能为空字符串）。
  * 每次调用都重新读文件 → 外部编辑器修改后立即生效。
  */
-async function loadRules(): Promise<string> {
+async function loadUserRules(): Promise<string> {
   try {
     const raw = await readFile(RULES_PATH, "utf8");
-    const trimmed = raw.trim();
-    if (trimmed) return trimmed;
-  } catch { /* 文件不存在，用默认 */ }
-  return DEFAULT_RULES;
+    return raw.trim();
+  } catch {
+    return "";
+  }
 }
 
-/** 组装注入 system prompt 的规则文本（用户规则 + 机制提示 + 底线） */
+/** 用户规则文件模板（只放用户增量，默认规则内置在源码里） */
+const USER_RULES_TEMPLATE = `# I am cooking 用户规则
+
+> 这里的规则会**叠加**在内置规则（随插件版本更新）之上。
+> 每回合实时读取，外部编辑保存后立即生效。
+> 只写你自己的规则即可；内置默认规则无需复制。
+
+## 内置默认规则（参考，跟随插件版本，无需在此维护）
+<!--
+## 自主推进
+- 能自己决断的就自己决断，采用最合理的默认方案，并在回复里注明你的假设。
+- 不要停下来等，除非真的被卡住。
+
+## 什么时候需要喊我
+- 需要决策 / 凭据 / 审批 / 澄清，且只有我能解决时。
+
+## 完成通知
+- 任务全部完成或达到重要里程碑时通知我（category=completion, urgency=info）。
+- 普通小步骤不值得喊。
+-->
+
+## 你的自定义规则
+- （自由发挥，任何你想让 agent 遵守的规则，例如：不修改生产代码 / 每天 22 点必须停止工作）
+`;
+
+/** 组装注入 system prompt 的规则文本（内置默认 + 用户增量 + 机制提示 + 底线） */
 async function buildRulesPrompt(): Promise<string> {
-  const rules = await loadRules();
+  const userRules = await loadUserRules();
   return (
-    `\n\n[IAM COOKING MODE] 用户不在电脑前（去做饭了）。以下是用户设定的行为规则：\n${rules}\n\n` +
+    `\n\n[IAM COOKING MODE] 用户不在电脑前（去做饭了）。\n\n` +
+    `[内置规则（来自插件源码）]\n${DEFAULT_RULES}\n\n` +
+    (userRules
+      ? `[用户自定义规则（来自 ${RULES_PATH}）]\n${userRules}\n\n`
+      : `[用户自定义规则]\n（无，用户未添加）\n\n`) +
     `[机制提示]\n- 用户明确表达偏好时（如"别喊了""完成后喊我""只有紧急才找我""随时汇报"），调用 set_calling_preference 调整呼喊方式。\n\n` +
     `[底线规则]\n${GUARD_RAIL}`
   );
 }
 
-/** 确保规则文件存在（不存在则写入模板） */
+/** 确保规则文件存在（不存在则写入用户增量模板） */
 async function ensureRulesFile(): Promise<void> {
   try {
     await readFile(RULES_PATH, "utf8");
   } catch {
-    const template = `# I am cooking 规则\n\n> 修改此文件可自定义 pi 离开时的行为规则。\n> 保存后下次 /i-am-cooking on 生效（每回合实时读取，外部改也生效）。\n\n${DEFAULT_RULES}\n\n## 你的自定义规则\n- （自由发挥，任何你想让 agent 遵守的规则，例如：不修改生产代码 / 每天 22 点必须停止工作）\n`;
     await mkdir(CONFIG_DIR, { recursive: true });
-    await writeFile(RULES_PATH, template, "utf8");
+    await writeFile(RULES_PATH, USER_RULES_TEMPLATE, "utf8");
   }
 }
 
@@ -962,10 +990,11 @@ export default function (pi: ExtensionAPI) {
       if (arg === "setup") { await setupWizard(ctx); return; }
       if (arg === "test") { await testShout(ctx); return; }
       if (arg === "rules") {
-        const source = await fileExists(RULES_PATH);
-        const rules = await loadRules();
+        const userRules = await loadUserRules();
         ctx.ui.notify(
-          `📋 当前生效规则（来源：${source ? RULES_PATH : "内置默认（未创建规则文件）"}）：\n\n${rules}\n\n— 编辑：/i-am-cooking edit-rules`,
+          `📋 当前生效规则：\n\n[内置规则]（源码，随插件更新）\n${DEFAULT_RULES}\n\n` +
+          `[用户自定义]（${await fileExists(RULES_PATH) ? RULES_PATH : "未创建"}）\n${userRules || "（无）"}\n\n` +
+          `— 编辑：/i-am-cooking edit-rules`,
           "info",
         );
         return;
