@@ -16,6 +16,7 @@
  *   /i-am-cooking reset-rules — 规则恢复出厂默认（内置规则）
  *   /i-am-cooking level       — 自主等级（conservative/balanced/autonomous）
  *   /i-am-cooking limits      — 查看/调整防打扰参数（交互式中文）
+ *   /i-am-cooking sound       — 自定义呼喊铃声（歌曲/试听/总时长，交互式中文）
  *
  * 工具 (LLM 调用):
  *   shout_for_user           — 卡住且只有用户能解决时调用
@@ -24,14 +25,14 @@
  *   agent_settled 后若回合以"？"结尾且没有后续工具调用 → 自动呼喊（安全网）
  *   cooking 模式下你直接打字 → 自动视为"回来了"，退出模式并让 agent 汇报
  *
- * 配置: ~/.pi/i-am-cooking.json （可热改，/reload 生效）
+ * 配置: ~/.pi/i-am-cooking/config.json （可热改，/reload 生效）
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -95,6 +96,7 @@ interface Alert {
   category: string;
   repeatCount: number;
   acked: boolean;
+  ttsText?: string; // Agent 自由语音：非空则 TTS 原样念这段，不走模板
 }
 
 interface Config {
@@ -106,7 +108,8 @@ interface Config {
   // channels
   sound: boolean;
   beeps: number;
-  soundPath: string; // optional .wav, overrides beeps
+  soundPath: string; // optional .wav/mp3, played AFTER beeps+tts as the user's custom ringtone
+  soundSeconds: number; // 声音播放总时长上限（秒），到点强制停止，默认 60
   tts: boolean;
   ttsTemplate: string; // "{message}" placeholder
   toast: boolean;
@@ -133,6 +136,9 @@ interface Config {
   autonomyLevel: AutonomyLevel;  // 自主等级（持久化；遇到阻塞时该不该喊）
   maxCompletionNotices: number;  // 每次离开最多喊几次完成（防打扰）
   ttsTemplateCompletion: string; // 完成时的 TTS 文案
+  milestoneReminders: boolean;   // 小阶段完成提醒（每次离开时询问用户是否开启）
+  ttsTemplateMilestone: string;  // 小阶段完成时的 TTS 文案
+  milestoneBeeps: number;        // 小阶段完成时的提示音次数（默认 1，轻声）
 }
 
 const DEFAULTS: Config = {
@@ -141,6 +147,7 @@ const DEFAULTS: Config = {
   sound: true,
   beeps: 4,
   soundPath: "",
+  soundSeconds: 60,
   tts: true,
   ttsTemplate: "主人，快来！pi 需要你！{message}",
   toast: true,
@@ -165,6 +172,9 @@ const DEFAULTS: Config = {
   autonomyLevel: "balanced", // 默认：有点难度才喊
   maxCompletionNotices: 3,
   ttsTemplateCompletion: "主人，好消息！任务完成了！{message}",
+  milestoneReminders: false, // 默认关：每次离开时询问用户
+  ttsTemplateMilestone: "小进展：{message}",
+  milestoneBeeps: 1,
 };
 
 // ── state ────────────────────────────────────────────────────────────────
@@ -274,6 +284,72 @@ async function fileExists(p: string): Promise<boolean> {
   }
 }
 
+// ── 音频文件浏览（sound 命令用）──────────────────────────────────────────
+const AUDIO_EXT = [".mp3", ".wav", ".m4a", ".aiff", ".aif", ".ogg", ".flac"];
+
+function isAudioFile(name: string): boolean {
+  const ext = name.slice(name.lastIndexOf(".")).toLowerCase();
+  return AUDIO_EXT.includes(ext);
+}
+
+/**
+ * 交互式浏览文件夹选择音频文件（TUI）。
+ * 从 startDir 开始：显示子文件夹 + 音频文件，选文件夹进入下一级，选文件返回其路径。
+ * 支持：返回上级 / 手动输入路径 / Esc 取消。
+ * 返回选中的音频文件路径，取消则 null。
+ */
+async function browseAudioFile(ui: any, startDir: string): Promise<string | null> {
+  let dir = startDir;
+  for (;;) {
+    let entries: { name: string; isDir: boolean }[] = [];
+    try {
+      const items = await readdir(dir, { withFileTypes: true });
+      entries = items
+        .filter((d) => d.isDirectory() || isAudioFile(d.name))
+        .sort((a, b) => {
+          // 文件夹在前，按名称排序
+          if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        })
+        .map((d) => ({ name: d.name, isDir: d.isDirectory() }));
+    } catch {
+      ui.notify(`❌ 无法读取目录：${dir}`, "warning");
+      return null;
+    }
+
+    const options: string[] = [
+      ...entries.map((e) => (e.isDir ? `📁 ${e.name}/` : `🔊 ${e.name}`)),
+      "📂 手动输入路径",
+      "⬆️ 返回上级",
+    ];
+    const pick = await ui.select(`🔊 选择音频文件（当前：${dir}）:`, options);
+    if (!pick) return null; // Esc 取消
+
+    if (pick === "📂 手动输入路径") {
+      const p = await ui.input("输入完整路径（回车取消）:", "");
+      if (!p || !p.trim()) continue;
+      const t = p.trim().replace(/^~\//, `${homedir()}/`);
+      if (isAudioFile(t)) return t;
+      // 输入的是目录 → 进入该目录
+      dir = t;
+      continue;
+    }
+    if (pick === "⬆️ 返回上级") {
+      const parent = dir.replace(/\/[^/]+\/?$/, "");
+      if (parent && parent !== dir) dir = parent;
+      continue;
+    }
+    // 选中的是文件或文件夹
+    const selected = entries.find((e) => (e.isDir ? `📁 ${e.name}/` : `🔊 ${e.name}`) === pick);
+    if (!selected) continue;
+    if (selected.isDir) {
+      dir = `${dir}/${selected.name}`;
+    } else {
+      return `${dir}/${selected.name}`;
+    }
+  }
+}
+
 // ── notification channels ────────────────────────────────────────────────
 /**
  * 解析配置值：支持 ${ENV_VAR} 或 $ENV_VAR 引用环境变量（避免 token 明文落盘）。
@@ -316,22 +392,63 @@ function runCommand(cmd: string, args: string[], opts: { timeoutMs?: number } = 
   });
 }
 
-async function playSound(beeps: number, soundPath: string): Promise<void> {
-  if (!beeps) return;
+/**
+ * spawn 播放器进程，最多播放 maxMs 毫秒后强制 kill（避免超长歌曲一直响）。
+ * 返回 Promise（进程退出/出错/被杀 都 resolve）。
+ */
+function playProcess(cmd: string, args: string[], maxMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    const proc = spawn(cmd, args, { stdio: "ignore", windowsHide: true });
+    proc.on("error", () => finish());
+    proc.on("exit", () => finish());
+    if (maxMs > 0) setTimeout(() => { proc.kill(); finish(); }, maxMs);
+  });
+}
+
+/**
+ * 三段式顺序播放：① 短铃声(beeps) → ② Agent 语音(TTS) → ③ 用户自定义歌曲(soundPath)。
+ * 共用 soundSeconds 总预算：从开始响到强制停止，到点 kill 掉还在播的歌曲。
+ */
+async function playSound(beeps: number, soundPath: string, ttsText: string): Promise<void> {
+  const totalMs = Math.max(5, (config.soundSeconds ?? 60)) * 1000;
+  const startedAt = Date.now();
+  const remainingMs = () => Math.max(0, totalMs - (Date.now() - startedAt));
   const p = process.platform;
-  try {
-    if (p === "win32") {
-      await runPowerShellScript("shout.ps1", { beeps, soundPath: "", ttsText: "" });
-    } else if (p === "darwin") {
-      // macOS: osascript beep（最简，无需额外文件）；自定义 wav 用 afplay
-      if (soundPath) await runCommand("afplay", [soundPath]);
-      else await runCommand("osascript", ["-e", `beep ${Math.min(beeps, 5)}`]);
-    } else {
-      // Linux: canberra 提示音（常见），或 paplay 播文件
-      if (soundPath) await runCommand("paplay", [soundPath]).catch(() => runCommand("aplay", [soundPath]));
-      else await runCommand("canberra-gtk-play", ["-i", "message"], { timeoutMs: 5000 }).catch(() => {});
-    }
-  } catch { /* best effort */ }
+
+  // ① 短铃声（beeps）
+  if (beeps > 0) {
+    try {
+      if (p === "win32") {
+        await runPowerShellScript("shout.ps1", { beeps, soundPath: "", ttsText: "" });
+      } else if (p === "darwin") {
+        await runCommand("osascript", ["-e", `beep ${Math.min(beeps, 5)}`], { timeoutMs: 3000 });
+      } else {
+        await runCommand("canberra-gtk-play", ["-i", "message"], { timeoutMs: 3000 }).catch(() => {});
+      }
+    } catch { /* best effort */ }
+  }
+
+  // ② Agent 语音（TTS）
+  if (ttsText) {
+    await speakTts(ttsText);
+  }
+
+  // ③ 用户自定义歌曲（soundPath）— 最多播到总预算剩余
+  if (soundPath && remainingMs() > 500) {
+    try {
+      if (p === "win32") {
+        await runPowerShellScript("shout.ps1", { beeps: 0, soundPath, ttsText: "" });
+      } else if (p === "darwin") {
+        await playProcess("afplay", [soundPath], remainingMs());
+      } else {
+        await playProcess("paplay", [soundPath], remainingMs()).catch(() =>
+          playProcess("aplay", [soundPath], remainingMs()),
+        );
+      }
+    } catch { /* best effort */ }
+  }
 }
 
 async function speakTts(text: string): Promise<void> {
@@ -515,10 +632,14 @@ async function pushWebhook(alert: Alert): Promise<boolean> {
 }
 
 function renderTts(alert: Alert): string {
-  const isCompletion = alert.category === "completion";
-  const template = isCompletion
-    ? (config.ttsTemplateCompletion || "主人，好消息！任务完成了！{message}")
-    : config.ttsTemplate;
+  // Agent 提供了自由语音 → 原样念，不走模板
+  if (alert.ttsText) return alert.ttsText;
+  const template =
+    alert.category === "milestone"
+      ? (config.ttsTemplateMilestone || "小进展：{message}")
+      : alert.category === "completion"
+        ? (config.ttsTemplateCompletion || "主人，好消息！任务完成了！{message}")
+        : config.ttsTemplate;
   return template.replaceAll("{message}", alert.message);
 }
 
@@ -649,25 +770,38 @@ async function fireAlert(alert: Alert, ctx: { ui: any }): Promise<boolean> {
   config.lastShout = Date.now();
   const suppress = shouldSuppress(alert);
   const isCompletion = alert.category === "completion";
+  const isMilestone = alert.category === "milestone";
 
   // ── widget + TUI notify（无论是否 suppress 都显示）──
   if (ctx?.ui) {
-    const icon = isCompletion ? "✅" : "⚠";
-    const label = isCompletion ? "完成通知" : `pi 需要你！[${alert.urgency}]`;
+    const icon = isCompletion ? "✅" : isMilestone ? "📈" : "⚠";
+    const label = isCompletion ? "完成通知" : isMilestone ? "小阶段完成" : `pi 需要你！[${alert.urgency}]`;
     ctx.ui.notify(`🍳 ${icon} ${label} ${alert.message}`, suppress ? "info" : "warning");
     updateWidget(ctx);
   }
 
   // ── 响铃 / 推送（suppress 时跳过）──
   if (suppress) return true;
+  // 三层音频区分：
+  //   🚨 需要你  → 完整三段式（beeps + 语音 + 自定义歌曲），最醒目
+  //   ✅ 整个完成 → beeps 2 声 + 完成语音（不播歌曲，安静报喜）
+  //   📈 小阶段   → beeps 1 声 + 简短语音（轻声，不打断思路）
+  // 声音不阻塞后续通道：fire-and-forget，最长 soundSeconds 秒后自动停
   if (config.sound || config.tts) {
-    await Promise.all([
-      playSound(config.sound ? config.beeps : 0, config.sound ? config.soundPath : ""),
-      speakTts(config.tts ? renderTts(alert) : ""),
-    ]);
+    if (isMilestone) {
+      void playSound(config.sound ? config.milestoneBeeps : 0, "", config.tts ? renderTts(alert) : "");
+    } else if (isCompletion) {
+      void playSound(config.sound ? 2 : 0, "", config.tts ? renderTts(alert) : "");
+    } else {
+      void playSound(
+        config.sound ? config.beeps : 0,
+        config.sound ? config.soundPath : "",
+        config.tts ? renderTts(alert) : "",
+      );
+    }
   }
   if (config.toast) {
-    const title = isCompletion ? "任务完成" : "pi 需要你！";
+    const title = isCompletion ? "任务完成" : isMilestone ? "小阶段完成" : "pi 需要你！";
     await showNotification(`🍳 ${title}`, `[${alert.urgency}] ${alert.message}`);
   }
 
@@ -725,8 +859,13 @@ function clearRepeatTimers(): void {
   repeatTimers = [];
 }
 
-function queueAlert(message: string, urgency: Urgency, category: string, ctx: { ui: any }): boolean {
+function queueAlert(message: string, urgency: Urgency, category: string, ctx: { ui: any }, ttsText?: string): boolean {
   if (!config.cooking) return false;
+
+  // milestone（小阶段完成）受开关控制：未开启则忽略；开启则每次都提醒（不共享 completion 上限）
+  if (category === "milestone") {
+    if (!config.milestoneReminders) return false;
+  }
 
   // completion 防打扰：每次离开最多 maxCompletionNotices 次完成通知
   if (category === "completion") {
@@ -748,6 +887,7 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: { 
     category,
     repeatCount: 0,
     acked: false,
+    ttsText,
   };
   config.alerts.push(alert);
   void saveConfig();
@@ -757,7 +897,30 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: { 
 }
 
 // ── mode control ─────────────────────────────────────────────────────────
-function turnOn(ctx: { ui: any }, note: string): void {
+/**
+ * 无条件清理离开状态：任何会话启动都从"在岗"开始。
+ * 离开是临时/单次状态，不跨会话存活（会话关闭后重开，默认在岗，需要时再 on）。
+ */
+function resetCookingState(ctx: { ui: any }): void {
+  clearRepeatTimers();
+  const hadCooking = config.cooking;
+  const hadPending = pendingAlerts().length;
+  config.cooking = false;
+  config.since = undefined;
+  config.alerts = [];
+  config.callingMode = "normal"; // 偏好是会话级的，每次会话重置
+  void saveConfig();
+  ctx.ui.setStatus("i-am-cooking", "");
+  ctx.ui.setWidget("i-am-cooking", []);
+  void restoreVolume(); // 若上次离开拉高了音量，恢复原值
+  if (hadCooking && hadPending) {
+    ctx.ui.notify(`🍳 上次会话的离开状态已清理（现在在岗）。上次离开时被喊了 ${hadPending} 次，已随会话结束归档。`, "info");
+  }
+}
+
+async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: string, askMilestone = false): Promise<void> {
+  // 幂等：已在离开模式则不再重复开启（供 Agent 工具复用，避免重复发指令/拉音量）
+  if (config.cooking) return;
   config.cooking = true;
   config.since = Date.now();
   completionNoticeCount = 0; // 新的一轮离开，重置完成通知计数
@@ -778,15 +941,34 @@ function turnOn(ctx: { ui: any }, note: string): void {
     if (level) setAutonomyLevel(level, `你在 on 备注里说了："${note.slice(0, 40)}"`, ctx);
   }
 
+  // 小阶段完成提醒：每次手动开启时询问用户（TUI 模式）；Agent 开启/非 TUI 用当前配置
+  if (askMilestone && ctx.hasUI && ctx.mode === "tui") {
+    const want = await ctx.ui.confirm(
+      "📈 小阶段完成提醒？",
+      `Agent 每完成一个小阶段（里程碑）都提醒你一次。\n` +
+      `小阶段可能比较频繁（如"已下载 3/10 个文件"）。\n\n` +
+      `开启 = 每次都提醒（轻声提示音）\n不开启 = 只在全部完成或卡住时提醒（${config.milestoneReminders ? "当前为开启，将保持" : "当前为关闭"}）`, 
+    );
+    if (want) {
+      config.milestoneReminders = true;
+      await saveConfig();
+      ctx.ui.notify("📈 小阶段完成提醒已开启：agent 每完成一个小阶段都会轻声提醒你。", "info");
+    }
+  }
+
   const noteText = note ? `备注：${note}` : "";
   const level = config.autonomyLevel || "balanced";
+  const milestoneHint = config.milestoneReminders
+    ? `\n小阶段完成提醒已开启：达到重要小节点时，调用 shout_for_user（category="milestone", urgency="info"）轻声通知我。`
+    : "";
   void api.sendUserMessage(
     `[I am cooking] 我离开去做饭了，不在电脑前。${noteText}\n` +
     `当前自主等级：${AUTONOMY_LABEL[level]}。具体行动指南见注入的 [自主等级指南]（含人类墙等场景的喊我阈值）。\n` +
     `请自主推进任务：能自己解决的就自己解决（采用最合理的默认方案，并在回复里注明你的假设），保证质量，不要降低标准；` +
     `只有达到当前等级的喊我阈值（见 [自主等级指南]）时才调用 shout_for_user 工具大声喊我，` +
     `喊完继续用合理默认值推进，绝不要干等我。\n` +
-    `任务全部完成或达到重要里程碑时，调用 shout_for_user（category="completion", urgency="info"）通知我。`,
+    `任务全部完成或达到重要里程碑时，调用 shout_for_user（category="completion", urgency="info"）通知我。` +
+    milestoneHint,
     { deliverAs: "followUp" },
   );
 }
@@ -838,6 +1020,7 @@ function showStatus(ctx: { ui: any }): void {
     `呼喊偏好: ${CALLING_MODE_LABEL[config.callingMode || "normal"]}`,
     `自主等级: ${AUTONOMY_LABEL[config.autonomyLevel || "balanced"]}`,
     `防打扰: 正常每 ${config.repeatIntervalMinutes} 分钟重喊 / 紧急每 ${config.urgentRepeatMinutes} 分钟重喊 / 完成通知上限 ${config.maxCompletionNotices} 次（/i-am-cooking limits 可调）`,
+    `声音: 哔哔${config.sound ? `${config.beeps}声` : "关"}${config.soundPath ? ` + 自定义歌曲(${config.soundPath})` : ""} / TTS${config.tts ? "开" : "关"} / 总时长${config.soundSeconds ?? 60}秒（/i-am-cooking sound 可调）`,
     `配置: ${CONFIG_PATH}（首次使用请运行 /i-am-cooking setup 配置手机推送）`,
   ];
   ctx.ui.notify(lines.join("\n"), "info");
@@ -1124,6 +1307,7 @@ export default function (pi: ExtensionAPI) {
         { value: "reset-rules", label: "reset-rules", description: "规则恢复出厂默认（内置规则）" },
         { value: "level", label: "level", description: "自主等级：conservative 谨慎(遇墙就喊) / balanced 平衡(默认) / autonomous 放手(能不喊就不喊)" },
         { value: "limits", label: "limits", description: "查看/调整防打扰参数（交互式中文菜单）" },
+        { value: "sound", label: "sound", description: "自定义呼喊铃声：歌曲路径/试听/总时长（交互式中文菜单）" },
       ];
       const filtered = subs.filter((s) => s.value.startsWith(prefix));
       return filtered.length > 0 ? filtered : null;
@@ -1234,8 +1418,113 @@ export default function (pi: ExtensionAPI) {
         await saveConfig();
         return;
       }
+      if (arg === "sound") {
+        // 自定义呼喊铃声（高级设置，交互式中文菜单）
+        if (ctx.mode !== "tui" || !ctx.hasUI) {
+          ctx.ui.notify(
+            `🔊 当前声音设置：\n` +
+            `  哔哔声: ${config.sound ? `${config.beeps} 声` : "关闭"}\n` +
+            `  Agent 语音(TTS): ${config.tts ? "开" : "关"}\n` +
+            `  自定义歌曲: ${config.soundPath || "（未设置）"}\n` +
+            `  总时长上限: ${config.soundSeconds ?? 60} 秒\n` +
+            `（TUI 模式下运行 /i-am-cooking sound 可交互设置）`,
+            "info",
+          );
+          return;
+        }
+        const ui = ctx.ui;
+        const choose = await ui.select(
+          "🔊 呼喊铃声设置（播放顺序：短铃声 → Agent语音 → 自定义歌曲；总时长到点自动停）:",
+          [
+            `查看当前设置` +
+              (config.soundPath ? `（歌曲：${config.soundPath}）` : "（无自定义歌曲）"),
+            `设置自定义歌曲（浏览文件或输入路径，macOS 支持 mp3/wav/m4a）`,
+            `开关：哔哔声/Agent语音/桌面弹窗（当前 声${config.sound ? "开" : "关"} 语${config.tts ? "开" : "关"} 弹${config.toast ? "开" : "关"}）`,
+            `试听当前设置`,
+            `设置总时长上限（当前 ${config.soundSeconds ?? 60} 秒，到点强制停止）`,
+            `清除自定义歌曲（回到只用哔哔+语音）`,
+          ],
+        );
+        if (!choose) { ui.notify("已退出。", "info"); return; }
+        if (choose.includes("查看当前")) {
+          ctx.ui.notify(
+            `🔊 当前声音设置：\n` +
+            `  哔哔声: ${config.sound ? `${config.beeps} 声` : "关闭"}\n` +
+            `  Agent 语音(TTS): ${config.tts ? "开" : "关"}\n` +
+            `  自定义歌曲: ${config.soundPath || "（未设置）"}\n` +
+            `  总时长上限: ${config.soundSeconds ?? 60} 秒`,
+            "info",
+          );
+          return;
+        }
+        if (choose.includes("开关")) {
+          const toggle = await ui.select("🔘 开关设置（选一个切换）:", [
+            `哔哔声：当前 ${config.sound ? "开" : "关"}`,
+            `Agent 语音(TTS)：当前 ${config.tts ? "开" : "关"}`,
+            `桌面弹窗：当前 ${config.toast ? "开" : "关"}`,
+          ]);
+          if (!toggle) { ui.notify("已退出。", "info"); return; }
+          if (toggle.includes("哔哔声")) {
+            config.sound = !config.sound;
+            ui.notify(`✅ 哔哔声已${config.sound ? "开启" : "关闭"}。`, "info");
+          } else if (toggle.includes("语音")) {
+            config.tts = !config.tts;
+            ui.notify(`✅ Agent 语音已${config.tts ? "开启" : "关闭"}。`, "info");
+          } else {
+            config.toast = !config.toast;
+            ui.notify(`✅ 桌面弹窗已${config.toast ? "开启" : "关闭"}。`, "info");
+          }
+          await saveConfig();
+          return;
+        }
+        if (choose.includes("设置自定义歌曲")) {
+          // 先提供文件浏览（从 ~/Music 开始，可逐级进入），也支持手动输入路径
+          const browse = await ui.confirm(
+            "🔊 选择音频文件",
+            `是否从 ~/Music 开始浏览选择音频文件？\n（也可以手动输入路径）`,
+          );
+          let picked: string | null = null;
+          if (browse) {
+            picked = await browseAudioFile(ui, join(homedir(), "Music"));
+          } else {
+            const p = await ui.input("音频文件路径（回车取消）:", config.soundPath);
+            if (p && p.trim()) picked = p.trim().replace(/^~\//, `${homedir()}/`);
+          }
+          if (!picked) { ui.notify("已取消。", "info"); return; }
+          config.soundPath = picked;
+          await saveConfig();
+          ui.notify(`✅ 自定义歌曲已设置：${config.soundPath}\n试听：/i-am-cooking sound 选"试听"；或下次呼喊时自动播放。`, "info");
+          return;
+        }
+        if (choose.includes("试听")) {
+          ui.notify("🔊 正在试听：哔哔 + Agent语音 + 自定义歌曲（最长 10 秒）…", "info");
+          await playSound(
+            config.sound ? config.beeps : 0,
+            config.sound ? config.soundPath : "",
+            config.tts ? "主人，这是测试语音！pi 需要你！" : "",
+          );
+          return;
+        }
+        if (choose.includes("总时长")) {
+          const v = await ui.input("总时长上限（秒，1-300，回车默认 60）:", String(config.soundSeconds ?? 60));
+          if (v === undefined || v === null || v.trim() === "") { ui.notify("已取消。", "info"); return; }
+          const n = parseInt(v.trim(), 10);
+          if (isNaN(n) || n < 1 || n > 300) { ui.notify("❌ 请输入 1-300 的数字。", "warning"); return; }
+          config.soundSeconds = n;
+          await saveConfig();
+          ui.notify(`✅ 总时长上限已设为 ${n} 秒（到点强制停止）。`, "info");
+          return;
+        }
+        if (choose.includes("清除自定义歌曲")) {
+          config.soundPath = "";
+          await saveConfig();
+          ui.notify("✅ 已清除自定义歌曲（回到哔哔 + Agent 语音）。", "info");
+          return;
+        }
+        return;
+      }
       const note = arg.startsWith("on") ? arg.slice(2).trim() : arg;
-      turnOn(ctx, note);
+      await turnOn(ctx, note, true); // 手动开启：询问是否开启小阶段提醒
     },
   });
 
@@ -1256,7 +1545,10 @@ export default function (pi: ExtensionAPI) {
       }),
       urgency: StringEnum(["info", "normal", "urgent"] as const),
       category: Type.Optional(Type.String({
-        description: "分类：decision / credential / approval / clarification / help 等",
+        description: "分类：decision / credential / approval / clarification / help / completion（全部完成）/ milestone（小阶段完成，仅当用户开启了小阶段提醒时用）等",
+      })),
+      ttsText: Type.Optional(Type.String({
+        description: "可选：想让用户听到的语音原文（TTS 将原样念出，不走默认模板）。例如：\"主人！方案 A 和 B 我拿不准，快回来看看！\" 不填则用默认模板（\"主人，快来！pi 需要你！+消息\"）。",
       })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1266,12 +1558,12 @@ export default function (pi: ExtensionAPI) {
           details: { fired: false },
         };
       }
-      const queued = queueAlert(params.message, params.urgency, params.category ?? "other", ctx);
+      const queued = queueAlert(params.message, params.urgency, params.category ?? "other", ctx, params.ttsText);
       return {
         content: [{ type: "text", text: queued
-          ? `呼喊已发出（${params.urgency}）。继续用最合理的默认方案推进，并在回复里注明你的假设；用户回来后会自动收到你的汇报。`
+          ? `呼喊已发出（${params.urgency}）${params.ttsText ? `，语音：${params.ttsText}` : ""}。继续用最合理的默认方案推进，并在回复里注明你的假设；用户回来后会自动收到你的汇报。`
           : "已有同内容的未确认呼喊，不重复发送。" }],
-        details: { fired: queued, urgency: params.urgency, category: params.category ?? "other" },
+        details: { fired: queued, urgency: params.urgency, category: params.category ?? "other", ttsText: params.ttsText ?? null },
       };
     },
   });
@@ -1333,19 +1625,101 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // 工具：用户表达要离开时，Agent 自主开启离开模式（用户无需手输命令）
+  pi.registerTool({
+    name: "enter_cooking_mode",
+    label: "Enter Cooking Mode",
+    description:
+      "开启离开模式：用户不在电脑前时 agent 自主推进任务，卡住时大声呼喊用户，任务完成时通知。\n" +
+      "**仅在用户非常明确地表达要离开电脑时调用**——例如：" +
+      "\"我去做饭了，你继续\" / \"我离开一下，有事喊我\" / \"我出门了，你自主处理\" / \"I'm cooking, handle it\" / 语音识别或输入的自然语言明确表示要离开。\n" +
+      "**不要误开**：如果用户只是短暂离开话题、问你问题、或让你继续普通对话（没有明确表示要离开电脑/无法即时回复），不要调用。" +
+      "不确定时宁可不开——用户会在需要时自己执行 /i-am-cooking on。",
+    promptSnippet: "Enter away-mode when the user is clearly leaving the computer (cooking, stepping away, going out)",
+    promptGuidelines: [
+      "Call enter_cooking_mode ONLY when the user unambiguously says they are leaving the computer and won't be available (e.g. cooking, stepping away, going out) and expects you to keep working autonomously. If unsure, do NOT call it — the user can enable it themselves with /i-am-cooking on.",
+    ],
+    parameters: Type.Object({
+      note: Type.Optional(Type.String({
+        description: "用户的离开说明或布置的任务（可选），例如：\"继续做调研，遇到人类墙喊我\"",
+      })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (config.cooking) {
+        return {
+          content: [{ type: "text", text: "已在离开模式中，无需重复开启。" }],
+          details: { entered: false, alreadyCooking: true },
+        };
+      }
+      await turnOn(ctx, params.note ?? ""); // Agent 开启：不询问，沿用当前配置
+      return {
+        content: [{ type: "text", text: `已开启离开模式${params.note ? `，备注：${params.note}` : ""}。请按注入的自主规则推进任务，卡住时用 shout_for_user 喊用户，任务完成时通知。` }],
+        details: { entered: true, note: params.note ?? "" },
+      };
+    },
+  });
+
+  // 工具：用户要求更换呼喊铃声时，agent 帮助设置自定义歌曲
+  pi.registerTool({
+    name: "set_shout_sound",
+    label: "Set Shout Sound",
+    description:
+      "设置呼喊铃声的自定义歌曲（用户离开时听到的提醒音频）。\n" +
+      "**仅在用户明确要求更换/设置铃声时调用**，例如：\"帮我换个铃声\" / \"把声音设成那首歌\" / \"用 xxx.mp3 当提醒音\"。\n" +
+      "path 必须是本机存在的音频文件路径（macOS 支持 mp3/wav/m4a/aiff）。\n" +
+      "如果用户没给具体路径，不要猜测——先问用户路径，或建议用户运行 /i-am-cooking sound 用文件浏览器选择。",
+    promptSnippet: "Set the custom shout ringtone when the user asks to change the alert sound",
+    promptGuidelines: [
+      "Call set_shout_sound ONLY when the user explicitly asks to change/set the ringtone and gives a specific audio file path. Do not guess paths — ask the user or suggest /i-am-cooking sound for the file browser.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({ description: "音频文件完整路径，例如：\"/Users/name/Music/ring.mp3\"" }),
+      soundSeconds: Type.Optional(Type.Number({ description: "可选：总时长上限（秒，1-300）。不填则保持当前值（默认 60）" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const p = params.path.trim().replace(/^~\//, `${homedir()}/`);
+      // 校验路径存在
+      try {
+        const st = await import("node:fs/promises").then((m) => m.stat(p));
+        if (!st.isFile()) {
+          return {
+            content: [{ type: "text", text: `路径不是文件：${p}` }],
+            details: { set: false, reason: "not-a-file" },
+          };
+        }
+      } catch {
+        return {
+          content: [{ type: "text", text: `文件不存在：${p}。请确认路径，或建议用户运行 /i-am-cooking sound 用文件浏览器选择。` }],
+          details: { set: false, reason: "not-found" },
+        };
+      }
+      if (!isAudioFile(p)) {
+        return {
+          content: [{ type: "text", text: `不支持的文件类型（支持 mp3/wav/m4a/aiff/ogg/flac）：${p}` }],
+          details: { set: false, reason: "unsupported-format" },
+        };
+      }
+      config.soundPath = p;
+      if (params.soundSeconds !== undefined) {
+        const n = Math.max(1, Math.min(300, Math.round(params.soundSeconds)));
+        config.soundSeconds = n;
+      }
+      void saveConfig();
+      ctx.ui.notify(`🔊 呼喊铃声已更新：${p}`, "info");
+      return {
+        content: [{ type: "text", text: `已设置呼喊铃声：${p}${params.soundSeconds !== undefined ? `（总时长 ${config.soundSeconds} 秒）` : ""}。下次呼喊时会先播短铃声+语音，再播这首歌。用户可随时用 /i-am-cooking sound 试听。` }],
+        details: { set: true, path: p, soundSeconds: config.soundSeconds },
+      };
+    },
+  });
+
   // ── events ──
   pi.on("session_start", async (_event, ctx) => {
     await loadConfig();
     await ensureRulesFile(); // 首次启动用内置默认创建规则文件，已存在则不动
-    if (config.cooking) {
-      ctx.ui.setStatus("i-am-cooking", "🍳 离开中（I am cooking）");
-      updateWidget(ctx);
-      void boostVolume(); // 恢复 session 时重新拉高音量
-      // 恢复未确认的 urgent 呼喊的重复提醒
-      for (const a of pendingAlerts().filter((x) => x.urgency === "urgent")) {
-        scheduleRepeats(a, ctx);
-      }
-    } else if (!config.setupDone) {
+    // 离开状态不跨会话存活：任何会话启动都从"在岗"开始（需要时用户或 Agent 再 on）
+    resetCookingState(ctx);
+    if (!config.setupDone) {
       // 初次使用：提醒配置手机推送
       ctx.ui.notify(
         "🍳 I am cooking 插件已加载。首次使用建议运行 /i-am-cooking setup 配置手机推送（人在厨房也能收到呼喊）。",

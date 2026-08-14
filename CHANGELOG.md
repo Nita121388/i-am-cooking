@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **三层消息音频区分**：🚨需要你（完整三段式含歌曲）/ ✅整个完成（2声不播歌）/ 📈小阶段完成（1声轻声）——听声即知发生了什么。
+- **小阶段完成提醒开关**：`shout_for_user` 支持 `category="milestone"`；每次手动开启离开模式时询问是否开启（开启=每小阶段轻声提醒，关闭=只在全部完成/卡住时通知）。
+- **铃声文件浏览器** `/i-am-cooking sound`：设置歌曲时从 `~/Music` 逐级浏览（📁文件夹/🔊音频文件）选择，无需手输路径；仍支持手动输入。
+- **`set_shout_sound` 工具**：用户说"帮我换个铃声"并给路径时，agent 可帮助设置自定义歌曲（含路径校验/格式校验）。
+- **声音开关菜单** `/i-am-cooking sound`：新增「开关」选项，可切换 哔哔声/Agent语音/桌面弹窗（此前只能改 config.json）。
+- **安全边界文档**：README 新增"Agent 不能设置什么"表格，说明手机推送/音量/防打扰/规则等为何不交给 agent。
+- **自定义呼喊铃声** `/i-am-cooking sound`：三段式顺序播放（短铃声 → Agent 语音 → 自定义歌曲），总时长默认 60 秒到点强制停止（可调 1-300 秒）；支持试听、路径设置/清除；macOS afplay / Linux paplay / Windows PowerShell。
+- **Agent 自由语音**：`shout_for_user` 新增可选 `ttsText` 参数——Agent 填了则 TTS 原样念出（不走默认模板），让呼喊更个性化。
+
+### Changed
+- **离开状态不跨会话**：任何会话启动都从"在岗"开始（`resetCookingState`），上次会话的离开模式不再自动恢复；旧呼喊记录随会话结束直接清空（不再保留待办）。
+- **Agent 自主开启离开模式**：新增 `enter_cooking_mode` 工具，用户说"我去做饭了/我离开一下/I'm cooking"等明确表达时 agent 理解并自动开启（无需手输命令）；工具描述严格限定仅在用户意图非常明确时调用，避免误开。
+
 ### Fixed
 - **回来输入被忽略**：cooking 模式中用户打字回来时，输入内容现在会作为新指令转交给 agent（之前 followUp 只发固定"汇报进度"消息，用户补充内容被丢弃导致 agent 继续原方向）。input handler 返回 `handled` 避免消息重复。
 

@@ -14,25 +14,53 @@ _"pi 需要你！" (pi needs you!)_
 | Feature | Description |
 |---|---|
 | 🧠 Autonomous mode | `/i-am-cooking on` injects "work autonomously, don't wait" rules into the agent |
-| 📣 Multi-channel shout | sound (beeps / custom wav) + Chinese TTS + desktop toast + **phone push** (ntfy / webhook) + TUI banner |
+| 🤖 Agent-initiated | just say "I'm cooking", "我去做饭了" or "我离开一下" — the agent understands and enters away-mode itself (`enter_cooking_mode`) |
+| 📣 Multi-channel shout | sound (beeps) + Chinese TTS + desktop toast + **phone push** (ntfy / webhook) + TUI banner |
+| 🎵 Custom ringtone | 3-stage playback: short beeps → agent voice → **your own song** (`/i-am-cooking sound`), auto-stops after a total budget |
+| 🗣️ Agent free speech | when shouting, the agent can speak exactly what it wants (`ttsText`), not just the default template |
 | 📱 Phone push | ntfy.sh (free, zero-config) — the key channel when you're in the kitchen |
 | 🔔 Completion alerts | agent notifies you when the task is done: "主人，好消息！任务完成了！" |
 | 🎛️ Dynamic preferences | agent adjusts alert mode from your words: "别喊了" → silence, "完成后喊我" → completion only, "随时汇报" → eager… |
-| 🛡️ Safety net | if the agent ends its turn with a question while you're away, it auto-shouts |
-| 🔙 Auto-exit | just type anything while cooking mode is on → "I'm back", agent debriefs what it shouted |
-| 🔊 Volume boost | opt-in: auto-raise system volume when you leave, restore when you return |
+| 🚀 Autonomy levels | how much the agent should call you when blocked: `conservative` (shout on any human wall) / `balanced` (default) / `autonomous` (avoid shouting) |
+| 🛡️ Safety net | if the agent ends its turn with a question while you're away, it auto-shouts (under `autonomous` level, only errors shout) |
+| 🔙 Auto-exit | just send a message while cooking mode is on → "I'm back", agent debriefs what it shouted |
+| 🔊 Volume boost | opt-in: auto-raise system volume when you leave, restore when you return (mute state included) |
 | 🗣️ Setup wizard | `/i-am-cooking setup` — guided, with ntfy explainer, auto-random topic, preview-then-confirm |
 | 🔐 Token security | token fields support `${ENV_VAR}` so secrets never hit disk |
+| 🧠 User-editable rules | behavior rules are one `rules.md` file, effective on save |
 | 💻 Cross-platform | Windows / macOS / Linux |
+
+## 🎯 Workflow
+
+```mermaid
+flowchart TD
+    A[🏠 At work] --> B{User leaving?}
+    B -->|Manual| C["/i-am-cooking on note"]
+    B -->|Natural language| D["Say: I'm cooking, keep going"]
+    C --> E[🍳 Cooking mode ON]
+    D --> E
+    E --> F[Agent works autonomously<br/>decides whether to shout per autonomy level]
+    F --> G{What happens?}
+    G -->|Human wall / needs decision| H["shout_for_user"]
+    G -->|Task complete| I["Completion notice (info)"]
+    G -->|Can solve itself| F
+    H --> J[📣 Multi-channel shout<br/>beeps/voice/song + toast/phone]
+    I --> J
+    J --> K[⌨️ You send a message when back]
+    K --> L[🔙 Auto-exit + agent debrief<br/>\"I shouted you N times\"]
+    L --> A
+```
+
+**In one sentence**: say you're leaving (or just "I'm cooking") → cooking mode on → agent works, shouts you when needed → you send a message when back → auto-exit + debrief.
 
 ## 📦 Install
 
 ```bash
 # from GitHub
-pi install git:github.com/<your-name>/i-am-cooking
+pi install git:github.com/Nita121388/i-am-cooking
 
-# or local path during development
-pi install E:/File/NitaFile/Projects/i-am-cooking
+# or local path during development (from source)
+pi install /path/to/your/local/checkout
 
 # or from npm (after publish)
 pi install npm:i-am-cooking
@@ -50,17 +78,63 @@ Reload pi (`/reload`) after installing.
 /i-am-cooking status                    # view mode / pending shouts / channels / preference
 ```
 
+> 💡 **Two ways to enter cooking mode:**
+> - **Automatic**: just say "I'm cooking", "我去做饭了，你继续" or "我离开一下，有事喊我" — the agent understands and enters away-mode itself (`enter_cooking_mode`). It only does this when your intent is unambiguous.
+> - **Manual**: `/i-am-cooking on [note]` (note can carry preferences, e.g. `on 完成后喊我`).
+
+> ⚠️ **Away state does NOT survive sessions**: every session starts "at work". The cooking state from a previous session is never auto-restored — re-enable it when needed.
+
 ## 📖 Commands
 
-| Command | Description |
-|---|---|
-| `/i-am-cooking on [note]` | Enter cooking mode. Note can carry a preference, e.g. `on 完成后喊我` |
-| `/i-am-cooking off` | Leave cooking mode; agent receives a debrief of what it shouted |
-| `/i-am-cooking status` | Mode, pending shouts, channels, token state, current preference |
-| `/i-am-cooking setup` | Interactive wizard: ntfy / webhook, token, volume boost permission |
-| `/i-am-cooking rules` | Show currently active rules (built-in or user file) |
-| `/i-am-cooking edit-rules` | Edit the rules file (saves instantly) |
-| `/i-am-cooking test` | Fire a test shout on all channels (no mode needed) |
+| Command | Description | Example |
+|---|---|---|
+| `/i-am-cooking on [note]` | Enter cooking mode. Note can carry preferences & autonomy level | `on 完成后喊我` / `on 谨慎点继续调研` |
+| `/i-am-cooking off` | Leave cooking mode; agent receives a debrief of what it shouted | `off` |
+| `/i-am-cooking status` | Mode, pending shouts, channels, volume, preferences, level, anti-noise params | `status` |
+| `/i-am-cooking setup` | Interactive wizard: phone push + volume + autonomy level | `setup` |
+| `/i-am-cooking test` | Test all channels, per-channel real result | `test` |
+| `/i-am-cooking rules` | Show currently active rules | `rules` |
+| `/i-am-cooking edit-rules` | Edit the rules file (saves instantly) | `edit-rules` |
+| `/i-am-cooking reset-rules` | Restore factory-default rules | `reset-rules` |
+| `/i-am-cooking level [level]` | Autonomy level: conservative / balanced / autonomous (no arg = show) | `level autonomous` |
+| `/i-am-cooking limits` | Adjust anti-noise parameters (interactive Chinese menu) | `limits` |
+| `/i-am-cooking sound` | Custom shout ringtone (interactive Chinese menu) | `sound` |
+
+Tab-completion is supported: type `/i-am-cooking ` then press Tab.
+
+## 🤖 Agent tools (capabilities for the LLM)
+
+Besides your manual commands, the **agent itself calls 4 tools** to understand you, shout at you, and adjust behavior:
+
+| Tool | Purpose | When the agent calls it |
+|---|---|---|
+| `enter_cooking_mode` | Enter cooking mode | when you **clearly** say you're leaving ("I'm cooking" / "我去做饭了" / "我离开一下"); never on ambiguity |
+| `set_shout_sound` | Set the custom shout ringtone | you say "帮我换个铃声" / "use xxx.mp3" and give a concrete path |
+| `shout_for_user` | Loudly shout at you | when blocked and only you can unblock (decision / credential / approval / clarification), or when the task is done |
+| `set_calling_preference` | Adjust calling preference (how loud) | you say "别喊了"→silence, "完成后喊我"→completion_only, etc. |
+| `set_autonomy_level` | Adjust autonomy level (whether to shout) | you say "遇墙就喊"→conservative, "能不喊就不喊"→autonomous, etc. |
+
+**`shout_for_user` parameters**:
+
+| Param | Required | Description |
+|---|---|---|
+| `message` | ✅ | short actionable shout content |
+| `urgency` | ✅ | `info` (completion) / `normal` / `urgent` |
+| `category` | ❌ | decision / credential / approval / clarification / help |
+| `ttsText` | ❌ | **free speech**: TTS speaks this exactly, bypassing the default template |
+
+> These tools degrade safely when cooking mode is off (e.g. `shout_for_user` tells the agent "the user is right there") — no spurious shouts.
+
+### What the agent CANNOT set (safety boundary)
+
+| Config | How to set | Why not the agent |
+|---|---|---|
+| 📱 Phone push (ntfy/webhook + token) | `/i-am-cooking setup` wizard / manual config.json | sensitive credentials, human-only |
+| 🔊 Volume boost toggle | `/i-am-cooking setup` wizard | system-level change, needs explicit consent |
+| 🛡️ Anti-noise parameters | `/i-am-cooking limits` | guardrail defaults are sensible, avoid accidental changes |
+| 🧠 Rules file rules.md | `/i-am-cooking edit-rules` / manual edit | rules are the user's will; the agent must not edit itself |
+| 🔘 Toggles (sound/tts/toast) | `/i-am-cooking sound` menu "开关" | supported via command |
+| 🔙 Exit cooking mode | no tool (only user message / `off`) | prevent the agent from disabling away-mode itself |
 
 ## 🧠 User-editable rules
 
@@ -69,11 +143,36 @@ The behavior rules while you're away are not hard-coded — you can edit them:
 ```
 /i-am-cooking edit-rules    # open editor, save = immediately effective
 /i-am-cooking rules         # show currently active rules
+/i-am-cooking reset-rules   # restore factory default
 ```
 
-The rules file is `~/.pi/i-am-cooking/rules.md` (Markdown). When missing, built-in defaults apply
-(autonomy, when to shout, completion notices). A guard rail is always appended:
-"never end your turn silently waiting for user input".
+The rules file is `~/.pi/i-am-cooking/rules.md` (Markdown), auto-created on first run from the
+factory template. It is the **single source of effective rules** — edit it with any editor.
+
+The factory template lives in the repo at `extensions/i-am-cooking/rules.default.md` (shipped with
+the plugin). It is copied into the user file on first run; after that the user fully owns `rules.md`.
+
+### ⏰ When do rules take effect?
+
+Rules are **re-read every turn with zero caching** — the plugin re-reads the file in `before_agent_start` and injects it into the system prompt. So:
+
+```
+edit rules.md in any editor → save
+  ↓ no restart / no /reload / no need to re-`on`
+next agent turn → new rules active
+```
+
+| What you change | Effect |
+|---|---|
+| add a rule like "never touch production code" | agent follows it from the next away-turn (depends on LLM) |
+| delete the "when to shout" section | shout timing is handled by the autonomy level guide (a mechanism layer, unaffected) |
+| empty the whole file | only the guard rail + level guide remain; the agent still never idles |
+| edit the file while NOT in cooking mode | **no effect** (rules are only injected during cooking mode) |
+| edit the repo `rules.default.md` | does not affect an existing user rules.md; only affects fresh installs / `reset-rules` |
+
+> ⚠️ Rules are **only injected during cooking mode** (`before_agent_start` checks `config.cooking`) — editing them mid-conversation does nothing.
+
+A guard rail is always appended and cannot be removed: "never end your turn silently waiting for user input" — this prevents the agent from idling if rules are emptied.
 
 ## 🧠 Dynamic calling preferences
 
@@ -92,6 +191,62 @@ Two detection paths (belt & suspenders):
 1. **Text matching** (extension code, instant): keywords in your typed messages or `on` notes.
 2. **Semantic understanding** (agent): the agent calls `set_calling_preference` for expressions the keywords don't cover, e.g. "我睡会儿".
 
+## 🚀 Autonomy levels
+
+Calling preference controls **how loudly** the agent shouts; **autonomy level** controls **whether it should shout at all** when blocked (e.g. a **human wall**: captcha / login / manual clicks that only you can do). The two are orthogonal.
+
+```
+/i-am-cooking level                   # show current level
+/i-am-cooking level conservative      # careful: shout on any human wall
+/i-am-cooking level balanced          # balanced (default): shout when it's hard enough
+/i-am-cooking level autonomous        # hands-off: avoid shouting
+```
+
+| Level | Behavior |
+|---|---|
+| `conservative` | Shout immediately on any human wall (captcha / login / manual clicks); confirm with you before decisions / approvals / credentials / clarifications; ask when requirements are ambiguous; only do fully-deterministic, low-risk work autonomously |
+| `balanced` (default) | Shout only on human walls; ordinary decisions / ambiguity → proceed with the most reasonable default and note your assumption; shout only when "can't proceed after autonomous attempts" or "wrong choice is costly" |
+| `autonomous` | Avoid shouting; make and log all decisions/assumptions yourself; shout only when the task is completely stuck (no permission / external service down / hard constraint violated) |
+
+> All three levels embed a **quality guarantee**: autonomy ≠ lower standards — when unsure, pick the safest approach.
+
+The level persists (config.json, survives across sessions); switch via `on` note (`on 谨慎点继续`), natural speech ("遇墙就喊我" / "能不喊就不喊"), or agent semantic understanding (`set_autonomy_level`).
+
+## 🔊 Custom shout ringtone (advanced)
+
+The shout sound plays in order **short beeps → agent voice → your custom song**, stopping automatically when the total budget is reached:
+
+```
+/i-am-cooking sound
+```
+
+Interactive Chinese menu: show current settings / set a custom song / preview / set total duration (default 60 s) / clear the song.
+
+**Two ways to set a song:**
+- **File browser**: start from `~/Music`, browse folders (📁) and audio files (🔊) level by level — no need to type a path
+- **Manual path**: type a full path (e.g. `~/Music/闹铃.mp3`)
+
+You can also just tell the agent "帮我换个铃声" with a path — it calls the `set_shout_sound` tool to set it for you.
+
+| Stage | Description |
+|---|---|
+| ① Short beeps | system beeps (default 4) |
+| ② Agent voice | Chinese TTS. The agent can pass `ttsText` to `shout_for_user` to **speak exactly what it wants** (e.g. "主人！方案 A 和 B 我拿不准，快回来看看！"); otherwise the default template is used |
+| ③ Custom song | your audio file (macOS: mp3/wav/m4a; Linux: wav/ogg; Windows: wav recommended) |
+| ⏱ Total duration | default 60 s, force-stopped at the limit, adjustable (1–300 s) |
+
+> Format tip: **wav works everywhere**; mp3 is best on macOS/Linux.
+
+**Three messages, three sounds** (know what happened by the sound):
+
+| Message | Audio | Example |
+|---|---|---|
+| 🚨 Need you | full 3-stage: 4 beeps + voice + your song (most attention-grabbing) | "need you to decide A or B" |
+| ✅ Whole completion | 2 beeps + completion voice (no song, quiet good news) | "all tasks done!" |
+| 📈 Milestone | 1 beep + short voice (subtle) | "downloaded 3/10 files" |
+
+> 📈 **Milestone reminders are a toggle**: each time you manually enter cooking mode it asks "enable milestone reminders?" — on = the agent softly pings every small milestone; off = only notify on full completion or when stuck.
+
 ## 📱 Phone push setup
 
 ```
@@ -108,12 +263,16 @@ Manual config in `~/.pi/i-am-cooking/config.json`:
   "phonePush": true,
   "pushProvider": "ntfy",
   "ntfyTopic": "i-am-cooking-your-random-topic",
-  "ntfyToken": "${NTFY_TOKEN}"
+  "ntfyToken": "${NTFY_TOKEN}",
+  "autonomyLevel": "balanced",
+  "soundSeconds": 60
 }
 ```
 
 Tokens support `${ENV_VAR}` / `$ENV_VAR` references. Webhook providers (Bark, WeChat Work bot,
 ServerChan) are supported via `pushProvider: "webhook"` + `webhookUrl`.
+
+> Other fields (`beeps` / `soundPath` / `repeatIntervalMinutes` …) have sensible defaults; adjust them with the commands instead of hand-editing: `/i-am-cooking level`, `/i-am-cooking sound`, `/i-am-cooking limits`.
 
 ## 🔊 Volume control (opt-in)
 
@@ -126,25 +285,33 @@ Prevents you missing the shout when the system volume is low or muted:
 | Linux | `pactl` (PulseAudio) |
 
 When enabled, entering cooking mode raises volume to `boostLevel` (default 80) only if it's lower,
-and restores the original value on exit. You are asked explicitly in the setup wizard.
+and restores the original value **and mute state** on exit (macOS reads both `output volume` and
+`output muted`). You are asked explicitly in the setup wizard.
 
-## 🛡️ Anti-noise guards (system-enforced)
+## 🛡️ Anti-noise guards (defaults, adjustable)
 
-- Completion alerts never repeat, are `info`-level ("好消息！"), and are capped at
-  `maxCompletionNotices` (default 3) per cooking session.
-- `normal` shouts repeat once after `repeatIntervalMinutes`; `urgent` repeats every
-  `urgentRepeatMinutes` until you return.
-- Duplicate shouts are deduplicated within 10 minutes.
+> Need-you / whole-completion / milestone are **three different kinds of messages** — each has its own independent limits.
+
+| Limit | Applies to | Default | Adjust |
+|---|---|---|---|
+| Same task completion never repeats | ✅ whole completion | never repeats | fixed |
+| Max completion notices per away period (different tasks) | ✅ whole completion | 3 | `/i-am-cooking limits` |
+| Milestone reminders | 📈 milestone | off (asks you each time you enter) | ask on enter |
+| Normal shout repeat | ⚠️ normal shout | **3 minutes** (once) | `/i-am-cooking limits` |
+| Urgent shout repeats | 🚨 urgent shout | **1 minute**, until you return | `/i-am-cooking limits` |
+| Deduplicate same message | all messages | within 10 min | fixed |
+
+Run `/i-am-cooking limits` for an interactive Chinese menu — no need to memorize English params.
 
 ## 🖥️ Platform support
 
-| Platform | Sound | Chinese TTS | Desktop notif | Phone push | Volume |
-|---|---|---|---|---|---|
-| Windows | ✅ | ✅ | ✅ Toast | ✅ | ✅ |
-| macOS | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Linux | ✅¹ | ✅¹ | ✅¹ | ✅ | ✅¹ |
+| Platform | Sound | Chinese TTS | Custom song | Desktop notif | Phone push | Volume |
+|---|---|---|---|---|---|---|
+| Windows | ✅ | ✅ | ✅ wav | ✅ Toast | ✅ | ✅ |
+| macOS | ✅ | ✅ | ✅ mp3/wav/m4a | ✅ | ✅ | ✅ |
+| Linux | ✅¹ | ✅¹ | ✅¹ wav/ogg | ✅¹ | ✅ | ✅¹ |
 
-¹ Linux: `canberra-gtk-play` / `espeak-ng` / `notify-send` / `pactl` — install the relevant packages.
+¹ Linux: `canberra-gtk-play` / `espeak-ng` / `paplay` / `notify-send` / `pactl` — install the relevant packages.
 
 ## ✅ Verification checklist
 

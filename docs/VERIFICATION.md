@@ -11,18 +11,22 @@
 - [ ] Typing anything while cooking mode is on → auto-exit + agent debrief
 - [ ] `/i-am-cooking off` — debrief contains pending shouts summary, volume restored (if enabled)
 
-## 2. Dynamic preferences
+## 2. Dynamic preferences & autonomy
 
 - [ ] `/i-am-cooking on 完成后喊我` → preference becomes `completion_only` (only completions ring)
 - [ ] Typing "别喊了" while away → preference becomes `silence` (banner only, no sounds)
 - [ ] `set_calling_preference` tool switches modes (simulate via agent)
 - [ ] `completion` category shout → "主人，好消息！" TTS, ✅ icon, no repeat
 - [ ] `maxCompletionNotices` cap works (3 per session)
+- [ ] `/i-am-cooking level autonomous` → agent_settled no longer shouts on "？" questions (errors still shout)
+- [ ] Saying "我离开一下" / "I'm cooking" → agent calls `enter_cooking_mode` and enters away-mode
+- [ ] Saying something ambiguous (e.g. a question) → agent does NOT auto-enter cooking mode
 
 ## 3. Volume control (if enabled)
 
 - [ ] System volume at 0% → `on` raises to 80% → shout audible → `off` restores 0%
 - [ ] System volume at 100% → `on` does NOT lower it
+- [ ] macOS: muted=true (Mute key) → `on` plays sound, `off` restores mute state
 
 ## 4. Auto-detect safety net
 
@@ -38,20 +42,28 @@
 
 ## 6. User-editable rules
 
-- [ ] `/i-am-cooking edit-rules` creates `~/.pi/i-am-cooking-rules.md` template
+- [ ] `/i-am-cooking edit-rules` creates `~/.pi/i-am-cooking/rules.md` (from factory template)
 - [ ] Editing the file (custom rule added) → injected into next cooking-mode turn
-- [ ] `/i-am-cooking rules` shows the user file as source once it exists
-- [ ] Deleting the rules file → falls back to built-in defaults
+- [ ] `/i-am-cooking rules` shows the file as the single source of effective rules
+- [ ] Deleting the rules file → falls back to factory defaults (rules.default.md)
+- [ ] `/i-am-cooking reset-rules` restores factory defaults
 - [ ] Guard rail ("绝不要默默结束回合") is always appended even with custom rules
 
-## 7. Robustness
+## 7. Custom ringtone & session isolation
+
+- [ ] `/i-am-cooking sound` → set a custom song path → `/i-am-cooking test` plays beeps → voice → song
+- [ ] Song stops automatically at the total-duration budget (default 60 s)
+- [ ] `shout_for_user` with `ttsText` → TTS speaks the exact text (not the template)
+- [ ] Away-mode ON in session A → close it → open a new session → status shows "在岗" (no leftover cooking state)
+
+## 8. Robustness
 
 - [ ] `/reload` after config edit — no errors
 - [ ] Removing the package → pi starts clean, no dangling errors
 - [ ] TTS/toast copy says "pi 需要你" / "任务完成" (not "I am cooking 需要你")
 - [ ] Extension loads in fresh install: `pi install git:...` → `/reload` → `/i-am-cooking status` works
 
-## 7. Cross-platform (if available)
+## 9. Cross-platform (if available)
 
 - [ ] Windows: all channels + volume (Core Audio)
 - [ ] macOS: sound/TTS (`say`)/notification (`osascript`)/volume
