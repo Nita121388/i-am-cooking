@@ -1060,6 +1060,7 @@ export default function (pi: ExtensionAPI) {
   // ── events ──
   pi.on("session_start", async (_event, ctx) => {
     await loadConfig();
+    await ensureRulesFile(); // 首次启动创建规则文件模板，已存在则不动
     if (config.cooking) {
       ctx.ui.setStatus("i-am-cooking", "🍳 离开中（I am cooking）");
       updateWidget(ctx);

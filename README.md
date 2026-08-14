@@ -70,7 +70,7 @@ agent 离开模式的行为规则不是写死的，你可以自己改：
 /i-am-cooking rules         # 查看当前生效规则
 ```
 
-规则文件在 `~/.pi/i-am-cooking-rules.md`（Markdown），也可用任意编辑器直接改。
+规则文件在 `~/.pi/i-am-cooking-rules.md`（Markdown），**首次启动插件时自动创建**——直接去这个文件夹改就行，任何编辑器都能编辑。
 
 内置默认规则（未创建文件时用）：
 
