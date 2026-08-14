@@ -58,6 +58,8 @@ pi install npm:i-am-cooking
 | `/i-am-cooking rules` | 查看当前生效的规则 |
 | `/i-am-cooking edit-rules` | 编辑规则文件（保存即生效） |
 | `/i-am-cooking reset-rules` | 规则恢复出厂默认（来自仓库默认模板） |
+| `/i-am-cooking level` | 自主等级：conservative / balanced / autonomous |
+| `/i-am-cooking limits` | 查看/调整防打扰参数（交互式中文菜单） |
 | `/i-am-cooking test` | 测试所有通道（无需开模式） |
 
 子命令支持 Tab 补全：`/i-am-cooking ` 后按 Tab 弹出选项。
@@ -151,15 +153,17 @@ setup 向导里会明确问你"允许吗"，默认关闭。允许后每次 `on` 
 | macOS | `osascript`（系统自带） |
 | Linux | `pactl`（PulseAudio） |
 
-## 🛡️ 防打扰机制（系统强制）
+## 🛡️ 防打扰机制（默认护栏，可调）
 
-| 规则 | 值 |
-|---|---|
-| 完成通知只喊一次 | 不重复 |
-| 每次离开最多喊几轮完成 | `maxCompletionNotices` 默认 3 |
-| 正常级别重复一次 | 5 分钟后 |
-| 紧急级别反复喊 | 3 分钟一次，直到你回来 |
-| 10 分钟内不重复同内容 | 自动去重 |
+| 规则 | 默认值 | 调整方式 |
+|---|---|---|
+| 完成通知只喊一次 | 不重复 | 固定 |
+| 每次离开最多喊几轮完成 | `maxCompletionNotices` 默认 3 | `/i-am-cooking limits` |
+| 正常级别重复 | **3 分钟**一次（只重复一次） | `/i-am-cooking limits` |
+| 紧急级别反复喊 | **1 分钟**一次，直到你回来 | `/i-am-cooking limits` |
+| 10 分钟内不重复同内容 | 自动去重 | 固定 |
+
+运行 `/i-am-cooking limits` 弹中文菜单即可调整（无需记英文参数）：
 
 ## 🖥️ 平台支持
 

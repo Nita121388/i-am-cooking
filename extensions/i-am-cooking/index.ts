@@ -14,6 +14,8 @@
  *   /i-am-cooking rules       — 查看当前生效规则
  *   /i-am-cooking edit-rules  — 编辑规则文件（保存即生效）
  *   /i-am-cooking reset-rules — 规则恢复出厂默认（内置规则）
+ *   /i-am-cooking level       — 自主等级（conservative/balanced/autonomous）
+ *   /i-am-cooking limits      — 查看/调整防打扰参数（交互式中文）
  *
  * 工具 (LLM 调用):
  *   shout_for_user           — 卡住且只有用户能解决时调用
@@ -154,8 +156,8 @@ const DEFAULTS: Config = {
   setupDone: false,
   autoDetect: true,
   exitOnUserInput: true,
-  repeatIntervalMinutes: 5,
-  urgentRepeatMinutes: 3,
+  repeatIntervalMinutes: 3,
+  urgentRepeatMinutes: 1,
   maxUrgentRepeats: -1,
   boostVolume: false, // 默认关，需在 setup 里允许
   boostLevel: 80,
@@ -370,6 +372,7 @@ async function showNotification(title: string, body: string): Promise<void> {
 
 // ── volume control（需用户允许 boostVolume 才启用） ──────────────────────
 let savedVolumePct: number | null = null; // 离开前的原始音量（0-100）
+let savedMuted: boolean | null = null;    // macOS：离开前的静音标志（restore 时还原）
 
 /** 离开时提升音量到 boostLevel（只升不降），并记住原值 */
 async function boostVolume(): Promise<void> {
@@ -388,10 +391,16 @@ async function boostVolume(): Promise<void> {
       const m = stdout.match(/saved=([\d.]+)/);
       if (m) savedVolumePct = Math.round(parseFloat(m[1]) * 100);
     } else if (p === "darwin") {
-      const { stdout } = await execFileAsync("osascript", ["-e", "get volume output volume"], { windowsHide: true });
-      const cur = parseInt(stdout.trim(), 10);
+      // 同时记录音量和静音标志：macOS 的 `set volume output volume N` 会自动取消静音，
+      // 所以离开前若是静音（或 Mute 键触发的 muted=true 但音量非 0），回来时必须还原 muted。
+      const { stdout } = await execFileAsync("osascript", ["-e", "get volume settings"], { windowsHide: true });
+      const mutedMatch = stdout.match(/output\s+muted:(true|false)/);
+      const volMatch = stdout.match(/output\s+volume:(\d+)/);
+      savedMuted = mutedMatch ? mutedMatch[1] === "true" : null;
+      const cur = volMatch ? parseInt(volMatch[1], 10) : NaN;
       savedVolumePct = isNaN(cur) ? null : cur;
       const newLevel = Math.max(isNaN(cur) ? 0 : cur, target);
+      // 设置音量（会自动取消静音，保证能喊醒你）
       await execFileAsync("osascript", ["-e", `set volume output volume ${newLevel}`], { windowsHide: true });
     } else {
       // Linux: pactl (PulseAudio)
@@ -404,6 +413,7 @@ async function boostVolume(): Promise<void> {
   } catch (e) {
     console.error("[i-am-cooking] boostVolume failed:", (e as Error).message);
     savedVolumePct = null; // 读不到原值就不恢复，避免误改
+    savedMuted = null;
   }
 }
 
@@ -419,7 +429,11 @@ async function restoreVolume(): Promise<void> {
         "-Action", "restore", "-SaveFile", join(TMP_DIR, "volume.json"),
       ], { timeout: 15_000, windowsHide: true });
     } else if (p === "darwin") {
+      // 恢复音量和静音状态（离开前若是静音，这里必须还原 muted）
       await execFileAsync("osascript", ["-e", `set volume output volume ${savedVolumePct}`], { windowsHide: true });
+      if (savedMuted !== null) {
+        await execFileAsync("osascript", ["-e", `set volume output muted ${savedMuted}`], { windowsHide: true });
+      }
     } else {
       await execFileAsync("pactl", ["set-sink-volume", "@DEFAULT_SINK@", `${savedVolumePct}%`], { windowsHide: true });
     }
@@ -427,11 +441,13 @@ async function restoreVolume(): Promise<void> {
     console.error("[i-am-cooking] restoreVolume failed:", (e as Error).message);
   }
   savedVolumePct = null;
+  savedMuted = null;
 }
 
-async function pushPhone(alert: Alert): Promise<void> {
+async function pushPhone(alert: Alert): Promise<boolean> {
+  // 返回是否发送成功（未配置 topic / 网络失败均视为失败）
   const topic = config.ntfyTopic?.trim();
-  if (!topic) return;
+  if (!topic) return false;
   const server = (config.ntfyServer?.trim() || "https://ntfy.sh").replace(/\/+$/, "");
   const priority = alert.urgency === "urgent" ? 5 : alert.urgency === "normal" ? 3 : 1;
   const headers: Record<string, string> = {
@@ -443,19 +459,27 @@ async function pushPhone(alert: Alert): Promise<void> {
   const token = resolveValue(config.ntfyToken).trim();
   if (token) headers["Authorization"] = `Bearer ${token}`;
   try {
-    await fetch(`${server}/${encodeURIComponent(topic)}`, {
+    const res = await fetch(`${server}/${encodeURIComponent(topic)}`, {
       method: "POST",
       body: `[${alert.urgency}] ${alert.message}`,
       headers,
+      signal: AbortSignal.timeout(15_000),
     });
+    if (!res.ok) {
+      console.error(`[i-am-cooking] ntfy push failed: HTTP ${res.status} ${res.statusText}`);
+      return false;
+    }
+    return true;
   } catch (e) {
     console.error("[i-am-cooking] ntfy push failed:", (e as Error).message);
+    return false;
   }
 }
 
-async function pushWebhook(alert: Alert): Promise<void> {
+async function pushWebhook(alert: Alert): Promise<boolean> {
+  // 返回是否发送成功（未配置 URL / 网络失败均视为失败）
   const url = config.webhookUrl?.trim();
-  if (!url) return;
+  if (!url) return false;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   // webhook 认证：token 放在指定 header（默认 Authorization: Bearer <token>）
   const token = resolveValue(config.webhookToken).trim();
@@ -467,7 +491,7 @@ async function pushWebhook(alert: Alert): Promise<void> {
     headers[headerName] = value;
   }
   try {
-    await fetch(url, {
+    const res = await fetch(url, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -477,9 +501,16 @@ async function pushWebhook(alert: Alert): Promise<void> {
         category: alert.category,
         time: new Date(alert.time).toISOString(),
       }),
+      signal: AbortSignal.timeout(15_000),
     });
+    if (!res.ok) {
+      console.error(`[i-am-cooking] webhook push failed: HTTP ${res.status} ${res.statusText}`);
+      return false;
+    }
+    return true;
   } catch (e) {
     console.error("[i-am-cooking] webhook push failed:", (e as Error).message);
+    return false;
   }
 }
 
@@ -609,7 +640,12 @@ function setCallingMode(mode: CallingMode, reason: string, ctx: { ui: any }): vo
   }
 }
 
-async function fireAlert(alert: Alert, ctx: { ui: any }): Promise<void> {
+/**
+ * 发出呼喊（widget + TUI 提示，以及未被偏好静音时的声音/TTS/弹窗/手机推送）。
+ * 返回手机推送是否成功：未配置或偏好静音跳过 = true；只有配置了且发送失败才 false。
+ * 手机推送按 pushProvider 分发（ntfy / webhook），避免双发；兼容旧配置（未走向导直接填 webhookUrl）。
+ */
+async function fireAlert(alert: Alert, ctx: { ui: any }): Promise<boolean> {
   config.lastShout = Date.now();
   const suppress = shouldSuppress(alert);
   const isCompletion = alert.category === "completion";
@@ -623,20 +659,24 @@ async function fireAlert(alert: Alert, ctx: { ui: any }): Promise<void> {
   }
 
   // ── 响铃 / 推送（suppress 时跳过）──
-  if (!suppress) {
-    if (config.sound || config.tts) {
-      await Promise.all([
-        playSound(config.sound ? config.beeps : 0, config.sound ? config.soundPath : ""),
-        speakTts(config.tts ? renderTts(alert) : ""),
-      ]);
-    }
-    if (config.toast) {
-      const title = isCompletion ? "任务完成" : "pi 需要你！";
-      await showNotification(`🍳 ${title}`, `[${alert.urgency}] ${alert.message}`);
-    }
-    if (config.phonePush) void pushPhone(alert);
-    if (config.webhookUrl) void pushWebhook(alert);
+  if (suppress) return true;
+  if (config.sound || config.tts) {
+    await Promise.all([
+      playSound(config.sound ? config.beeps : 0, config.sound ? config.soundPath : ""),
+      speakTts(config.tts ? renderTts(alert) : ""),
+    ]);
   }
+  if (config.toast) {
+    const title = isCompletion ? "任务完成" : "pi 需要你！";
+    await showNotification(`🍳 ${title}`, `[${alert.urgency}] ${alert.message}`);
+  }
+
+  // ── 手机推送（按 pushProvider 分发；兼容旧配置：未走向导但直接填了 webhookUrl）──
+  if (config.phonePush) {
+    return config.pushProvider === "ntfy" ? await pushPhone(alert) : await pushWebhook(alert);
+  }
+  if (config.webhookUrl) return await pushWebhook(alert);
+  return true;
 }
 
 function updateWidget(ctx: { ui: any }): void {
@@ -751,7 +791,7 @@ function turnOn(ctx: { ui: any }, note: string): void {
   );
 }
 
-function turnOff(ctx: { ui: any }, source: "command" | "user-input"): void {
+function turnOff(ctx: { ui: any }, source: "command" | "user-input", userText?: string): void {
   clearRepeatTimers();
   const pending = pendingAlerts();
   config.cooking = false;
@@ -768,12 +808,15 @@ function turnOff(ctx: { ui: any }, source: "command" | "user-input"): void {
   const summary = pending.length
     ? pending.map((a, i) => `${i + 1}. [${a.urgency}] ${a.message}`).join("\n")
     : "（无待处理呼喊）";
-  void api.sendUserMessage(
-    `[I am cooking] 我回来了（${source === "user-input" ? "检测到你打字" : "执行 off 命令"}）。\n` +
-    `我不在的时候你喊了我这些事：\n${summary}\n` +
-    `请简要汇报当前进度，然后继续处理这些事项。`,
-    { deliverAs: "followUp" },
-  );
+  // 用户回来了且带了新输入 → 把输入内容作为后续指令交给 agent（修复：之前被忽略）
+  const followUp = userText
+    ? `[I am cooking] 我回来了（检测到你打字）。你补充了新的指令：\n“${userText}”\n\n` +
+      `请停止之前的自主推进方向，优先按这条新指令处理。` +
+      (pending.length ? `\n另外，我不在的时候你喊了我这些事：\n${summary}` : "")
+    : `[I am cooking] 我回来了（${source === "user-input" ? "检测到你打字" : "执行 off 命令"}）。\n` +
+      `我不在的时候你喊了我这些事：\n${summary}\n` +
+      `请简要汇报当前进度，然后继续处理这些事项。`;
+  void api.sendUserMessage(followUp, { deliverAs: "followUp" });
 }
 
 function showStatus(ctx: { ui: any }): void {
@@ -794,6 +837,7 @@ function showStatus(ctx: { ui: any }): void {
     `音量: ${config.boostVolume ? `离开自动拉高到 ${config.boostLevel}%` : "未启用"}`,
     `呼喊偏好: ${CALLING_MODE_LABEL[config.callingMode || "normal"]}`,
     `自主等级: ${AUTONOMY_LABEL[config.autonomyLevel || "balanced"]}`,
+    `防打扰: 正常每 ${config.repeatIntervalMinutes} 分钟重喊 / 紧急每 ${config.urgentRepeatMinutes} 分钟重喊 / 完成通知上限 ${config.maxCompletionNotices} 次（/i-am-cooking limits 可调）`,
     `配置: ${CONFIG_PATH}（首次使用请运行 /i-am-cooking setup 配置手机推送）`,
   ];
   ctx.ui.notify(lines.join("\n"), "info");
@@ -999,7 +1043,7 @@ async function setupWizard(ctx: { mode: string; hasUI: boolean; ui: any }): Prom
 }
 
 /** 单独测试手机推送通道（只走 ntfy/webhook，不响声音） */
-async function testPush(provider: "ntfy" | "webhook", _ctx: { ui: any }): Promise<boolean> {
+async function testPush(provider: "ntfy" | "webhook", ctx: { ui: any }): Promise<boolean> {
   const alert: Alert = {
     id: randomUUID(),
     time: Date.now(),
@@ -1009,14 +1053,9 @@ async function testPush(provider: "ntfy" | "webhook", _ctx: { ui: any }): Promis
     repeatCount: 0,
     acked: false,
   };
-  try {
-    if (provider === "ntfy") await pushPhone(alert);
-    else await pushWebhook(alert);
-    return true;
-  } catch (e) {
-    console.error("[i-am-cooking] test push failed:", e);
-    return false;
-  }
+  ctx.ui.notify("⌛️ 正在发送手机测试推送，请留意手机通知…（最长等待 15 秒）", "info");
+  const ok = provider === "ntfy" ? await pushPhone(alert) : await pushWebhook(alert);
+  return ok;
 }
 
 async function testShout(ctx: { ui: any }): Promise<void> {
@@ -1029,8 +1068,31 @@ async function testShout(ctx: { ui: any }): Promise<void> {
     repeatCount: 0,
     acked: false,
   };
-  await fireAlert(alert, ctx);
-  ctx.ui.notify("测试呼喊已发出（声音/TTS/Toast/手机推送）。请确认能感知到。", "info");
+
+  // ① 先发等待提示，再发出全部通道（声音/TTS/弹窗/手机推送），拿到真实成功/失败
+  ctx.ui.notify("⌛️ 正在测试全部通道：声音 / TTS / 桌面通知 / 手机推送…请留意听到的声音与桌面弹窗。", "info");
+  const suppress = shouldSuppress(alert);
+  const phoneOk = await fireAlert(alert, ctx);
+
+  // ② 汇总各通道结果
+  const marks: string[] = [];
+  if (config.sound) marks.push(suppress ? "声音（偏好跳过）" : `声音 ✓${config.soundPath ? "（自定义音效）" : ""}`);
+  if (config.tts) marks.push(suppress ? "TTS（偏好跳过）" : "TTS ✓");
+  if (config.toast) marks.push(suppress ? "桌面通知（偏好跳过）" : "桌面通知 ✓");
+  const hasPhone = config.phonePush || !!config.webhookUrl;
+  marks.push(
+    !hasPhone ? "手机推送（未配置）"
+      : suppress ? "手机推送（偏好跳过）"
+      : phoneOk ? "手机推送 ✓" : "手机推送 ✗",
+  );
+
+  // ③ 结果说明
+  const failed = hasPhone && !suppress && !phoneOk;
+  let note = "";
+  if (suppress) note = "ℹ️ 当前呼喊偏好为静音/仅完成模式：声音/弹窗/推送按偏好跳过（横幅已显示）。";
+  else if (failed) note = "⚠️ 手机推送失败：请检查 topic/token/网络，日志见 pi 控制台。";
+  const body = `测试完成：${marks.join(" | ")}${note ? "\n" + note : ""}`;
+  ctx.ui.notify(body, failed ? "warning" : "info");
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -1061,6 +1123,7 @@ export default function (pi: ExtensionAPI) {
         { value: "edit-rules", label: "edit-rules", description: "编辑规则文件（保存即生效）" },
         { value: "reset-rules", label: "reset-rules", description: "规则恢复出厂默认（内置规则）" },
         { value: "level", label: "level", description: "自主等级：conservative 谨慎(遇墙就喊) / balanced 平衡(默认) / autonomous 放手(能不喊就不喊)" },
+        { value: "limits", label: "limits", description: "查看/调整防打扰参数（交互式中文菜单）" },
       ];
       const filtered = subs.filter((s) => s.value.startsWith(prefix));
       return filtered.length > 0 ? filtered : null;
@@ -1124,6 +1187,51 @@ export default function (pi: ExtensionAPI) {
         } else {
           ctx.ui.notify("❌ 未知等级，可选：conservative / balanced / autonomous", "warning");
         }
+        return;
+      }
+      if (arg === "limits") {
+        // 交互式查看/调整防打扰参数（中文菜单，无需记忆英文参数）
+        if (ctx.mode !== "tui" || !ctx.hasUI) {
+          ctx.ui.notify(
+            `防打扰参数（当前）：\n` +
+            `  正常呼喊重复间隔: ${config.repeatIntervalMinutes} 分钟\n` +
+            `  紧急呼喊重复间隔: ${config.urgentRepeatMinutes} 分钟\n` +
+            `  紧急最多重复次数: ${config.maxUrgentRepeats === -1 ? "一直喊到回来" : config.maxUrgentRepeats + " 次"}\n` +
+            `  每次离开最多完成通知: ${config.maxCompletionNotices} 次\n` +
+            `（TUI 模式下运行 /i-am-cooking limits 可交互调整）`,
+            "info",
+          );
+          return;
+        }
+        const ui = ctx.ui;
+        const choose = await ui.select(
+          "🛡️ 防打扰参数（Esc 退出）:",
+          [
+            `正常呼喊重复间隔（当前 ${config.repeatIntervalMinutes} 分钟）`,
+            `紧急呼喊重复间隔（当前 ${config.urgentRepeatMinutes} 分钟）`,
+            `紧急最多重复次数（当前 ${config.maxUrgentRepeats === -1 ? "一直喊到回来" : config.maxUrgentRepeats + " 次"}）`,
+            `每次离开最多完成通知次数（当前 ${config.maxCompletionNotices} 次）`,
+          ],
+        );
+        if (!choose) { ui.notify("已退出。", "info"); return; }
+        const newVal = await ui.input("输入新的数值（分钟/次数）：", "");
+        if (newVal === undefined || newVal === null) { ui.notify("已取消。", "info"); return; }
+        const num = parseInt(newVal.trim(), 10);
+        if (isNaN(num)) { ui.notify("❌ 请输入数字。", "warning"); return; }
+        if (choose.includes("正常呼喊")) {
+          config.repeatIntervalMinutes = Math.max(1, num);
+          ui.notify(`✅ 正常呼喊重复间隔已设为 ${config.repeatIntervalMinutes} 分钟。`, "info");
+        } else if (choose.includes("紧急呼喊")) {
+          config.urgentRepeatMinutes = Math.max(1, num);
+          ui.notify(`✅ 紧急呼喊重复间隔已设为 ${config.urgentRepeatMinutes} 分钟。`, "info");
+        } else if (choose.includes("紧急最多")) {
+          config.maxUrgentRepeats = num === 0 ? -1 : num; // 0 = 一直喊
+          ui.notify(`✅ 紧急最多重复次数已设为 ${config.maxUrgentRepeats === -1 ? "一直喊到回来" : config.maxUrgentRepeats + " 次"}。`, "info");
+        } else {
+          config.maxCompletionNotices = Math.max(1, num);
+          ui.notify(`✅ 每次离开最多完成通知已设为 ${config.maxCompletionNotices} 次。`, "info");
+        }
+        await saveConfig();
         return;
       }
       const note = arg.startsWith("on") ? arg.slice(2).trim() : arg;
@@ -1318,9 +1426,10 @@ export default function (pi: ExtensionAPI) {
       setAutonomyLevel(level, `你说了："${event.text.slice(0, 40)}"`, ctx);
     }
 
-    // ② 用户打字 = 回来了 → 退出离开模式并让 agent 汇报
+    // ② 用户打字 = 回来了 → 退出离开模式，并把用户输入作为新指令转交给 agent
     if (config.exitOnUserInput) {
-      turnOff(ctx, "user-input");
+      turnOff(ctx, "user-input", event.text.trim());
+      return { action: "handled" }; // 输入已被 followUp 转交，阻止它再走正常流程（避免重复）
     }
   });
 }
