@@ -99,10 +99,11 @@ pi install npm:i-am-cooking
 | `/i-am-cooking level [档位]` | 自主等级：`conservative`/`balanced`/`autonomous`，不填则查看 | `level autonomous` |
 | `/i-am-cooking limits` | 查看/调整防打扰参数（交互式中文菜单） | `limits` |
 | `/i-am-cooking sound` | 自定义呼喊铃声（交互式中文菜单） | `sound` |
+| `/i-am-cooking volume` | 音量控制：查看/手动调整/离开自动拉高（交互式中文菜单） | `volume` |
 
 子命令支持 Tab 补全：输入 `/i-am-cooking ` 后按 Tab 弹出选项。
 
-## 🤖 Agent 工具（给 LLM 用的能力）
+## 🤖 Agent 工具
 
 除了你手动敲命令，**agent 自己也会调用 4 个工具**来理解你、喊你、调整行为。这些是"人机协作"的接口：
 
@@ -110,6 +111,7 @@ pi install npm:i-am-cooking
 |---|---|---|
 | `enter_cooking_mode` | 开启离开模式 | 你说"我去做饭了/我离开一下/I'm cooking"等**非常明确**的离开表达时；不确定不调用 |
 | `set_shout_sound` | 设置呼喊铃声的自定义歌曲 | 你说"帮我换个铃声""用 xxx.mp3 当提醒音"并给了具体路径时 |
+| `set_volume` | 调整系统音量 | 你说"音量调大点/小点声/静音"，或呼喊前发现系统静音需解除 |
 | `shout_for_user` | 大声呼喊你 | 遇到必须你处理的事（决策/凭据/审批/澄清），**先准备好交接内容（刚好够用）再喊**，或任务完成时 |
 | `set_calling_preference` | 调整呼喊偏好（响不响） | 你说"别喊了"→silence、"完成后喊我"→completion_only 等 |
 | `set_autonomy_level` | 调整自主等级（该不该喊） | 你说"遇墙就喊"→conservative、"能不喊就不喊"→autonomous 等 |
@@ -293,6 +295,18 @@ TTS 模板里用 `{shoutPhrase}` 占位（默认 `主人，快来！{shoutPhrase
 也支持 Webhook（Bark / 企业微信机器人 / Server酱），见 [完整文档](docs/README.en.md)。
 
 ## 🔊 音量控制（可选）
+
+### 手动调整 & 查看
+
+```
+/i-am-cooking volume
+```
+
+交互式中文菜单：查看当前系统音量 / 立即把音量调到指定值（0-100）/ 设置"离开时拉高到多少" / 开关"离开自动拉高"。
+
+**Agent 也会调整音量**（`set_volume` 工具）：你说"音量调大点""小点声""静音"时，agent 帮你调；呼喊前发现系统静音也会先解除静音保证你能听到。
+
+### 离开自动拉高（可选）
 
 离开时自动拉高音量（防止静音听不到呼喊），回来恢复。
 

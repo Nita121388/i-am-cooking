@@ -27,6 +27,8 @@
 - [ ] System volume at 0% → `on` raises to 80% → shout audible → `off` restores 0%
 - [ ] System volume at 100% → `on` does NOT lower it
 - [ ] macOS: muted=true (Mute key) → `on` plays sound, `off` restores mute state
+- [ ] `/i-am-cooking volume` — menu shows current volume; setting to X% works; boostLevel configurable
+- [ ] `set_volume` tool — agent can set absolute level and raise/lower; unmute before shout
 
 ## 4. Auto-detect safety net
 

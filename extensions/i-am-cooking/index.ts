@@ -588,6 +588,70 @@ async function showNotification(title: string, body: string): Promise<void> {
 let savedVolumePct: number | null = null; // 离开前的原始音量（0-100）
 let savedMuted: boolean | null = null;    // macOS：离开前的静音标志（restore 时还原）
 
+/** 读取当前系统音量（0-100）；失败返回 null */
+async function getSystemVolume(): Promise<number | null> {
+  const p = process.platform;
+  try {
+    if (p === "win32") {
+      const { stdout } = await execFileAsync("powershell.exe", [
+        "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", join(SCRIPTS, "volume.ps1"), "-Action", "get",
+      ], { timeout: 15_000, windowsHide: true });
+      const m = stdout.match(/volume=([\d.]+)/);
+      return m ? Math.round(parseFloat(m[1]) * 100) : null;
+    } else if (p === "darwin") {
+      const { stdout } = await execFileAsync("osascript", ["-e", "output volume of (get volume settings)"], { windowsHide: true });
+      const n = parseInt(stdout.trim(), 10);
+      return isNaN(n) ? null : n;
+    } else {
+      const { stdout } = await execFileAsync("pactl", ["get-sink-volume", "@DEFAULT_SINK@"], { windowsHide: true });
+      const m = stdout.match(/(\d+)%/);
+      return m ? parseInt(m[1], 10) : null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** 设置系统音量（0-100）；返回是否成功 */
+async function setSystemVolume(level: number): Promise<boolean> {
+  const clamped = Math.max(0, Math.min(100, Math.round(level)));
+  const p = process.platform;
+  try {
+    if (p === "win32") {
+      await runPowerShellScript("volume.ps1", { action: "set", level: clamped / 100 });
+    } else if (p === "darwin") {
+      // macOS：设置音量会自动解除静音
+      await execFileAsync("osascript", ["-e", `set volume output volume ${clamped}`], { windowsHide: true });
+    } else {
+      await execFileAsync("pactl", ["set-sink-volume", "@DEFAULT_SINK@", `${clamped}%`], { windowsHide: true });
+    }
+    return true;
+  } catch (e) {
+    console.error("[i-am-cooking] setSystemVolume failed:", (e as Error).message);
+    return false;
+  }
+}
+
+/** 切换静音（macOS/Linux 支持）；返回操作后的静音状态，失败返回 null */
+async function toggleMute(mute: boolean): Promise<boolean | null> {
+  const p = process.platform;
+  try {
+    if (p === "darwin") {
+      await execFileAsync("osascript", ["-e", `set volume output muted ${mute}`], { windowsHide: true });
+      return mute;
+    } else if (p === "linux") {
+      const arg = mute ? "mute" : "unmute";
+      await execFileAsync("pactl", ["set-sink-mute", "@DEFAULT_SINK@", arg], { windowsHide: true });
+      return mute;
+    }
+    return null; // Windows 走 volume.ps1（set 音量会解静音）
+  } catch (e) {
+    console.error("[i-am-cooking] toggleMute failed:", (e as Error).message);
+    return null;
+  }
+}
+
 /** 离开时提升音量到 boostLevel（只升不降），并记住原值 */
 async function boostVolume(): Promise<void> {
   if (!config.boostVolume) return;
@@ -1416,6 +1480,7 @@ export default function (pi: ExtensionAPI) {
         { value: "level", label: "level", description: "自主等级：conservative 谨慎(遇墙就喊) / balanced 平衡(默认) / autonomous 放手(能不喊就不喊)" },
         { value: "limits", label: "limits", description: "查看/调整防打扰参数（交互式中文菜单）" },
         { value: "sound", label: "sound", description: "自定义呼喊铃声：歌曲路径/试听/总时长（交互式中文菜单）" },
+        { value: "volume", label: "volume", description: "音量控制：查看/手动调整/离开自动拉高（交互式中文菜单）" },
       ];
       const filtered = subs.filter((s) => s.value.startsWith(prefix));
       return filtered.length > 0 ? filtered : null;
@@ -1632,6 +1697,54 @@ export default function (pi: ExtensionAPI) {
         }
         return;
       }
+      if (arg === "volume") {
+        // 音量控制：查看 / 手动调整 / 设置离开自动拉高
+        const cur = await getSystemVolume();
+        const statusLine = `当前系统音量: ${cur === null ? "（读取失败）" : cur + "%"}\n离开自动拉高: ${config.boostVolume ? `开（拉到 ${config.boostLevel || 80}%）` : "关"}`;
+        if (ctx.mode !== "tui" || !ctx.hasUI) {
+          ctx.ui.notify(`🔊 音量控制\n${statusLine}\n（TUI 模式下运行 /i-am-cooking volume 可交互调整）`, "info");
+          return;
+        }
+        const ui = ctx.ui;
+        const choose = await ui.select("🔊 音量控制（Esc 退出）:", [
+          `查看当前音量（${cur === null ? "读取失败" : cur + "%"}）`,
+          `立即把系统音量调到指定值（0-100）`,
+          `设置"离开时自动拉高到多少"（当前 ${config.boostLevel || 80}%）`,
+          `开关"离开自动拉高音量"（当前 ${config.boostVolume ? "开" : "关"}）`,
+        ]);
+        if (!choose) { ui.notify("已退出。", "info"); return; }
+        if (choose.includes("查看当前")) {
+          ui.notify(`🔊 ${statusLine}`, "info");
+          return;
+        }
+        if (choose.includes("立即")) {
+          const v = await ui.input("设置系统音量（0-100）:", "");
+          if (v === undefined || v === null || v.trim() === "") { ui.notify("已取消。", "info"); return; }
+          const n = parseInt(v.trim(), 10);
+          if (isNaN(n) || n < 0 || n > 100) { ui.notify("❌ 请输入 0-100 的数字。", "warning"); return; }
+          const ok = await setSystemVolume(n);
+          ui.notify(ok ? `✅ 系统音量已设为 ${n}%。` : "⚠️ 设置失败（见日志）。", ok ? "info" : "warning");
+          return;
+        }
+        if (choose.includes("离开时自动拉高到多少")) {
+          const v = await ui.input("离开时拉高到多少（1-100，默认 80）:", String(config.boostLevel || 80));
+          if (v === undefined || v === null || v.trim() === "") { ui.notify("已取消。", "info"); return; }
+          const n = parseInt(v.trim(), 10);
+          if (isNaN(n) || n < 1 || n > 100) { ui.notify("❌ 请输入 1-100 的数字。", "warning"); return; }
+          config.boostLevel = n;
+          config.boostVolume = true;
+          await saveConfig();
+          ui.notify(`✅ 离开时自动拉高到 ${n}%（已自动开启该功能）。`, "info");
+          return;
+        }
+        if (choose.includes("开关")) {
+          config.boostVolume = !config.boostVolume;
+          await saveConfig();
+          ui.notify(`✅ "离开自动拉高音量"已${config.boostVolume ? "开启" : "关闭"}。`, "info");
+          return;
+        }
+        return;
+      }
       const note = arg.startsWith("on") ? arg.slice(2).trim() : arg;
       await turnOn(ctx, note, true); // 手动开启：询问是否开启小阶段提醒
     },
@@ -1823,6 +1936,72 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text: `已设置呼喊铃声：${p}${params.soundSeconds !== undefined ? `（总时长 ${config.soundSeconds} 秒）` : ""}。下次呼喊时会先播短铃声+语音，再播这首歌。用户可随时用 /i-am-cooking sound 试听。` }],
         details: { set: true, path: p, soundSeconds: config.soundSeconds },
       };
+    },
+  });
+
+  // 工具：调整系统音量（用户明确要求，或呼喊前解除静音保障）
+  pi.registerTool({
+    name: "set_volume",
+    label: "Set Volume",
+    description:
+      "调整系统音量（0-100）。\n" +
+      "**何时调用**：① 用户明确要求（如\"把音量调大点\"\"太吵了，小点声\"\"静音\"）；② 呼喊用户前发现系统静音，需解除静音保证用户能听到。\n" +
+      "**参数二选一**：给 level=绝对音量（0-100）；给 action=相对动作（raise 调大 / lower 调小 / mute 静音 / unmute 取消静音），amount 为步进（默认 10）。\n" +
+      "**不要擅自调整**：用户没要求时不要改音量。",
+    promptSnippet: "Adjust system volume when the user asks, or unmute before shouting",
+    promptGuidelines: [
+      "Use set_volume only when the user explicitly asks to change volume, or when the system is muted and you must shout at the user (unmute first). Do not adjust volume on your own initiative.",
+    ],
+    parameters: Type.Object({
+      level: Type.Optional(Type.Number({ description: "绝对音量（0-100）。与 action 二选一" })),
+      action: Type.Optional(StringEnum(["raise", "lower", "mute", "unmute"] as const)),
+      amount: Type.Optional(Type.Number({ description: "raise/lower 的步进（默认 10）" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return (async () => {
+        const action = params.action;
+        const amount = Math.max(1, Math.min(50, Math.round(params.amount ?? 10)));
+
+        if (action === "mute") {
+          const r = await toggleMute(true);
+          return {
+            content: [{ type: "text", text: r === null ? "静音设置（当前平台需手动操作或走音量命令）。" : "已静音。" }],
+            details: { muted: true, ok: r !== null },
+          };
+        }
+        if (action === "unmute") {
+          const r = await toggleMute(false);
+          return {
+            content: [{ type: "text", text: r === null ? "取消静音设置失败/不支持。" : "已取消静音。" }],
+            details: { muted: false, ok: r !== null },
+          };
+        }
+
+        const cur = await getSystemVolume();
+        if (cur === null) {
+          return {
+            content: [{ type: "text", text: "无法读取当前音量，调整失败（见日志）。" }],
+            details: { ok: false, reason: "read-failed" },
+          };
+        }
+        let target: number;
+        if (action === "raise") target = cur + amount;
+        else if (action === "lower") target = cur - amount;
+        else if (typeof params.level === "number") target = params.level;
+        else {
+          return {
+            content: [{ type: "text", text: "参数缺失：请提供 level（0-100）或 action（raise/lower/mute/unmute）。" }],
+            details: { ok: false, reason: "bad-params" },
+          };
+        }
+        const ok = await setSystemVolume(target);
+        const now = await getSystemVolume();
+        ctx.ui.notify(`🔊 音量${ok ? `已调整到 ${now ?? target}%` : "调整失败"}（原 ${cur}%）。`, ok ? "info" : "warning");
+        return {
+          content: [{ type: "text", text: ok ? `系统音量已调整为 ${now ?? target}%（原 ${cur}%）。` : "音量调整失败（见日志）。" }],
+          details: { ok, from: cur, to: now ?? target },
+        };
+      })();
     },
   });
 

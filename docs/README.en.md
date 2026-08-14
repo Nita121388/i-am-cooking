@@ -102,6 +102,7 @@ Reload pi (`/reload`) after installing.
 | `/i-am-cooking level [level]` | Autonomy level: conservative / balanced / autonomous (no arg = show) | `level autonomous` |
 | `/i-am-cooking limits` | Adjust anti-noise parameters (interactive Chinese menu) | `limits` |
 | `/i-am-cooking sound` | Custom shout ringtone (interactive Chinese menu) | `sound` |
+| `/i-am-cooking volume` | Volume control: view / manual adjust / auto-boost on leave (interactive Chinese menu) | `volume` |
 
 Tab-completion is supported: type `/i-am-cooking ` then press Tab.
 
@@ -113,6 +114,7 @@ Besides your manual commands, the **agent itself calls 4 tools** to understand y
 |---|---|---|
 | `enter_cooking_mode` | Enter cooking mode | when you **clearly** say you're leaving ("I'm cooking" / "我去做饭了" / "我离开一下"); never on ambiguity |
 | `set_shout_sound` | Set the custom shout ringtone | you say "帮我换个铃声" / "use xxx.mp3" and give a concrete path |
+| `set_volume` | Adjust system volume | you say "音量调大点/小点声/静音", or before shouting when the system is muted |
 | `shout_for_user` | Loudly shout at you | when a task needs you (decision / credential / approval / clarification) — prepare the handoff (just enough) FIRST, then shout; or when the task is done |
 | `set_calling_preference` | Adjust calling preference (how loud) | you say "别喊了"→silence, "完成后喊我"→completion_only, etc. |
 | `set_autonomy_level` | Adjust autonomy level (whether to shout) | you say "遇墙就喊"→conservative, "能不喊就不喊"→autonomous, etc. |
@@ -280,6 +282,18 @@ ServerChan) are supported via `pushProvider: "webhook"` + `webhookUrl`.
 > Other fields (`beeps` / `soundPath` / `repeatIntervalMinutes` …) have sensible defaults; adjust them with the commands instead of hand-editing: `/i-am-cooking level`, `/i-am-cooking sound`, `/i-am-cooking limits`.
 
 ## 🔊 Volume control (opt-in)
+
+### Manual adjust & view
+
+```
+/i-am-cooking volume
+```
+
+Interactive Chinese menu: view current system volume / set volume immediately (0-100) / set "boost level on leave" / toggle "auto-boost on leave".
+
+**The agent can also adjust volume** (`set_volume` tool): when you say "音量调大点/小点声/静音", or it unmutes before shouting so you can hear it.
+
+### Auto-boost on leave (opt-in)
 
 Prevents you missing the shout when the system volume is low or muted:
 

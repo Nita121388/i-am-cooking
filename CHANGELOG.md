@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **音量控制** `/i-am-cooking volume`：交互式中文菜单（查看当前音量 / 立即调音量 / 设置离开自动拉高 / 开关）；`set_volume` 工具让 agent 也能调（用户明确要求时，或呼喊前解除静音）。跨平台：macOS osascript / Linux pactl / Windows volume.ps1。
 - **多 Agent 协作**：音频互斥锁（多个 pi 同时离开只放一个声音，崩溃锁自动抢占，test 可强制抢占）；联动关闭（任一 Agent 检测到你回来，其他全自动关闭，watch+轮询双保险）。
 - **可爱 Topic 名**：编程/算法/LLM 风词池（22 形容词 × 24 名词）+ 6 位随机数字 = 5.28 亿种组合，全局唯一。
 - **自定义呼喊短语** `shoutPhrase`：默认"agent 需要你"，TTS 模板支持 `{shoutPhrase}` 占位，改一处全文案生效。
