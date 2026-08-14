@@ -37,9 +37,10 @@ const execFileAsync = promisify(execFile);
 const HOME       = homedir();
 // scripts 与 index.ts 同目录：本地开发 / pi install / git clone 任何安装方式都能正确定位
 const SCRIPTS    = fileURLToPath(new URL("./scripts", import.meta.url));
-const CONFIG_PATH = join(HOME, ".pi", "i-am-cooking.json");
-const TMP_DIR    = join(HOME, ".pi", "i-am-cooking-tmp");
-const RULES_PATH  = join(HOME, ".pi", "i-am-cooking-rules.md");
+const CONFIG_DIR  = join(HOME, ".pi", "i-am-cooking");
+const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+const RULES_PATH  = join(CONFIG_DIR, "rules.md");
+const TMP_DIR     = join(CONFIG_DIR, "tmp");
 
 // ── 内置默认规则（用户规则文件不存在时使用） ────────────────────────────────
 const DEFAULT_RULES = `## 自主推进
@@ -156,7 +157,7 @@ async function loadConfig(): Promise<void> {
 
 async function saveConfig(): Promise<void> {
   try {
-    await mkdir(join(HOME, ".pi"), { recursive: true });
+    await mkdir(CONFIG_DIR, { recursive: true });
     await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), "utf8");
   } catch (e) {
     console.error("[i-am-cooking] save config failed:", e);
@@ -197,7 +198,7 @@ async function ensureRulesFile(): Promise<void> {
     await readFile(RULES_PATH, "utf8");
   } catch {
     const template = `# I am cooking 规则\n\n> 修改此文件可自定义 pi 离开时的行为规则。\n> 保存后下次 /i-am-cooking on 生效（每回合实时读取，外部改也生效）。\n\n${DEFAULT_RULES}\n\n## 你的自定义规则\n- （自由发挥，任何你想让 agent 遵守的规则，例如：不修改生产代码 / 每天 22 点必须停止工作）\n`;
-    await mkdir(join(HOME, ".pi"), { recursive: true });
+    await mkdir(CONFIG_DIR, { recursive: true });
     await writeFile(RULES_PATH, template, "utf8");
   }
 }

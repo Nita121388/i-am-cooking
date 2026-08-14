@@ -71,7 +71,7 @@ The behavior rules while you're away are not hard-coded — you can edit them:
 /i-am-cooking rules         # show currently active rules
 ```
 
-The rules file is `~/.pi/i-am-cooking-rules.md` (Markdown). When missing, built-in defaults apply
+The rules file is `~/.pi/i-am-cooking/rules.md` (Markdown). When missing, built-in defaults apply
 (autonomy, when to shout, completion notices). A guard rail is always appended:
 "never end your turn silently waiting for user input".
 
@@ -101,7 +101,7 @@ Two detection paths (belt & suspenders):
 Guided flow: pick ntfy (recommended, free) → it explains what ntfy is, how to install the app
 (Android / iOS), auto-generates a random topic → enter optional access token → preview & confirm → live test.
 
-Manual config in `~/.pi/i-am-cooking.json`:
+Manual config in `~/.pi/i-am-cooking/config.json`:
 
 ```json
 {
