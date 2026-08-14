@@ -32,7 +32,8 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, readFile, rm, writeFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile, readdir, open, rename } from "node:fs/promises";
+import { watch } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -49,6 +50,20 @@ const CONFIG_DIR  = join(HOME, ".pi", "i-am-cooking");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const RULES_PATH  = join(CONFIG_DIR, "rules.md");
 const TMP_DIR     = join(CONFIG_DIR, "tmp");
+const AUDIO_LOCK_PATH = join(CONFIG_DIR, "audio.lock"); // 跨 Agent 音频互斥锁
+const STATE_PATH      = join(CONFIG_DIR, "state.json");  // 跨 Agent 离开状态（联动关闭）
+
+// ── 可爱 topic 词池（编程/算法/LLM 风，原创）──────────────────────────────
+const TOPIC_ADJ = [
+  "递归的", "贪心的", "并发的", "异步的", "迭代的", "哈希的", "分治的", "回溯的",
+  "动态的", "懒惰的", "原子的", "鲁棒的", "优雅的", "熵增的", "收敛的", "涌现的",
+  "幻觉的", "对齐的", "蒸馏的", "微调的", "自举的", "深夜炼丹的",
+];
+const TOPIC_NOUN = [
+  "递归", "栈", "队列", "堆", "哈希", "梯度", "向量", "张量", "词元", "提示词",
+  "注意力", "神经元", "权重", "参数", "嵌入", "协程", "信号量", "守护进程",
+  "管道", "缓存", "缓冲区", "编译器", "字节", "剪枝",
+];
 
 // 底线规则（不可删除，永远追加在用户规则后面）
 const GUARD_RAIL = "- 绝不要默默结束回合等用户回复。";
@@ -111,7 +126,8 @@ interface Config {
   soundPath: string; // optional .wav/mp3, played AFTER beeps+tts as the user's custom ringtone
   soundSeconds: number; // 声音播放总时长上限（秒），到点强制停止，默认 60
   tts: boolean;
-  ttsTemplate: string; // "{message}" placeholder
+  ttsTemplate: string; // 模板，支持 {message} 和 {shoutPhrase} 占位
+  shoutPhrase: string; // 呼喊短语（默认 "agent 需要你"），用户可自定义，用于所有呼喊文案
   toast: boolean;
   tuiBanner: boolean;
   phonePush: boolean;
@@ -149,7 +165,8 @@ const DEFAULTS: Config = {
   soundPath: "",
   soundSeconds: 60,
   tts: true,
-  ttsTemplate: "主人，快来！pi 需要你！{message}",
+  ttsTemplate: "主人，快来！{shoutPhrase}！{message}",
+  shoutPhrase: "agent 需要你",
   toast: true,
   tuiBanner: true,
   phonePush: false,
@@ -392,6 +409,9 @@ function runCommand(cmd: string, args: string[], opts: { timeoutMs?: number } = 
   });
 }
 
+// 全局跟踪正在播放的音频进程（用户回来/关会话时 stopAllAudio 立即掐断）
+let activeAudioProcs: ReturnType<typeof spawn>[] = [];
+
 /**
  * spawn 播放器进程，最多播放 maxMs 毫秒后强制 kill（避免超长歌曲一直响）。
  * 返回 Promise（进程退出/出错/被杀 都 resolve）。
@@ -401,53 +421,174 @@ function playProcess(cmd: string, args: string[], maxMs: number): Promise<void> 
     let done = false;
     const finish = () => { if (!done) { done = true; resolve(); } };
     const proc = spawn(cmd, args, { stdio: "ignore", windowsHide: true });
-    proc.on("error", () => finish());
-    proc.on("exit", () => finish());
+    activeAudioProcs.push(proc);
+    proc.on("error", () => { activeAudioProcs = activeAudioProcs.filter((p) => p !== proc); finish(); });
+    proc.on("exit", () => { activeAudioProcs = activeAudioProcs.filter((p) => p !== proc); finish(); });
     if (maxMs > 0) setTimeout(() => { proc.kill(); finish(); }, maxMs);
   });
+}
+
+/** 停止所有正在播放的音频（用户回来/关会话时调用，立即安静） */
+function stopAllAudio(): void {
+  for (const proc of activeAudioProcs) {
+    try { proc.kill(); } catch { /* ignore */ }
+  }
+  activeAudioProcs = [];
+}
+
+// ── 跨 Agent 音频互斥锁（多个 pi 进程同时离开时，只放一个声音）─────────────
+// 锁文件含 pid + createdAt：pid 死了立即抢占；超时(75s=60播放+15余量)兜底防 pid 复用
+const AUDIO_LOCK_MAX_MS = 75_000;
+
+function isProcessAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/** 尝试获取音频锁。force=true 抢占（用户主动 test 优先）。返回是否拿到锁。 */
+async function acquireAudioLock(force: boolean): Promise<boolean> {
+  try {
+    if (force) await rm(AUDIO_LOCK_PATH, { force: true });
+    const handle = await open(AUDIO_LOCK_PATH, "wx"); // 原子创建：只有一个进程能成功
+    await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now() }), "utf8");
+    await handle.close();
+    return true;
+  } catch {
+    // 锁已存在 → 检查是否 stale（崩溃/超时）
+    try {
+      const raw = await readFile(AUDIO_LOCK_PATH, "utf8");
+      const lock = JSON.parse(raw) as { pid: number; createdAt: number };
+      const stale = !isProcessAlive(lock.pid) || Date.now() - lock.createdAt > AUDIO_LOCK_MAX_MS;
+      if (stale) {
+        await rm(AUDIO_LOCK_PATH, { force: true });
+        return acquireAudioLock(false); // 抢占后重试一次
+      }
+      return false; // 其他 Agent 正在播 → 本 Agent 跳过声音
+    } catch {
+      return false;
+    }
+  }
+}
+
+/** 释放音频锁（仅当锁还属于本进程时才删，避免误删别人新拿到的锁） */
+async function releaseAudioLock(): Promise<void> {
+  try {
+    const raw = await readFile(AUDIO_LOCK_PATH, "utf8");
+    const lock = JSON.parse(raw) as { pid: number };
+    if (lock.pid === process.pid) await rm(AUDIO_LOCK_PATH, { force: true });
+  } catch { /* 锁已不存在或被抢占，无需处理 */ }
+}
+
+// ── 跨 Agent 离开状态（联动关闭：任一 Agent 回来，其他都关）───────────────
+// 共享 state.json：turnOn 写 true，turnOff 写 false；其他 Agent 监听变化后静默关闭。
+// 用临时文件 + rename 原子写，避免 watcher 读到半写内容。
+let stateWatcher: ReturnType<typeof watch> | null = null;
+let statePollTimer: ReturnType<typeof setInterval> | null = null;
+
+async function writeSharedState(cooking: boolean): Promise<void> {
+  try {
+    await mkdir(CONFIG_DIR, { recursive: true });
+    const tmp = `${STATE_PATH}.tmp`;
+    await writeFile(tmp, JSON.stringify({ cooking, since: cooking ? Date.now() : undefined, updatedAt: Date.now() }), "utf8");
+    await rename(tmp, STATE_PATH);
+  } catch (e) {
+    console.error("[i-am-cooking] writeSharedState failed:", (e as Error).message);
+  }
+}
+
+/**
+ * 检查共享状态：若其他 Agent 已回来（state.cooking=false 且比本 Agent 开启晚），
+ * 则静默关闭本 Agent 的离开模式——不停 agent 当前回合、不发送"我回来了"汇报，
+ * 只停声音/重复/音量，避免误报（用户其实没在这个会话说话）。
+ */
+async function checkSharedState(ctx: { ui: any }): Promise<void> {
+  if (!config.cooking) return;
+  try {
+    const raw = await readFile(STATE_PATH, "utf8");
+    const st = JSON.parse(raw) as { cooking: boolean; updatedAt: number };
+    const since = config.since ?? 0;
+    if (!st.cooking && st.updatedAt > since) {
+      // 其他 Agent 检测到用户回来 → 静默关闭
+      clearRepeatTimers();
+      stopAllAudio();
+      config.cooking = false;
+      config.since = undefined;
+      config.alerts = [];
+      config.callingMode = "normal";
+      void saveConfig();
+      ctx.ui.setStatus("i-am-cooking", "");
+      ctx.ui.setWidget("i-am-cooking", []);
+      void restoreVolume();
+      ctx.ui.notify("🍳 已从其他会话检测到你回来了，离开模式自动关闭。", "info");
+    }
+  } catch { /* state.json 不存在或不可读，忽略 */ }
+}
+
+/** 启动跨 Agent 状态监听（session_start 时调用；watch + 轮询双保险） */
+function startStateSync(ctx: { ui: any }): void {
+  try {
+    stateWatcher = watch(CONFIG_DIR, (_evt, filename) => {
+      if (filename === "state.json") void checkSharedState(ctx);
+    });
+  } catch { /* watch 失败则靠轮询兜底 */ }
+  statePollTimer = setInterval(() => void checkSharedState(ctx), 10_000);
+}
+
+/** 停止跨 Agent 状态监听（session_shutdown 时调用） */
+function stopStateSync(): void {
+  if (stateWatcher) { try { stateWatcher.close(); } catch { /* ignore */ } stateWatcher = null; }
+  if (statePollTimer) { clearInterval(statePollTimer); statePollTimer = null; }
 }
 
 /**
  * 三段式顺序播放：① 短铃声(beeps) → ② Agent 语音(TTS) → ③ 用户自定义歌曲(soundPath)。
  * 共用 soundSeconds 总预算：从开始响到强制停止，到点 kill 掉还在播的歌曲。
+ * 跨 Agent 互斥：多个 pi 同时离开时，同一时刻只放一个声音（后到的跳过声音）。
  */
-async function playSound(beeps: number, soundPath: string, ttsText: string): Promise<void> {
-  const totalMs = Math.max(5, (config.soundSeconds ?? 60)) * 1000;
-  const startedAt = Date.now();
-  const remainingMs = () => Math.max(0, totalMs - (Date.now() - startedAt));
-  const p = process.platform;
+async function playSound(beeps: number, soundPath: string, ttsText: string, opts: { force?: boolean } = {}): Promise<void> {
+  // 音频互斥锁：其他 Agent 正在播 → 本次跳过声音（只留弹窗/推送/横幅）
+  const acquired = await acquireAudioLock(opts.force ?? false);
+  if (!acquired) return;
+  try {
+    const totalMs = Math.max(5, (config.soundSeconds ?? 60)) * 1000;
+    const startedAt = Date.now();
+    const remainingMs = () => Math.max(0, totalMs - (Date.now() - startedAt));
+    const p = process.platform;
 
-  // ① 短铃声（beeps）
-  if (beeps > 0) {
-    try {
-      if (p === "win32") {
-        await runPowerShellScript("shout.ps1", { beeps, soundPath: "", ttsText: "" });
-      } else if (p === "darwin") {
-        await runCommand("osascript", ["-e", `beep ${Math.min(beeps, 5)}`], { timeoutMs: 3000 });
-      } else {
-        await runCommand("canberra-gtk-play", ["-i", "message"], { timeoutMs: 3000 }).catch(() => {});
-      }
-    } catch { /* best effort */ }
-  }
+    // ① 短铃声（beeps）
+    if (beeps > 0) {
+      try {
+        if (p === "win32") {
+          await runPowerShellScript("shout.ps1", { beeps, soundPath: "", ttsText: "" });
+        } else if (p === "darwin") {
+          await runCommand("osascript", ["-e", `beep ${Math.min(beeps, 5)}`], { timeoutMs: 3000 });
+        } else {
+          await runCommand("canberra-gtk-play", ["-i", "message"], { timeoutMs: 3000 }).catch(() => {});
+        }
+      } catch { /* best effort */ }
+    }
 
-  // ② Agent 语音（TTS）
-  if (ttsText) {
-    await speakTts(ttsText);
-  }
+    // ② Agent 语音（TTS）
+    if (ttsText) {
+      await speakTts(ttsText);
+    }
 
-  // ③ 用户自定义歌曲（soundPath）— 最多播到总预算剩余
-  if (soundPath && remainingMs() > 500) {
-    try {
-      if (p === "win32") {
-        await runPowerShellScript("shout.ps1", { beeps: 0, soundPath, ttsText: "" });
-      } else if (p === "darwin") {
-        await playProcess("afplay", [soundPath], remainingMs());
-      } else {
+    // ③ 用户自定义歌曲（soundPath）— 最多播到总预算剩余
+    if (soundPath && remainingMs() > 500) {
+      try {
+        if (p === "win32") {
+          await runPowerShellScript("shout.ps1", { beeps: 0, soundPath, ttsText: "" });
+        } else if (p === "darwin") {
+          await playProcess("afplay", [soundPath], remainingMs());
+        } else {
         await playProcess("paplay", [soundPath], remainingMs()).catch(() =>
           playProcess("aplay", [soundPath], remainingMs()),
         );
       }
     } catch { /* best effort */ }
+  }
+  } finally {
+    await releaseAudioLock(); // 播放完/被中断都释放锁
   }
 }
 
@@ -612,7 +753,7 @@ async function pushWebhook(alert: Alert): Promise<boolean> {
       method: "POST",
       headers,
       body: JSON.stringify({
-        title: "🍳 pi 需要你！",
+        title: `🍳 ${config.shoutPhrase || "agent 需要你"}！`,
         message: alert.message,
         urgency: alert.urgency,
         category: alert.category,
@@ -640,7 +781,10 @@ function renderTts(alert: Alert): string {
       : alert.category === "completion"
         ? (config.ttsTemplateCompletion || "主人，好消息！任务完成了！{message}")
         : config.ttsTemplate;
-  return template.replaceAll("{message}", alert.message);
+  // 先替换 {shoutPhrase}（用户自定义呼喊短语），再替换 {message}
+  return template
+    .replaceAll("{shoutPhrase}", config.shoutPhrase || "agent 需要你")
+    .replaceAll("{message}", alert.message);
 }
 
 /**
@@ -766,16 +910,17 @@ function setCallingMode(mode: CallingMode, reason: string, ctx: { ui: any }): vo
  * 返回手机推送是否成功：未配置或偏好静音跳过 = true；只有配置了且发送失败才 false。
  * 手机推送按 pushProvider 分发（ntfy / webhook），避免双发；兼容旧配置（未走向导直接填 webhookUrl）。
  */
-async function fireAlert(alert: Alert, ctx: { ui: any }): Promise<boolean> {
+async function fireAlert(alert: Alert, ctx: { ui: any }, opts: { forceSound?: boolean } = {}): Promise<boolean> {
   config.lastShout = Date.now();
   const suppress = shouldSuppress(alert);
   const isCompletion = alert.category === "completion";
   const isMilestone = alert.category === "milestone";
+  const forceSound = opts.forceSound ?? false;
 
   // ── widget + TUI notify（无论是否 suppress 都显示）──
   if (ctx?.ui) {
     const icon = isCompletion ? "✅" : isMilestone ? "📈" : "⚠";
-    const label = isCompletion ? "完成通知" : isMilestone ? "小阶段完成" : `pi 需要你！[${alert.urgency}]`;
+    const label = isCompletion ? "完成通知" : isMilestone ? "小阶段完成" : `${config.shoutPhrase || "agent 需要你"}！[${alert.urgency}]`;
     ctx.ui.notify(`🍳 ${icon} ${label} ${alert.message}`, suppress ? "info" : "warning");
     updateWidget(ctx);
   }
@@ -789,19 +934,20 @@ async function fireAlert(alert: Alert, ctx: { ui: any }): Promise<boolean> {
   // 声音不阻塞后续通道：fire-and-forget，最长 soundSeconds 秒后自动停
   if (config.sound || config.tts) {
     if (isMilestone) {
-      void playSound(config.sound ? config.milestoneBeeps : 0, "", config.tts ? renderTts(alert) : "");
+      void playSound(config.sound ? config.milestoneBeeps : 0, "", config.tts ? renderTts(alert) : "", { force: forceSound });
     } else if (isCompletion) {
-      void playSound(config.sound ? 2 : 0, "", config.tts ? renderTts(alert) : "");
+      void playSound(config.sound ? 2 : 0, "", config.tts ? renderTts(alert) : "", { force: forceSound });
     } else {
       void playSound(
         config.sound ? config.beeps : 0,
         config.sound ? config.soundPath : "",
         config.tts ? renderTts(alert) : "",
+        { force: forceSound },
       );
     }
   }
   if (config.toast) {
-    const title = isCompletion ? "任务完成" : isMilestone ? "小阶段完成" : "pi 需要你！";
+    const title = isCompletion ? "任务完成" : isMilestone ? "小阶段完成" : config.shoutPhrase || "agent 需要你";
     await showNotification(`🍳 ${title}`, `[${alert.urgency}] ${alert.message}`);
   }
 
@@ -903,6 +1049,8 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: { 
  */
 function resetCookingState(ctx: { ui: any }): void {
   clearRepeatTimers();
+  stopAllAudio(); // 用户回来/新会话：立即停止正在播放的音频
+  void writeSharedState(false); // 广播：离开状态已结束
   const hadCooking = config.cooking;
   const hadPending = pendingAlerts().length;
   config.cooking = false;
@@ -924,9 +1072,10 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
   config.cooking = true;
   config.since = Date.now();
   completionNoticeCount = 0; // 新的一轮离开，重置完成通知计数
+  void writeSharedState(true); // 广播：进入离开模式（供其他 Agent 联动）
   void saveConfig();
   ctx.ui.setStatus("i-am-cooking", "🍳 离开中（I am cooking）");
-  ctx.ui.notify("🍳 离开模式已开启。pi 需要你时我会大声喊你。", "info");
+  ctx.ui.notify(`🍳 离开模式已开启。${config.shoutPhrase || "agent 需要你"}时我会大声喊你。`, "info");
   updateWidget(ctx);
 
   // 自动提升音量（只在用户允许时生效）
@@ -965,8 +1114,8 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
     `[I am cooking] 我离开去做饭了，不在电脑前。${noteText}\n` +
     `当前自主等级：${AUTONOMY_LABEL[level]}。具体行动指南见注入的 [自主等级指南]（含人类墙等场景的喊我阈值）。\n` +
     `请自主推进任务：能自己解决的就自己解决（采用最合理的默认方案，并在回复里注明你的假设），保证质量，不要降低标准；` +
-    `只有达到当前等级的喊我阈值（见 [自主等级指南]）时才调用 shout_for_user 工具大声喊我，` +
-    `喊完继续用合理默认值推进，绝不要干等我。\n` +
+    `只有达到当前等级的喊我阈值（见 [自主等级指南]）时才调用 shout_for_user 工具大声喊我。` +
+    `调用前先准备好交接内容（刚好够用：决策给选项和推荐，凭据给获取方式，手动操作给步骤），准备好再喊，喊出的消息即最终版。\n` +
     `任务全部完成或达到重要里程碑时，调用 shout_for_user（category="completion", urgency="info"）通知我。` +
     milestoneHint,
     { deliverAs: "followUp" },
@@ -975,6 +1124,8 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
 
 function turnOff(ctx: { ui: any }, source: "command" | "user-input", userText?: string): void {
   clearRepeatTimers();
+  stopAllAudio(); // 用户回来：立即停止正在播放的音频
+  void writeSharedState(false); // 广播：用户回来了（其他 Agent 联动关闭）
   const pending = pendingAlerts();
   config.cooking = false;
   config.since = undefined;
@@ -1009,7 +1160,7 @@ function showStatus(ctx: { ui: any }): void {
       ? `ntfy topic=${config.ntfyTopic || "(未填)"} token=${maskToken(config.ntfyToken)}`
       : `webhook ${config.webhookUrl || "(未填)"} token=${maskToken(config.webhookToken)}`;
   const lines = [
-    `模式: ${config.cooking ? "🍳 离开中（I am cooking）" : "在岗"}`,
+    `模式: ${config.cooking ? "🍳 离开中（I am cooking）" : "人类在岗"}`,
     ...(config.since ? [`开启时间: ${new Date(config.since).toLocaleTimeString("zh-CN")}`] : []),
     `待处理呼喊: ${pending.length}`,
     ...pending.map(
@@ -1033,9 +1184,17 @@ function maskToken(token: string): string {
   return `已配置(${t.slice(0, 3)}***${t.slice(-3)})`;
 }
 
-/** 生成建议的随机 topic 名（隐私安全，别人猜不到） */
+/**
+ * 生成建议的随机 topic 名：可爱词池（编程/算法/LLM 风）+ 6 位随机数字。
+ * 唯一性靠 6 位数字（528 组合 × 1,000,000 = 5.28 亿种），前缀只是装饰。
+ */
 function suggestTopic(): string {
-  return `i-am-cooking-${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+  const adj = TOPIC_ADJ[Math.floor(Math.random() * TOPIC_ADJ.length)];
+  const noun = TOPIC_NOUN[Math.floor(Math.random() * TOPIC_NOUN.length)];
+  // 从 uuid 里取 6 位纯数字（crypto 随机，非 Math.random）
+  const digits = randomUUID().replace(/\D/g, "");
+  const num = (digits + "000000").slice(0, 6);
+  return `i-am-cooking-${adj}${noun}-${num}`;
 }
 
 /**
@@ -1230,7 +1389,7 @@ async function testPush(provider: "ntfy" | "webhook", ctx: { ui: any }): Promise
   const alert: Alert = {
     id: randomUUID(),
     time: Date.now(),
-    message: "测试推送：pi 需要你！如果你看到这条，说明手机推送通道正常。",
+    message: `测试推送：${config.shoutPhrase || "agent 需要你"}！如果你看到这条，说明手机推送通道正常。`,
     urgency: "normal",
     category: "test",
     repeatCount: 0,
@@ -1255,7 +1414,7 @@ async function testShout(ctx: { ui: any }): Promise<void> {
   // ① 先发等待提示，再发出全部通道（声音/TTS/弹窗/手机推送），拿到真实成功/失败
   ctx.ui.notify("⌛️ 正在测试全部通道：声音 / TTS / 桌面通知 / 手机推送…请留意听到的声音与桌面弹窗。", "info");
   const suppress = shouldSuppress(alert);
-  const phoneOk = await fireAlert(alert, ctx);
+  const phoneOk = await fireAlert(alert, ctx, { forceSound: true }); // 用户主动测试：声音抢占
 
   // ② 汇总各通道结果
   const marks: string[] = [];
@@ -1501,7 +1660,8 @@ export default function (pi: ExtensionAPI) {
           await playSound(
             config.sound ? config.beeps : 0,
             config.sound ? config.soundPath : "",
-            config.tts ? "主人，这是测试语音！pi 需要你！" : "",
+            config.tts ? `主人，这是测试语音！${config.shoutPhrase || "agent 需要你"}！` : "",
+            { force: true }, // 用户主动试听：抢占其他 Agent 的声音
           );
           return;
         }
@@ -1533,22 +1693,26 @@ export default function (pi: ExtensionAPI) {
     name: "shout_for_user",
     label: "Shout For User",
     description:
-      "大声呼喊离开的用户（例如在做饭）。仅在你被真正卡住、只有用户能解决时调用：需要决策、凭据、审批或澄清。" +
-      "给出简短、用户可直接行动的消息。若 cooking 模式未开启，它只会告诉你用户就在电脑前，直接在对话里问即可。",
+      "大声呼喊离开的用户（例如在做饭）。仅当你被真正卡住、且只有用户能解决时调用。\n" +
+      "**调用时机（重要）**：必须在交接内容准备好之后一次性呼喊，禁止先喊再准备。\n" +
+      "**准备标准**：刚好够用——只整理用户立即行动所必需的信息：决策给选项和推荐；凭据给获取方式；手动操作给步骤。不要面面俱到、不要塞无关背景。\n" +
+      "喊出的 message 即最终版，事后不再补充。若 cooking 模式未开启，它只会告诉你用户就在电脑前，直接在对话里问即可。",
     promptSnippet: "Loudly alert the away user when you are blocked and need their input",
     promptGuidelines: [
-      "Use shout_for_user only when truly blocked and only the user can unblock you. Never end your turn silently waiting for input when cooking mode is active — shout instead, then continue with reasonable defaults.",
+      "Call shout_for_user only AFTER the handoff is ready — never shout first and prepare later.",
+      "'Ready' means JUST ENOUGH: the minimal info the user needs to act immediately (options + your recommendation for decisions; how to obtain credentials; steps for manual actions). Don't over-collect or pad with irrelevant context.",
+      "Use shout_for_user only when truly blocked and only the user can unblock you. Shout once with the final message; no preparing-after-shouting.",
     ],
     parameters: Type.Object({
       message: Type.String({
-        description: "简短可执行的消息，例如：\"需要你决定方案 A 还是 B；我先按 A 继续\"。",
+        description: "交接说明（一次性最终版）：用户需做什么 + 必需的材料/凭据/步骤（仅列必要的）。例如：\"需要你登录 example.com（账号 xxx），登录后我需抓取价格页；调研进度已整理\"。",
       }),
       urgency: StringEnum(["info", "normal", "urgent"] as const),
       category: Type.Optional(Type.String({
         description: "分类：decision / credential / approval / clarification / help / completion（全部完成）/ milestone（小阶段完成，仅当用户开启了小阶段提醒时用）等",
       })),
       ttsText: Type.Optional(Type.String({
-        description: "可选：想让用户听到的语音原文（TTS 将原样念出，不走默认模板）。例如：\"主人！方案 A 和 B 我拿不准，快回来看看！\" 不填则用默认模板（\"主人，快来！pi 需要你！+消息\"）。",
+        description: "可选：想让用户听到的语音原文（TTS 将原样念出，不走默认模板）。例如：\"主人！方案 A 和 B 我拿不准，快回来看看！\" 不填则用默认模板（\"主人，快来！agent 需要你！+消息\"）。",
       })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1719,6 +1883,7 @@ export default function (pi: ExtensionAPI) {
     await ensureRulesFile(); // 首次启动用内置默认创建规则文件，已存在则不动
     // 离开状态不跨会话存活：任何会话启动都从"在岗"开始（需要时用户或 Agent 再 on）
     resetCookingState(ctx);
+    startStateSync(ctx); // 监听其他 Agent 的离开状态（任一回来则联动关闭）
     if (!config.setupDone) {
       // 初次使用：提醒配置手机推送
       ctx.ui.notify(
@@ -1730,6 +1895,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     clearRepeatTimers();
+    stopAllAudio(); // 会话关闭：停止正在播放的音频
+    stopStateSync();
     void restoreVolume(); // 退出时恢复音量
     await saveConfig();
   });

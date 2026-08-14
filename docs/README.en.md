@@ -20,8 +20,11 @@ _"pi 需要你！" (pi needs you!)_
 | 🗣️ Agent free speech | when shouting, the agent can speak exactly what it wants (`ttsText`), not just the default template |
 | 📱 Phone push | ntfy.sh (free, zero-config) — the key channel when you're in the kitchen |
 | 🔔 Completion alerts | agent notifies you when the task is done: "主人，好消息！任务完成了！" |
+| 🗣️ Custom shout phrase | default "agent 需要你", fully customizable (with placeholder) |
+| 🎭 Cute Topic names | auto-generated programming/algorithm-style names (e.g. "幻觉的提示词-483726"), guaranteed unique |
 | 🎛️ Dynamic preferences | agent adjusts alert mode from your words: "别喊了" → silence, "完成后喊我" → completion only, "随时汇报" → eager… |
 | 🚀 Autonomy levels | how much the agent should call you when blocked: `conservative` (shout on any human wall) / `balanced` (default) / `autonomous` (avoid shouting) |
+| 🤝 Multi-agent mutual exclusion | with multiple pi's away at once: only one plays sound; any agent detecting you back closes all |
 | 🛡️ Safety net | if the agent ends its turn with a question while you're away, it auto-shouts (under `autonomous` level, only errors shout) |
 | 🔙 Auto-exit | just send a message while cooking mode is on → "I'm back", agent debriefs what it shouted |
 | 🔊 Volume boost | opt-in: auto-raise system volume when you leave, restore when you return (mute state included) |
@@ -110,7 +113,7 @@ Besides your manual commands, the **agent itself calls 4 tools** to understand y
 |---|---|---|
 | `enter_cooking_mode` | Enter cooking mode | when you **clearly** say you're leaving ("I'm cooking" / "我去做饭了" / "我离开一下"); never on ambiguity |
 | `set_shout_sound` | Set the custom shout ringtone | you say "帮我换个铃声" / "use xxx.mp3" and give a concrete path |
-| `shout_for_user` | Loudly shout at you | when blocked and only you can unblock (decision / credential / approval / clarification), or when the task is done |
+| `shout_for_user` | Loudly shout at you | when a task needs you (decision / credential / approval / clarification) — prepare the handoff (just enough) FIRST, then shout; or when the task is done |
 | `set_calling_preference` | Adjust calling preference (how loud) | you say "别喊了"→silence, "完成后喊我"→completion_only, etc. |
 | `set_autonomy_level` | Adjust autonomy level (whether to shout) | you say "遇墙就喊"→conservative, "能不喊就不喊"→autonomous, etc. |
 
@@ -118,7 +121,7 @@ Besides your manual commands, the **agent itself calls 4 tools** to understand y
 
 | Param | Required | Description |
 |---|---|---|
-| `message` | ✅ | short actionable shout content |
+| `message` | ✅ | handoff note (final, one-shot): what you need to do + essential materials/credentials/steps (only what's needed) |
 | `urgency` | ✅ | `info` (completion) / `normal` / `urgent` |
 | `category` | ❌ | decision / credential / approval / clarification / help |
 | `ttsText` | ❌ | **free speech**: TTS speaks this exactly, bypassing the default template |
@@ -256,6 +259,8 @@ You can also just tell the agent "帮我换个铃声" with a path — it calls t
 Guided flow: pick ntfy (recommended, free) → it explains what ntfy is, how to install the app
 (Android / iOS), auto-generates a random topic → enter optional access token → preview & confirm → live test.
 
+> 🎭 **Auto-generated Topic**: random programming/algorithm-style cute name + 6 digits (e.g. `i-am-cooking-幻觉的提示词-483726`) — 528 million combinations, globally unique. You can override it manually.
+
 Manual config in `~/.pi/i-am-cooking/config.json`:
 
 ```json
@@ -302,6 +307,27 @@ and restores the original value **and mute state** on exit (macOS reads both `ou
 | Deduplicate same message | all messages | within 10 min | fixed |
 
 Run `/i-am-cooking limits` for an interactive Chinese menu — no need to memorize English params.
+
+## 🤝 Multi-agent scenarios (multiple pi's away at once)
+
+When multiple pi's (e.g. two terminals / one terminal + RPC) are in cooking mode simultaneously:
+
+| Capability | Behavior |
+|---|---|
+| 🔊 Audio mutual exclusion | **only one sound plays at a time**. Later agents skip the sound (keep toast/push/banner) to avoid overlap; user-initiated `/i-am-cooking test` or preview can **preempt** |
+| 🔙 Linked shutdown | **when any agent detects you're back, all others auto-close** (stop sound, stop repeats, restore volume). Broadcast via shared state file, watch + polling double safety |
+
+> Crash recovery: audio locks left by crashed agent processes are auto-detected (process-alive check) and preempted; a 75 s timeout guards against pid-reuse misjudgment.
+
+### 🗣️ Custom shout phrase
+
+The "agent 需要你" in all shout copy (TTS / toast / push / banner) can be changed to anything. Edit `shoutPhrase` in `config.json`:
+
+```json
+{ "shoutPhrase": "快来救我" }
+```
+
+TTS templates use the `{shoutPhrase}` placeholder (default `主人，快来！{shoutPhrase}！{message}`) — change once, applies everywhere.
 
 ## 🖥️ Platform support
 
