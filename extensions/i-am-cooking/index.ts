@@ -42,7 +42,6 @@ import { fileURLToPath } from "node:url";
 import { suggestTopic as suggestTopicImpl } from "./lib/topic.ts";
 import { acquireAudioLock as acquireAudioLockImpl, releaseAudioLock as releaseAudioLockImpl, isProcessAlive as isProcessAliveImpl } from "./lib/audio-lock.ts";
 import { renderTts as renderTtsImpl } from "./lib/tts.ts";
-import { writeSharedState as writeSharedStateImpl, readSharedState as readSharedStateImpl } from "./lib/state-sync.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -56,7 +55,6 @@ const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const RULES_PATH  = join(CONFIG_DIR, "rules.md");
 const TMP_DIR     = join(CONFIG_DIR, "tmp");
 const AUDIO_LOCK_PATH = join(CONFIG_DIR, "audio.lock"); // 跨 Agent 音频互斥锁
-const STATE_PATH      = join(CONFIG_DIR, "state.json");  // 跨 Agent 离开状态（联动关闭）
 
 // 底线规则（不可删除，永远追加在用户规则后面）
 const GUARD_RAIL = "- 绝不要默默结束回合等用户回复。";
@@ -135,7 +133,6 @@ interface Config {
 
   // behavior
   autoDetect: boolean;      // agent 以"？"结尾等回复时自动喊
-  exitOnUserInput: boolean; // cooking 中你直接打字 = 回来了
   repeatIntervalMinutes: number; // normal 重复间隔
   urgentRepeatMinutes: number;   // urgent 重复间隔
   maxUrgentRepeats: number;      // -1 = 一直喊到回来
@@ -173,7 +170,6 @@ const DEFAULTS: Config = {
   webhookTokenHeader: "Authorization",
   setupDone: false,
   autoDetect: true,
-  exitOnUserInput: true,
   repeatIntervalMinutes: 3,
   urgentRepeatMinutes: 1,
   maxUrgentRepeats: -1,
@@ -440,63 +436,6 @@ async function releaseAudioLock(): Promise<void> {
   await releaseAudioLockImpl(AUDIO_LOCK_PATH);
 }
 
-// ── 跨 Agent 离开状态（联动关闭：任一 Agent 回来，其他都关）───────────────
-// 共享 state.json：turnOn 写 true，turnOff 写 false；其他 Agent 监听变化后静默关闭。
-// 用临时文件 + rename 原子写，避免 watcher 读到半写内容。
-let stateWatcher: ReturnType<typeof watch> | null = null;
-let statePollTimer: ReturnType<typeof setInterval> | null = null;
-
-async function writeSharedState(cooking: boolean): Promise<void> {
-  try {
-    await writeSharedStateImpl(STATE_PATH, CONFIG_DIR, cooking);
-  } catch (e) {
-    console.error("[i-am-cooking] writeSharedState failed:", (e as Error).message);
-  }
-}
-
-/**
- * 检查共享状态：若其他 Agent 已回来（state.cooking=false 且比本 Agent 开启晚），
- * 则静默关闭本 Agent 的离开模式——不停 agent 当前回合、不发送"我回来了"汇报，
- * 只停声音/重复/音量，避免误报（用户其实没在这个会话说话）。
- */
-async function checkSharedState(ctx: { ui: any }): Promise<void> {
-  if (!config.cooking) return;
-  try {
-    const raw = await readFile(STATE_PATH, "utf8");
-    const st = JSON.parse(raw) as { cooking: boolean; updatedAt: number };
-    const since = config.since ?? 0;
-    if (!st.cooking && st.updatedAt > since) {
-      // 其他 Agent 检测到用户回来 → 静默关闭
-      clearRepeatTimers();
-      stopAllAudio();
-      config.cooking = false;
-      config.since = undefined;
-      config.alerts = [];
-      config.callingMode = "normal";
-      void saveConfig();
-      ctx.ui.setStatus("i-am-cooking", "");
-      ctx.ui.setWidget("i-am-cooking", []);
-      void restoreVolume();
-      ctx.ui.notify("🍳 已从其他会话检测到你回来了，离开模式自动关闭。", "info");
-    }
-  } catch { /* state.json 不存在或不可读，忽略 */ }
-}
-
-/** 启动跨 Agent 状态监听（session_start 时调用；watch + 轮询双保险） */
-function startStateSync(ctx: { ui: any }): void {
-  try {
-    stateWatcher = watch(CONFIG_DIR, (_evt, filename) => {
-      if (filename === "state.json") void checkSharedState(ctx);
-    });
-  } catch { /* watch 失败则靠轮询兜底 */ }
-  statePollTimer = setInterval(() => void checkSharedState(ctx), 10_000);
-}
-
-/** 停止跨 Agent 状态监听（session_shutdown 时调用） */
-function stopStateSync(): void {
-  if (stateWatcher) { try { stateWatcher.close(); } catch { /* ignore */ } stateWatcher = null; }
-  if (statePollTimer) { clearInterval(statePollTimer); statePollTimer = null; }
-}
 
 /**
  * 三段式顺序播放：① 短铃声(beeps) → ② Agent 语音(TTS) → ③ 用户自定义歌曲(soundPath)。
@@ -1094,7 +1033,6 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: { 
 function resetCookingState(ctx: { ui: any }): void {
   clearRepeatTimers();
   stopAllAudio(); // 用户回来/新会话：立即停止正在播放的音频
-  void writeSharedState(false); // 广播：离开状态已结束
   const hadCooking = config.cooking;
   const hadPending = pendingAlerts().length;
   config.cooking = false;
@@ -1116,7 +1054,6 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
   config.cooking = true;
   config.since = Date.now();
   completionNoticeCount = 0; // 新的一轮离开，重置完成通知计数
-  void writeSharedState(true); // 广播：进入离开模式（供其他 Agent 联动）
   void saveConfig();
   ctx.ui.setStatus("i-am-cooking", "🍳 离开中（I am cooking）");
   ctx.ui.notify(`🍳 离开模式已开启。${config.shoutPhrase || "agent 需要你"}时我会大声喊你。`, "info");
@@ -1182,10 +1119,9 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
   );
 }
 
-function turnOff(ctx: { ui: any }, source: "command" | "user-input", userText?: string): void {
+function turnOff(ctx: { ui: any }, source: "command" | "agent-exit", userText?: string): void {
   clearRepeatTimers();
-  stopAllAudio(); // 用户回来：立即停止正在播放的音频
-  void writeSharedState(false); // 广播：用户回来了（其他 Agent 联动关闭）
+  stopAllAudio(); // 关闭离开：立即停止正在播放的音频
   const pending = pendingAlerts();
   config.cooking = false;
   config.since = undefined;
@@ -1201,14 +1137,10 @@ function turnOff(ctx: { ui: any }, source: "command" | "user-input", userText?: 
   const summary = pending.length
     ? pending.map((a, i) => `${i + 1}. [${a.urgency}] ${a.message}`).join("\n")
     : "（无待处理呼喊）";
-  // 用户回来了且带了新输入 → 把输入内容作为后续指令交给 agent（修复：之前被忽略）
-  const followUp = userText
-    ? `[I am cooking] 我回来了（检测到你打字）。你补充了新的指令：\n“${userText}”\n\n` +
-      `请停止之前的自主推进方向，优先按这条新指令处理。` +
-      (pending.length ? `\n另外，我不在的时候你喊了我这些事：\n${summary}` : "")
-    : `[I am cooking] 我回来了（${source === "user-input" ? "检测到你打字" : "执行 off 命令"}）。\n` +
-      `我不在的时候你喊了我这些事：\n${summary}\n` +
-      `请简要汇报当前进度，然后继续处理这些事项。`;
+  const followUp =
+    source === "command"
+      ? `[I am cooking] 我回来了（执行 off 命令）。\n我不在的时候你喊了我这些事：\n${summary}\n请简要汇报当前进度，然后继续处理这些事项。`
+      : `[I am cooking] 用户结束了离开模式（agent 理解判定）。\n我不在的时候你喊了我这些事：\n${summary}\n请简要汇报当前进度，然后继续处理这些事项。`;
   void api.sendUserMessage(followUp, { deliverAs: "followUp" });
 }
 
@@ -2047,13 +1979,45 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // 工具：用户明确表示结束离开时，agent 关闭离开模式（语义关闭，不依赖关键词）
+  pi.registerTool({
+    name: "exit_cooking_mode",
+    label: "Exit Cooking Mode",
+    description:
+      "关闭离开模式（I am cooking），回到在线状态。\n" +
+      "**调用时机**：用户明确表示要结束离开、回到在线时——例如说\"我不离开了\"\"保持在线\"\"别忙了，我回来了\"\"先停一下，不用了\"\"取消离开模式\"，或明显接管任务、表示不再需要你自主干活。\n" +
+      "**不要误关**：\n" +
+      "  · 用户只是临时看一眼、补充信息、问个问题 → 不要调用，保持离开模式继续工作\n" +
+      "  · 用户说\"我先去忙别的，你继续\" → 不要调用\n" +
+      "调用后：当前会话退出离开模式，agent 收到汇报并继续按新情况处理；只影响当前这一个 Agent，不影响其他 Agent。",
+    promptSnippet: "Exit away-mode when the user clearly returns / wants to be online again",
+    promptGuidelines: [
+      "Call exit_cooking_mode ONLY when the user clearly says they are ending the away session (e.g. '我不离开了', '保持在线', '先停一下，不用了'). Do NOT call it when the user just adds a note, asks a question, or says 'keep going'. Only affects this session.",
+    ],
+    parameters: Type.Object({
+      reason: Type.String({ description: "依据的用户原话或推理，例如：\"用户说：我不离开了，保持在线\"" }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!config.cooking) {
+        return {
+          content: [{ type: "text", text: "当前不在离开模式，无需关闭。" }],
+          details: { closed: false, alreadyOff: true },
+        };
+      }
+      turnOff(ctx, "agent-exit");
+      return {
+        content: [{ type: "text", text: `已关闭离开模式（依据：${params.reason}）。汇报已发送给用户。` }],
+        details: { closed: true, reason: params.reason },
+      };
+    },
+  });
+
   // ── events ──
   pi.on("session_start", async (_event, ctx) => {
     await loadConfig();
     await ensureRulesFile(); // 首次启动用内置默认创建规则文件，已存在则不动
     // 离开状态不跨会话存活：任何会话启动都从"在岗"开始（需要时用户或 Agent 再 on）
     resetCookingState(ctx);
-    startStateSync(ctx); // 监听其他 Agent 的离开状态（任一回来则联动关闭）
     if (!config.setupDone) {
       // 初次使用：提醒配置手机推送
       ctx.ui.notify(
@@ -2066,7 +2030,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     clearRepeatTimers();
     stopAllAudio(); // 会话关闭：停止正在播放的音频
-    stopStateSync();
     void restoreVolume(); // 退出时恢复音量
     await saveConfig();
   });
@@ -2137,10 +2100,7 @@ export default function (pi: ExtensionAPI) {
       setAutonomyLevel(level, `你说了："${event.text.slice(0, 40)}"`, ctx);
     }
 
-    // ② 用户打字 = 回来了 → 退出离开模式，并把用户输入作为新指令转交给 agent
-    if (config.exitOnUserInput) {
-      turnOff(ctx, "user-input", event.text.trim());
-      return { action: "handled" }; // 输入已被 followUp 转交，阻止它再走正常流程（避免重复）
-    }
+    // ② 用户打字 = 正常输入：不触发任何关闭，交给 agent 处理
+    //    关闭离开模式由 agent 语义理解调用 exit_cooking_mode，或用户手动 /off
   });
 }

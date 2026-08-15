@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Changed
+- **多 Agent 独立**：移除联动关闭机制（state.json 广播/watch），各 Agent 完全独立——关闭某个 Agent 不影响其他；打字不再自动关闭离开模式（正常输入交给 agent 处理）。
+- **语义退出**：新增 `exit_cooking_mode` 工具，agent 理解用户"我不离开了/保持在线"等明确结束表达时关闭当前会话；`/i-am-cooking off` 手动关闭。
+
+### Changed
 - **进度汇报模式**：`milestoneReminders` 布尔重构为 `progressReporting` 三态（milestone 小阶段完成时/interval 定时/none 不汇报），默认小阶段；每次手动 `on` 时弹"进度汇报·可选-手机通知"三选一，选定时可设间隔（默认 15 分钟）；定时模式下每 N 分钟强制 agent 汇报进度（含无进展/卡住情况），随 off 自动停止。紧急/完成通知不受影响。
 
 ### Added

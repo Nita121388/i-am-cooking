@@ -24,9 +24,9 @@ _"Agent 需要你！" (Agent needs you!)_
 | 🎭 Cute Topic names | auto-generated programming/algorithm-style names (e.g. "幻觉的提示词-483726"), guaranteed unique |
 | 🎛️ Dynamic preferences | agent adjusts alert mode from your words: "别喊了" → silence, "完成后喊我" → completion only, "随时汇报" → eager… |
 | 🚀 Autonomy levels | how much the agent should call you when blocked: `conservative` (shout on any human wall) / `balanced` (default) / `autonomous` (avoid shouting) |
-| 🤝 Multi-agent mutual exclusion | with multiple pi's away at once: only one plays sound; any agent detecting you back closes all |
+| 🤝 Multi-agent independence | with multiple pi's away at once: each is fully independent — only one plays sound at a time; closing one does not affect others |
 | 🛡️ Safety net | if the agent ends its turn with a question while you're away, it auto-shouts (under `autonomous` level, only errors shout) |
-| 🔙 Auto-exit | just send a message while cooking mode is on → "I'm back", agent debriefs what it shouted |
+| 🔙 Semantic exit | say "我不离开了/保持在线" → agent understands and exits; or manual `/i-am-cooking off` |
 | 🔊 Volume boost | opt-in: auto-raise system volume when you leave, restore when you return (mute state included) |
 | 🗣️ Setup wizard | `/i-am-cooking setup` — guided, with ntfy explainer, auto-random topic, preview-then-confirm |
 | 🔐 Token security | token fields support `${ENV_VAR}` so secrets never hit disk |
@@ -47,11 +47,19 @@ flowchart TD
     G -->|Human wall / needs decision| H["shout_for_user"]
     G -->|Task complete| I["Completion notice (info)"]
     G -->|Can solve itself| F
+    G -->|Progress node / interval| P["📈 Progress report (optional)<br/>milestone or interval"]
     H --> J[📣 Multi-channel shout<br/>beeps/voice/song + toast/phone]
     I --> J
-    J --> K[⌨️ You send a message when back]
-    K --> L[🔙 Auto-exit + agent debrief<br/>\"I shouted you N times\"]
-    L --> A
+    P --> J
+    J --> K[⌨️ You type when back: note/question<br/>NO close - agent keeps going]
+    K --> F
+    E --> M{User clearly ends?}
+    M -->|say 我不离开了/保持在线| N["agent calls exit_cooking_mode (this session only)"]
+    M -->|manual /off| N
+    N --> A
+```
+
+**In one sentence**: say you're leaving (or just "I'm cooking") → cooking mode on → agent works, shouts you when needed; typing as a note/question does NOT close it (agent keeps going) - only a clear "我不离开了" or `/off` closes this session (others unaffected).
 ```
 
 **In one sentence**: say you're leaving (or just "I'm cooking") → cooking mode on → agent works, shouts you when needed → you send a message when back → auto-exit + debrief.
@@ -118,6 +126,7 @@ Besides your manual commands, the **agent itself calls 4 tools** to understand y
 | `shout_for_user` | Loudly shout at you | when a task needs you (decision / credential / approval / clarification) — prepare the handoff (just enough) FIRST, then shout; or when the task is done |
 | `set_calling_preference` | Adjust calling preference (how loud) | you say "别喊了"→silence, "完成后喊我"→completion_only, etc. |
 | `set_autonomy_level` | Adjust autonomy level (whether to shout) | you say "遇墙就喊"→conservative, "能不喊就不喊"→autonomous, etc. |
+| `exit_cooking_mode` | Exit away-mode | you clearly end it ("我不离开了/保持在线/先停一下"); NOT for quick notes/questions |
 
 **`shout_for_user` parameters**:
 
@@ -330,7 +339,7 @@ When multiple pi's (e.g. two terminals / one terminal + RPC) are in cooking mode
 | Capability | Behavior |
 |---|---|
 | 🔊 Audio mutual exclusion | **only one sound plays at a time**. Later agents skip the sound (keep toast/push/banner) to avoid overlap; user-initiated `/i-am-cooking test` or preview can **preempt** |
-| 🔙 Linked shutdown | **when any agent detects you're back, all others auto-close** (stop sound, stop repeats, restore volume). Broadcast via shared state file, watch + polling double safety |
+| 🔙 Independent close | closing one agent ("我不离开了" or `/i-am-cooking off`) **only affects that agent** — others keep working, no need to re-enable |
 
 > Crash recovery: audio locks left by crashed agent processes are auto-detected (process-alive check) and preempted; a 75 s timeout guards against pid-reuse misjudgment.
 
