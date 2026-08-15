@@ -11,6 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **进度汇报模式**：`milestoneReminders` 布尔重构为 `progressReporting` 三态（milestone 小阶段完成时/interval 定时/none 不汇报），默认小阶段；每次手动 `on` 时弹"进度汇报·可选-手机通知"三选一，选定时可设间隔（默认 15 分钟）；定时模式下每 N 分钟强制 agent 汇报进度（含无进展/卡住情况），随 off 自动停止。紧急/完成通知不受影响。
+
 ### Added
 - **音量控制** `/i-am-cooking volume`：交互式中文菜单（查看当前音量 / 立即调音量 / 设置离开自动拉高 / 开关）；`set_volume` 工具让 agent 也能调（用户明确要求时，或呼喊前解除静音）。跨平台：macOS osascript / Linux pactl / Windows volume.ps1。
 - **多 Agent 协作**：音频互斥锁（多个 pi 同时离开只放一个声音，崩溃锁自动抢占，test 可强制抢占）；联动关闭（任一 Agent 检测到你回来，其他全自动关闭，watch+轮询双保险）。

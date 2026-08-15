@@ -145,7 +145,8 @@ interface Config {
   autonomyLevel: AutonomyLevel;  // 自主等级（持久化；遇到阻塞时该不该喊）
   maxCompletionNotices: number;  // 每次离开最多喊几次完成（防打扰）
   ttsTemplateCompletion: string; // 完成时的 TTS 文案
-  milestoneReminders: boolean;   // 小阶段完成提醒（每次离开时询问用户是否开启）
+  progressReporting: "milestone" | "interval" | "none"; // 进度汇报模式：小阶段完成时 / 定时 / 不汇报
+  reportIntervalMinutes: number;   // 定时汇报间隔（分钟，默认 15）
   ttsTemplateMilestone: string;  // 小阶段完成时的 TTS 文案
   milestoneBeeps: number;        // 小阶段完成时的提示音次数（默认 1，轻声）
 }
@@ -182,7 +183,8 @@ const DEFAULTS: Config = {
   autonomyLevel: "balanced", // 默认：有点难度才喊
   maxCompletionNotices: 3,
   ttsTemplateCompletion: "主人，好消息！任务完成了！{message}",
-  milestoneReminders: false, // 默认关：每次离开时询问用户
+  progressReporting: "milestone", // 默认：小阶段完成时汇报
+  reportIntervalMinutes: 15,
   ttsTemplateMilestone: "小进展：{message}",
   milestoneBeeps: 1,
 };
@@ -1023,12 +1025,32 @@ function clearRepeatTimers(): void {
   repeatTimers = [];
 }
 
+// ── 定时汇报（progressReporting = interval）──────────────────────────────
+let reportTimer: ReturnType<typeof setInterval> | null = null;
+
+/** 启动定时汇报：每 N 分钟给 agent 发"请汇报进度"，agent 响应后汇报到本地+手机 */
+function startReportTimer(ctx: { ui: any }): void {
+  stopReportTimer();
+  const minutes = Math.max(1, Math.min(120, config.reportIntervalMinutes || 15));
+  reportTimer = setInterval(() => {
+    if (!config.cooking) return;
+    const msg = `[定时汇报] 到点了，请汇报当前进度：\n` +
+      `- 已完成什么？\n- 正在做什么？\n- 有无进展（没有新进展就如实说明原因，卡住了就说卡在哪、是否需要用户）`;
+    void api.sendUserMessage(msg, { deliverAs: "followUp" });
+  }, minutes * 60_000);
+  repeatTimers.push(reportTimer); // 并入重复计时器，随 off/会话结束一起清理
+}
+
+function stopReportTimer(): void {
+  if (reportTimer) { clearInterval(reportTimer); reportTimer = null; }
+}
+
 function queueAlert(message: string, urgency: Urgency, category: string, ctx: { ui: any }, ttsText?: string): boolean {
   if (!config.cooking) return false;
 
-  // milestone（小阶段完成）受开关控制：未开启则忽略；开启则每次都提醒（不共享 completion 上限）
+  // milestone（小阶段完成）仅在 progressReporting = milestone 模式提醒；interval/none 忽略
   if (category === "milestone") {
-    if (!config.milestoneReminders) return false;
+    if (config.progressReporting !== "milestone") return false;
   }
 
   // completion 防打扰：每次离开最多 maxCompletionNotices 次完成通知
@@ -1108,26 +1130,42 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
     if (level) setAutonomyLevel(level, `你在 on 备注里说了："${note.slice(0, 40)}"`, ctx);
   }
 
-  // 小阶段完成提醒：每次手动开启时询问用户（TUI 模式）；Agent 开启/非 TUI 用当前配置
+  // 进度汇报模式：每次手动开启时询问用户（TUI 模式）；Agent 开启/非 TUI 用当前配置
   if (askMilestone && ctx.hasUI && ctx.mode === "tui") {
-    const want = await ctx.ui.confirm(
-      "📈 小阶段完成提醒？",
-      `Agent 每完成一个小阶段（里程碑）都提醒你一次。\n` +
-      `小阶段可能比较频繁（如"已下载 3/10 个文件"）。\n\n` +
-      `开启 = 每次都提醒（轻声提示音）\n不开启 = 只在全部完成或卡住时提醒（${config.milestoneReminders ? "当前为开启，将保持" : "当前为关闭"}）`, 
-    );
-    if (want) {
-      config.milestoneReminders = true;
+    const pick = await ctx.ui.select("📈 进度汇报·可选-手机通知", [
+      "① 小阶段完成时（默认）",
+      "② 定时（每15分钟）",
+      "③ 不汇报",
+    ], {
+      footer: "紧急 / 完成 → 照常声音+弹窗+手机通知",
+    });
+    if (pick) {
+      if (pick.includes("①")) config.progressReporting = "milestone";
+      else if (pick.includes("②")) {
+        config.progressReporting = "interval";
+        const v = await ctx.ui.input("定时汇报间隔（分钟，默认 15）:", String(config.reportIntervalMinutes || 15));
+        const n = parseInt((v ?? "").trim(), 10);
+        if (!isNaN(n) && n >= 1 && n <= 120) config.reportIntervalMinutes = n;
+        else config.reportIntervalMinutes = 15;
+      }
+      else config.progressReporting = "none";
       await saveConfig();
-      ctx.ui.notify("📈 小阶段完成提醒已开启：agent 每完成一个小阶段都会轻声提醒你。", "info");
     }
+  }
+
+  // interval 模式：启动定时汇报定时器
+  if (config.progressReporting === "interval") {
+    startReportTimer(ctx);
   }
 
   const noteText = note ? `备注：${note}` : "";
   const level = config.autonomyLevel || "balanced";
-  const milestoneHint = config.milestoneReminders
-    ? `\n小阶段完成提醒已开启：达到重要小节点时，调用 shout_for_user（category="milestone", urgency="info"）轻声通知我。`
-    : "";
+  const progressHint =
+    config.progressReporting === "milestone"
+      ? `\n小阶段完成提醒已开启：达到重要小节点时，调用 shout_for_user（category="milestone", urgency="info"）轻声通知我。`
+      : config.progressReporting === "interval"
+        ? `\n定时汇报已开启：每 ${config.reportIntervalMinutes || 15} 分钟，你会收到一条“请汇报当前进度”的消息，届时汇报当前进展（即使没有新进展也要如实说明，卡住了就说卡在哪）。`
+        : "";
   void api.sendUserMessage(
     `[I am cooking] 我离开去做饭了，不在电脑前。${noteText}\n` +
     `当前自主等级：${AUTONOMY_LABEL[level]}。具体行动指南见注入的 [自主等级指南]（含人类墙等场景的喊我阈值）。\n` +
@@ -1135,7 +1173,7 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
     `只有达到当前等级的喊我阈值（见 [自主等级指南]）时才调用 shout_for_user 工具大声喊我。` +
     `调用前先准备好交接内容（刚好够用：决策给选项和推荐，凭据给获取方式，手动操作给步骤），准备好再喊，喊出的消息即最终版。\n` +
     `任务全部完成或达到重要里程碑时，调用 shout_for_user（category="completion", urgency="info"）通知我。` +
-    milestoneHint,
+    progressHint,
     { deliverAs: "followUp" },
   );
 }

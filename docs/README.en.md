@@ -250,7 +250,7 @@ You can also just tell the agent "帮我换个铃声" with a path — it calls t
 | ✅ Whole completion | 2 beeps + completion voice (no song, quiet good news) | "all tasks done!" |
 | 📈 Milestone | 1 beep + short voice (subtle) | "downloaded 3/10 files" |
 
-> 📈 **Milestone reminders are a toggle**: each time you manually enter cooking mode it asks "enable milestone reminders?" — on = the agent softly pings every small milestone; off = only notify on full completion or when stuck.
+> 📈 **Progress reporting mode (pick one of three)**: each time you manually enter cooking mode it asks "进度汇报" — ① milestone (default, soft ping) / ② interval (every 15 min, even without progress) / ③ none. Urgent/completion notifications are unaffected.
 
 ## 📱 Phone push setup
 
@@ -315,7 +315,8 @@ and restores the original value **and mute state** on exit (macOS reads both `ou
 |---|---|---|---|
 | Same task completion never repeats | ✅ whole completion | never repeats | fixed |
 | Max completion notices per away period (different tasks) | ✅ whole completion | 3 | `/i-am-cooking limits` |
-| Milestone reminders | 📈 milestone | off (asks you each time you enter) | ask on enter |
+| Milestone reminders | 📈 milestone | ① milestone (default, ask on enter) | ask on enter |
+| Interval progress reports | ⏰ progress | off (② → every 15 min) | ask on enter |
 | Normal shout repeat | ⚠️ normal shout | **3 minutes** (once) | `/i-am-cooking limits` |
 | Urgent shout repeats | 🚨 urgent shout | **1 minute**, until you return | `/i-am-cooking limits` |
 | Deduplicate same message | all messages | within 10 min | fixed |
