@@ -646,8 +646,12 @@ async function toggleMute(mute: boolean): Promise<boolean | null> {
       const arg = mute ? "mute" : "unmute";
       await execFileAsync("pactl", ["set-sink-mute", "@DEFAULT_SINK@", arg], { windowsHide: true });
       return mute;
+    } else if (p === "win32") {
+      // Windows：走 volume.ps1 的 mute/unmute action（Core Audio API）
+      await runPowerShellScript("volume.ps1", { action: mute ? "mute" : "unmute" });
+      return mute;
     }
-    return null; // Windows 走 volume.ps1（set 音量会解静音）
+    return null;
   } catch (e) {
     console.error("[i-am-cooking] toggleMute failed:", (e as Error).message);
     return null;
