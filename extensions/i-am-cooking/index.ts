@@ -30,6 +30,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { Key } from "@earendil-works/pi-tui"; // 快捷键（停止本次播放）
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, readFile, rm, writeFile, readdir, rename } from "node:fs/promises";
@@ -189,6 +190,8 @@ const DEFAULTS: Config = {
 let api: ExtensionAPI; // set by factory; needed by turnOn/turnOff
 let config: Config = { ...DEFAULTS };
 let repeatTimers: ReturnType<typeof setInterval>[] = [];
+// 当前是否正在响铃播放（状态栏/横幅指示用；仅反映本实例，多 Agent 间互不影响）
+let shoutingState = false;
 
 async function loadConfig(): Promise<void> {
   try {
@@ -419,12 +422,13 @@ function playProcess(cmd: string, args: string[], maxMs: number): Promise<void> 
   });
 }
 
-/** 停止所有正在播放的音频（用户回来/关会话时调用，立即安静） */
+/** 停止所有正在播放的音频（用户回来/关会话/停止本次播放时调用，立即安静） */
 function stopAllAudio(): void {
   for (const proc of activeAudioProcs) {
     try { proc.kill(); } catch { /* ignore */ }
   }
   activeAudioProcs = [];
+  shoutingState = false; // 已安静，状态栏/横幅恢复
 }
 
 // ── 跨 Agent 音频互斥锁（逻辑在 lib/audio-lock.ts，可测试）────────────────────
@@ -896,17 +900,22 @@ async function fireAlert(alert: Alert, ctx: { ui: any }, opts: { forceSound?: bo
   //   📈 小阶段   → beeps 1 声 + 简短语音（轻声，不打断思路）
   // 声音不阻塞后续通道：fire-and-forget，最长 soundSeconds 秒后自动停
   if (config.sound || config.tts) {
+    // 状态栏/横幅：响铃期间显示“正在喊你”，播完自动恢复“🍳 离开中”
+    shoutingState = true;
+    updateStatus(ctx, "shouting", alert.urgency);
+    updateWidget(ctx);
+    const done = () => { shoutingState = false; updateStatus(ctx, "idle"); updateWidget(ctx); };
     if (isMilestone) {
-      void playSound(config.sound ? config.milestoneBeeps : 0, "", config.tts ? renderTts(alert) : "", { force: forceSound });
+      void playSound(config.sound ? config.milestoneBeeps : 0, "", config.tts ? renderTts(alert) : "", { force: forceSound }).then(done).catch(done);
     } else if (isCompletion) {
-      void playSound(config.sound ? 2 : 0, "", config.tts ? renderTts(alert) : "", { force: forceSound });
+      void playSound(config.sound ? 2 : 0, "", config.tts ? renderTts(alert) : "", { force: forceSound }).then(done).catch(done);
     } else {
       void playSound(
         config.sound ? config.beeps : 0,
         config.sound ? config.soundPath : "",
         config.tts ? renderTts(alert) : "",
         { force: forceSound },
-      );
+      ).then(done).catch(done);
     }
   }
   if (config.toast) {
@@ -922,6 +931,18 @@ async function fireAlert(alert: Alert, ctx: { ui: any }, opts: { forceSound?: bo
   return true;
 }
 
+/** 更新状态栏：idle=🍳 离开中 / shouting=📣 正在喊你（带本次停止提示） */
+function updateStatus(ctx: { ui: any }, phase: "idle" | "shouting", urgency?: string): void {
+  if (!ctx?.ui) return;
+  if (!config.cooking) { ctx.ui.setStatus("i-am-cooking", ""); return; }
+  ctx.ui.setStatus(
+    "i-am-cooking",
+    phase === "shouting"
+      ? ctx.ui.theme.fg("warning", `📣 正在喊你！[${urgency ?? ""}]（Ctrl+Alt+M 停止本次播放）`)
+      : "🍳 离开中（I am cooking）",
+  );
+}
+
 function updateWidget(ctx: { ui: any }): void {
   if (!ctx?.ui) return;
   if (!config.tuiBanner) { ctx.ui.setWidget("i-am-cooking", []); return; }
@@ -929,10 +950,25 @@ function updateWidget(ctx: { ui: any }): void {
   const lines = config.cooking
     ? [
         "🍳 离开中（I am cooking）— 需要你时我会大声喊你。",
+        ...(shoutingState ? ["  🔕 正在响铃 — 按 Ctrl+Alt+M 停止本次播放（下次照常）"] : []),
         ...pending.map((a, i) => `  ⚠ ${i + 1}. [${a.urgency}] ${a.message}`),
       ]
     : [];
   ctx.ui.setWidget("i-am-cooking", lines);
+}
+
+/** 停止本次播放：只掐当前音频，不改配置、不清待处理呼喊、不影响下次呼喊 */
+function stopCurrentSound(ctx: { ui: any }): void {
+  const hadAudio = shoutingState || activeAudioProcs.length > 0;
+  stopAllAudio();
+  updateStatus(ctx, "idle");
+  updateWidget(ctx);
+  ctx.ui.notify(
+    hadAudio
+      ? "🔕 已停止本次播放。下次呼喊照常响铃。"
+      : "🔕 当前没有正在播放的声音。下次呼喊照常响铃。",
+    "info",
+  );
 }
 
 // ── alert queue & escalation ─────────────────────────────────────────────
@@ -1055,8 +1091,8 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
   config.since = Date.now();
   completionNoticeCount = 0; // 新的一轮离开，重置完成通知计数
   void saveConfig();
-  ctx.ui.setStatus("i-am-cooking", "🍳 离开中（I am cooking）");
   ctx.ui.notify(`🍳 离开模式已开启。${config.shoutPhrase || "agent 需要你"}时我会大声喊你。`, "info");
+  updateStatus(ctx, "idle");
   updateWidget(ctx);
 
   // 自动提升音量（只在用户允许时生效）
@@ -1448,6 +1484,7 @@ export default function (pi: ExtensionAPI) {
         { value: "status", label: "status", description: "查看模式 / 待处理呼喊 / 通道 / token 状态" },
         { value: "setup", label: "setup", description: "配置手机推送（首次使用，交互式向导）" },
         { value: "test", label: "test", description: "测试所有通道（声音/TTS/Toast/手机）" },
+        { value: "stop-sound", label: "stop-sound", description: "停止本次呼喊播放（只停当前，下次照常）" },
         { value: "rules", label: "rules", description: "查看当前生效规则" },
         { value: "edit-rules", label: "edit-rules", description: "编辑规则文件（保存即生效）" },
         { value: "reset-rules", label: "reset-rules", description: "规则恢复出厂默认（内置规则）" },
@@ -1465,6 +1502,7 @@ export default function (pi: ExtensionAPI) {
       if (arg === "status") { showStatus(ctx); return; }
       if (arg === "setup") { await setupWizard(ctx); return; }
       if (arg === "test") { await testShout(ctx); return; }
+      if (arg === "stop-sound") { stopCurrentSound(ctx); return; }
       if (arg === "rules") {
         const rules = await loadRules();
         ctx.ui.notify(
@@ -1721,6 +1759,18 @@ export default function (pi: ExtensionAPI) {
       }
       const note = arg.startsWith("on") ? arg.slice(2).trim() : arg;
       await turnOn(ctx, note, true); // 手动开启：询问是否开启小阶段提醒
+    },
+  });
+
+  // 快捷键：停止本次播放（默认 Ctrl+Alt+M；可在 keybindings.json 自定义）
+  pi.registerShortcut(Key.ctrlAlt("m"), {
+    description: "i-am-cooking: 停止本次呼喊播放（仅本次，下次照常）",
+    handler: async (ctx) => {
+      if (!config.cooking) {
+        ctx.ui.notify("当前不在离开模式，无播放可停止。", "info");
+        return;
+      }
+      stopCurrentSound(ctx);
     },
   });
 

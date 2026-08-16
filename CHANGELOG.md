@@ -11,6 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **状态栏动态指示 & 停止本次播放**：喊话时状态栏变 `📣 正在喊你！[urgency]（Ctrl+Alt+M 停止本次播放）`，播完自动恢复 `🍳 离开中`；新增 `Ctrl+Alt+M` 快捷键和 `/i-am-cooking stop-sound` 命令停止本次播放——只掐当前音频，不改配置、不清待处理呼喊、下次照常响铃；横幅同步显示“正在响铃”提示。
+
 ### Changed
 - **多 Agent 独立**：移除联动关闭机制（state.json 广播/watch），各 Agent 完全独立——关闭某个 Agent 不影响其他；打字不再自动关闭离开模式（正常输入交给 agent 处理）。
 - **语义退出**：新增 `exit_cooking_mode` 工具，agent 理解用户"我不离开了/保持在线"等明确结束表达时关闭当前会话；`/i-am-cooking off` 手动关闭。

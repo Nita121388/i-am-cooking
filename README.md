@@ -13,6 +13,7 @@
 | 🧠 自主模式 | 离开时注入"自主推进，别干等"规则，agent 继续干活而不是停下来等你 |
 | 🤖 Agent 自主开启 | 说"我去做饭了""我离开一下""I'm cooking"，agent 理解后自动开启（无需记命令） |
 | 📣 多路呼喊 | 声音 + 中文 TTS + 桌面弹窗 + **手机推送** + TUI 横幅，总有一路能传到你 |
+| 📣 状态栏动态指示 | 喊话时状态栏变 `📣 正在喊你！`，喊完自动恢复 `🍳 离开中`；不想听了按 `Ctrl+Alt+M` 停止本次（下次照常） |
 | 🎵 自定义铃声 | 三段式播放：短铃声 → Agent 语音 → 你自己的歌（`/i-am-cooking sound`），到点自动停 |
 | 🗣️ Agent 自由语音 | 呼喊时 agent 可原样说出想说的话（`ttsText`），不限于默认模板 |
 | 📱 手机推送 | ntfy.sh（免费，零配置）— 厨房场景的关键通道 |
@@ -48,7 +49,7 @@ flowchart TD
     H --> J[📣 多路呼喊<br/>短铃声/语音/歌曲 + 弹窗/手机推送]
     I --> J
     P --> J
-    J --> K["⌨️ 你回来打字：补充/问问题<br/>不关闭，agent 继续"]
+    J --> K["⌨️ 回来打字：补充/问问题，agent 继续"]
     K --> F
     E --> M{用户明确结束?}
     M -->|说 我不离开了／保持在线| N["agent 调 exit_cooking_mode 关闭本会话"]
@@ -98,6 +99,7 @@ pi install /path/to/your/local/checkout
 | `/i-am-cooking status` | 查看模式/待处理呼喊/通道/音量/偏好/等级/防打扰参数 | `status` |
 | `/i-am-cooking setup` | 交互式配置向导（手机推送 + 音量 + 自主等级） | `setup` |
 | `/i-am-cooking test` | 测试所有通道，逐通道汇报真实结果 | `test` |
+| `/i-am-cooking stop-sound` | 停止本次播放（只停当前，下次照常；同 `Ctrl+Alt+M`） | `stop-sound` |
 | `/i-am-cooking rules` | 查看当前生效的规则 | `rules` |
 | `/i-am-cooking edit-rules` | 编辑规则文件（保存即生效） | `edit-rules` |
 | `/i-am-cooking reset-rules` | 规则恢复出厂默认 | `reset-rules` |
@@ -266,6 +268,25 @@ agent 离开模式的行为规则不是写死的，你可以自己改：
 ```
 
 TTS 模板里用 `{shoutPhrase}` 占位（默认 `主人，快来！{shoutPhrase}！{message}`），改一处全生效。
+
+### 📣 状态栏动态指示 & 停止本次播放
+
+离开模式下你可以在状态栏（底部）和编辑区上方横幅看到当前状态：
+
+| 状态 | 显示 |
+|---|---|
+| 离开中、安静 | `🍳 离开中（I am cooking）` |
+| **正在喊话（响铃中）** | `📣 正在喊你！[urgency]（Ctrl+Alt+M 停止本次播放）`（高亮） |
+| 喊完 / 被停止 | 自动恢复 `🍳 离开中（I am cooking）` |
+
+**停止本次播放**（不想听这次响铃，但保留待处理呼喊）：
+
+- 快捷键：`Ctrl+Alt+M`（M = Mute；可在 `~/.pi/agent/keybindings.json` 自定义绑定）
+- 命令：`/i-am-cooking stop-sound`
+
+停止**只掐断当前正在播放的声音**——不改任何配置、不关声音开关、不清除待处理呼喊，所以**下次呼喊照常响铃**。
+
+> ⚠️ 说明：pi 的终端状态栏不支持鼠标点击，所以用快捷键替代“点击关闭”；按键只影响当前这个终端里正在播的声音（多 Agent 各停各的）。
 
 ## 📱 手机推送配置
 
