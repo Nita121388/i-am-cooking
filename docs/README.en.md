@@ -16,6 +16,7 @@ _"Agent 需要你！" (Agent needs you!)_
 | 🧠 Autonomous mode | `/i-am-cooking on` injects "work autonomously, don't wait" rules into the agent |
 | 🤖 Agent-initiated | just say "I'm cooking", "我去做饭了" or "我离开一下" — the agent understands and enters away-mode itself (`enter_cooking_mode`) |
 | 📣 Multi-channel shout | sound (beeps) + Chinese TTS + desktop toast + **phone push** (ntfy / webhook) + TUI banner |
+| 📣 Dynamic status bar | while shouting, status/banner show `📢 正在广播中...`; after it stops, restores to `🍳 离开中 · ⚠N`; press `Ctrl+Alt+M` to stop this time (next time still rings) |
 | 🎵 Custom ringtone | 3-stage playback: short beeps → agent voice → **your own song** (`/i-am-cooking sound`), auto-stops after a total budget |
 | 🗣️ Agent free speech | when shouting, the agent can speak exactly what it wants (`ttsText`), not just the default template |
 | 📱 Phone push | ntfy.sh (free, zero-config) — the key channel when you're in the kitchen |
@@ -104,6 +105,7 @@ Reload pi (`/reload`) after installing.
 | `/i-am-cooking status` | Mode, pending shouts, channels, volume, preferences, level, anti-noise params | `status` |
 | `/i-am-cooking setup` | Interactive wizard: phone push + volume + autonomy level | `setup` |
 | `/i-am-cooking test` | Test all channels, per-channel real result | `test` |
+| `/i-am-cooking stop-sound` | Stop the current playback only (next shout still rings; same as `Ctrl+Alt+M`) | `stop-sound` |
 | `/i-am-cooking rules` | Show currently active rules | `rules` |
 | `/i-am-cooking edit-rules` | Edit the rules file (saves instantly) | `edit-rules` |
 | `/i-am-cooking reset-rules` | Restore factory-default rules | `reset-rules` |
@@ -250,6 +252,29 @@ You can also just tell the agent "帮我换个铃声" with a path — it calls t
 | ⏱ Total duration | default 60 s, force-stopped at the limit, adjustable (1–300 s) |
 
 > Format tip: **wav works everywhere**; mp3 is best on macOS/Linux.
+
+### 📣 Dynamic status indicator & stop current playback
+
+While in cooking mode, the status bar (footer) and the banner above the editor stay minimal — they act as a **signal light**, not a details page:
+
+| State | Status bar | Banner |
+|---|---|---|
+| Away, quiet | `🍳 离开中 · ⚠N 待处理` | `🍳 离开中 · ⚠N 待处理 · /status 看全部` |
+| **Shouting (ringing)** | `📢 正在广播中...（Ctrl+Alt+M 静音）` (highlighted) | same + one `📢` line |
+| After it stops / stopped | auto restores `🍳 离开中 · ⚠N 待处理` | same |
+
+**Design principle**: the banner only shows *count + state*, never lists message contents — plans, progress and task summaries live in the conversation history (the agent writes a summary when done); run `/i-am-cooking status` to inspect all pending details. So the banner is 1 line normally, 2 lines max while ringing.
+
+**Typing = acknowledged**: while in cooking mode, typing anything (answering a shout / giving new instructions) immediately stops any ringing audio and marks previous shouts as handled (removed from the banner). The agent keeps working autonomously; *new* shouts from now on show/ring as usual.
+
+**Stop the current playback** (don't want this ring, but keep the pending shouts):
+
+- Shortcut: `Ctrl+Alt+M` (M = Mute; rebindable in `~/.pi/agent/keybindings.json`)
+- Command: `/i-am-cooking stop-sound`
+
+Stopping **only kills the currently playing audio** — it changes no config, does not disable sound, and does not clear pending shouts, so **the next shout rings as usual**.
+
+> ⚠️ Note: pi's terminal status bar has no mouse click support, so a keyboard shortcut replaces "click to close"; it only affects audio playing in this terminal (each agent stops its own).
 
 **Three messages, three sounds** (know what happened by the sound):
 
