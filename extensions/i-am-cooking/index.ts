@@ -7,23 +7,31 @@
  *   ④ 手机推送（ntfy.sh，人在厨房的关键通道） ⑤ TUI 横幅常驻
  *
  * 命令:
- *   /i-am-cooking on [备注]   — 开启离开模式（agent 收到指令自主推进）
- *   /i-am-cooking off         — 我回来了（agent 收到"我不在时喊了你X件事"的汇报）
- *   /i-am-cooking status      — 查看模式/待处理呼喊/通道状态
- *   /i-am-cooking test        — 测试所有通道（不用先开模式）
- *   /i-am-cooking rules       — 查看当前生效规则
- *   /i-am-cooking edit-rules  — 编辑规则文件（保存即生效）
- *   /i-am-cooking reset-rules — 规则恢复出厂默认（内置规则）
- *   /i-am-cooking level       — 自主等级（conservative/balanced/autonomous）
- *   /i-am-cooking limits      — 查看/调整防打扰参数（交互式中文）
- *   /i-am-cooking sound       — 自定义呼喊铃声（歌曲/试听/总时长，交互式中文）
+ *   /i-am-cooking on [备注]    — 开启离开模式（agent 收到指令自主推进）
+ *   /i-am-cooking off          — 我回来了（agent 收到"我不在时喊了你X件事"的汇报）
+ *   /i-am-cooking status       — 查看模式/待处理呼喊/通道/音量/偏好/等级/防打扰参数
+ *   /i-am-cooking setup        — 交互式配置向导（手机推送 + 音量 + 自主等级）
+ *   /i-am-cooking test         — 测试所有通道（不用先开模式）
+ *   /i-am-cooking stop-sound   — 停止本次播放（只停当前，下次照常；同 Ctrl+Alt+M）
+ *   /i-am-cooking rules        — 查看当前生效规则
+ *   /i-am-cooking edit-rules   — 编辑规则文件（保存即生效）
+ *   /i-am-cooking reset-rules  — 规则恢复出厂默认（内置规则）
+ *   /i-am-cooking level        — 自主等级（conservative/balanced/autonomous）
+ *   /i-am-cooking limits       — 查看/调整防打扰参数（交互式中文）
+ *   /i-am-cooking sound        — 自定义呼喊铃声（歌曲/试听/总时长，交互式中文）
+ *   /i-am-cooking volume       — 音量控制（查看/手动调整/离开自动拉高，交互式中文）
  *
  * 工具 (LLM 调用):
- *   shout_for_user           — 卡住且只有用户能解决时调用
+ *   shout_for_user            — 卡住且只有用户能解决时调用
+ *   set_calling_preference    — 根据用户原话调整呼喊偏好（别喊了/完成后喊我/…）
+ *   set_autonomy_level        — 根据用户原话调整自主等级（遇墙就喊/能不喊就不喊/…）
+ *   enter_cooking_mode        — 用户明确说"去做饭了"时自动开启离开模式
+ *   set_shout_sound           — 用户要求换铃声时设置自定义歌曲
+ *   set_volume                — 用户明确要求时调整系统音量/解除静音
+ *   exit_cooking_mode         — 用户明确回来时关闭离开模式
  *
  * 自动检测:
  *   agent_settled 后若回合以"？"结尾且没有后续工具调用 → 自动呼喊（安全网）
- *   cooking 模式下你直接打字 → 自动视为"回来了"，退出模式并让 agent 汇报
  *
  * 配置: ~/.pi/i-am-cooking/config.json （可热改，/reload 生效）
  */

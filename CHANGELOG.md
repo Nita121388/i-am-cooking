@@ -11,6 +11,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Refactored
+- **代码整洁性大轮次（行为不变，纯重构）**：
+  - 拆 lib 模块：`config`（类型/默认值/读写）、`prefs`（偏好&等级检测/shouldSuppress）、`push`（ntfy/webhook）、`volume`（音量控制）、`audio`（三段式播放+互斥）、`rules`（规则加载/prompt 构成）、`platform`（命令执行）——全部配单元测试，测试 15 → 35 个。
+  - `index.ts` 从 2156 行瘦身至 1510 行：命令 handler 拆为独立函数 + 注册表（265→10 行）；setupWizard ntfy/webhook 公共尾声抽成 `finishPushSetup`；fireAlert 三层音频分支合并。
+  - 全部 `{ ui: any }` 替换为基于官方 `ExtensionUIContext` 的 `CookingCtx` 统一类型。
+  - 新增 `npm run typecheck`（正式 devDependencies：typescript/@types/node/typebox，替代临时目录方式）。
+  - 清理死代码/未使用导入，文件头注释命令列表同步最新。
+
 ### Added
 - **状态栏动态指示 & 停止本次播放**：喊话时状态栏变 `📣 正在喊你！[urgency]（Ctrl+Alt+M 停止本次播放）`，播完自动恢复 `🍳 离开中`；新增 `Ctrl+Alt+M` 快捷键和 `/i-am-cooking stop-sound` 命令停止本次播放——只掐当前音频，不改配置、不清待处理呼喊、下次照常响铃；横幅同步显示“正在响铃”提示。
 
