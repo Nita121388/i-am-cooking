@@ -80,7 +80,7 @@ pi install /path/to/your/local/checkout
 /i-am-cooking setup                     # ① 配置手机推送（交互式向导）
 /i-am-cooking test                      # ② 测试所有通道（声音/TTS/弹窗/手机）
 /i-am-cooking on 继续做登录模块          # ③ 开启离开模式，走人
-/i-am-cooking off                       # ④ 结束离开模式，agent 汇报
+/i-am-cooking off                       # ④ 结束离开模式（关闭即关闭，无需 agent 汇报）
 /i-am-cooking status                    # 查看状态
 ```
 
@@ -95,7 +95,7 @@ pi install /path/to/your/local/checkout
 | 命令 | 说明 | 示例 |
 |---|---|---|
 | `/i-am-cooking on [备注]` | 开启离开模式。备注可带偏好和自主等级 | `on 完成后喊我` / `on 谨慎点继续调研` |
-| `/i-am-cooking off` | 关闭离开模式，agent 收到"喊了你什么"的汇报 | `off` |
+| `/i-am-cooking off` | 关闭离开模式（只关闭，不发汇报——agent 结束时会自行总结） | `off` |
 | `/i-am-cooking status` | 查看模式/待处理呼喊/通道/音量/偏好/等级/防打扰参数 | `status` |
 | `/i-am-cooking setup` | 交互式配置向导（手机推送 + 音量 + 自主等级） | `setup` |
 | `/i-am-cooking test` | 测试所有通道，逐通道汇报真实结果 | `test` |

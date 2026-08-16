@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 - **ntfy 推送标题含 emoji → 整条推送报错**：HTTP header 只允许 Latin-1，`📈 进度`/`✅ 任务完成` 导致 `fetch` 抛 ByteString 异常，进度类与完成通知的手机推送全部失败（仅普通呼喊正常）。修复：header Title 改纯 ASCII（progress / task done / pi alert!），分类 emoji 前缀移到 body（UTF-8 安全）；新增回归测试（header 必须纯 ASCII）防再犯。
+- **关闭离开模式不再发“请汇报喊了什么”的 followUp**：agent 结束时会自行总结进度，off 只负责关闭（本地一条轻提示）；`exit_cooking_mode` 工具返回文案与文档同步。
 
 ## [0.4.0] - 2026-08-16
 

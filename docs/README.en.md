@@ -63,7 +63,7 @@ flowchart TD
 **In one sentence**: say you're leaving (or just "I'm cooking") → cooking mode on → agent works, shouts you when needed; typing as a note/question does NOT close it (agent keeps going) - only a clear "我不离开了" or `/off` closes this session (others unaffected).
 ```
 
-**In one sentence**: say you're leaving (or just "I'm cooking") → cooking mode on → agent works, shouts you when needed → you send a message when back → auto-exit + debrief.
+**In one sentence**: say you're leaving (or just "I'm cooking") → cooking mode on → agent works, shouts you when needed → you send a message when back → auto-exit (close = close, no debrief; the agent summarizes when it finishes).
 
 ## 📦 Install
 
@@ -101,7 +101,7 @@ Reload pi (`/reload`) after installing.
 | Command | Description | Example |
 |---|---|---|
 | `/i-am-cooking on [note]` | Enter cooking mode. Note can carry preferences & autonomy level | `on 完成后喊我` / `on 谨慎点继续调研` |
-| `/i-am-cooking off` | Leave cooking mode; agent receives a debrief of what it shouted | `off` |
+| `/i-am-cooking off` | Leave cooking mode (close only, no debrief — the agent summarizes when it finishes) | `off` |
 | `/i-am-cooking status` | Mode, pending shouts, channels, volume, preferences, level, anti-noise params | `status` |
 | `/i-am-cooking setup` | Interactive wizard: phone push + volume + autonomy level | `setup` |
 | `/i-am-cooking test` | Test all channels, per-channel real result | `test` |

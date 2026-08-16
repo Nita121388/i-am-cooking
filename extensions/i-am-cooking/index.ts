@@ -353,7 +353,7 @@ async function cmdVolume(ctx: CookingCtx): Promise<void> {
 
 // 子命令注册表（handler 只做分发，具体逻辑见上面各函数）
 const commandHandlers: Record<string, (ctx: CookingCtx, fullArg: string) => Promise<void> | void> = {
-  off: (ctx) => { turnOff(ctx, "command"); },
+  off: (ctx) => { turnOff(ctx); },
   status: (ctx) => { showStatus(ctx); },
   setup: async (ctx) => { await setupWizard(ctx); },
   test: async (ctx) => { await testShout(ctx); },
@@ -810,7 +810,7 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
   );
 }
 
-function turnOff(ctx: CookingCtx, source: "command" | "agent-exit", userText?: string): void {
+function turnOff(ctx: CookingCtx): void {
   clearRepeatTimers();
   stopAudioAll(); // 关闭离开：立即停止正在播放的音频
   const pending = pendingAlerts();
@@ -825,15 +825,14 @@ function turnOff(ctx: CookingCtx, source: "command" | "agent-exit", userText?: s
   // 恢复音量
   void restoreVolume();
 
-  const summary = pending.length
-    ? pending.map((a, i) => `${i + 1}. [${a.urgency}] ${a.message}`).join("\n")
-    : "（无待处理呼喊）";
-  const followUp =
-    source === "command"
-      ? `[I am cooking] 我回来了（执行 off 命令）。\n我不在的时候你喊了我这些事：\n${summary}\n请简要汇报当前进度，然后继续处理这些事项。`
-      : `[I am cooking] 用户结束了离开模式（agent 理解判定）。\n我不在的时候你喊了我这些事：\n${summary}\n请简要汇报当前进度，然后继续处理这些事项。`;
-  // steer：agent 干活途中在下一次 LLM 调用前投递，让“我回来了”尽快送达（followUp 会压队列等到 settle）
-  void api.sendUserMessage(followUp, { deliverAs: "steer" });
+  // 不再给 agent 发“请汇报喊了什么”的 followUp：agent 结束时会自己汇报进度，
+  // 关闭就是关闭。给用户本地一条轻提示即可（不发给 agent）。
+  ctx.ui.notify(
+    pending.length
+      ? `🍳 离开模式已关闭（离开期间喊了你 ${pending.length} 次，内容见对话记录）。`
+      : "🍳 离开模式已关闭。",
+    "info",
+  );
 }
 
 function showStatus(ctx: CookingCtx): void {
@@ -1427,7 +1426,7 @@ export default function (pi: ExtensionAPI) {
       "**不要误关**：\n" +
       "  · 用户只是临时看一眼、补充信息、问个问题 → 不要调用，保持离开模式继续工作\n" +
       "  · 用户说\"我先去忙别的，你继续\" → 不要调用\n" +
-      "调用后：当前会话退出离开模式，agent 收到汇报并继续按新情况处理；只影响当前这一个 Agent，不影响其他 Agent。",
+      "调用后：当前会话退出离开模式，后续按新情况继续；只影响当前这一个 Agent，不影响其他 Agent。",
     promptSnippet: "Exit away-mode when the user clearly returns / wants to be online again",
     promptGuidelines: [
       "Call exit_cooking_mode ONLY when the user clearly says they are ending the away session (e.g. '我不离开了', '保持在线', '先停一下，不用了'). Do NOT call it when the user just adds a note, asks a question, or says 'keep going'. Only affects this session.",
@@ -1442,9 +1441,9 @@ export default function (pi: ExtensionAPI) {
           details: { closed: false, alreadyOff: true },
         };
       }
-      turnOff(ctx, "agent-exit");
+      turnOff(ctx);
       return {
-        content: [{ type: "text", text: `已关闭离开模式（依据：${params.reason}）。汇报已发送给用户。` }],
+        content: [{ type: "text", text: `已关闭离开模式（依据：${params.reason}）。无需汇报——结束时会自行总结。` }],
         details: { closed: true, reason: params.reason },
       };
     },
