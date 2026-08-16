@@ -92,6 +92,11 @@ function pendingAlerts(): Alert[] {
   return config.alerts.filter((a) => !a.acked);
 }
 
+/** 需要用户处理的行动项（完成/进度等纯告知类不计入“待处理”） */
+function pendingActionAlerts(): Alert[] {
+  return config.alerts.filter((a) => !a.acked && a.category !== "completion" && a.category !== "milestone");
+}
+
 
 // ── 子命令处理函数（handler 注册表引用）────────────────────────────────────
 
@@ -432,7 +437,7 @@ async function browseAudioFile(ui: CookingCtx["ui"], startDir: string): Promise<
 
 /** 本地包装：停止所有音频并复位 UI 响铃状态（lib/audio.ts 只管进程，UI 状态归入口管） */
 function stopAudioAll(): void {
-  stopAudioAll();
+  stopAllAudio(); // lib/audio.ts：杀死正在播放的音频进程
   shoutingState = false; // 已安静，状态栏/横幅恢复
 }
 
@@ -538,9 +543,9 @@ async function fireAlert(alert: Alert, ctx: CookingCtx, opts: { forceSound?: boo
   //   📈 小阶段   → beeps 1 声 + 简短语音（轻声，不打断思路）
   // 声音不阻塞后续通道：fire-and-forget，最长 soundSeconds 秒后自动停
   if (config.sound || config.tts) {
-    // 状态栏/横幅：响铃期间显示“正在喊你”，播完自动恢复“🍳 离开中”
+    // 状态栏/横幅：响铃期间显示“正在广播”，播完自动恢复“🍳 离开中”
     shoutingState = true;
-    updateStatus(ctx, "shouting", alert.urgency);
+    updateStatus(ctx, "shouting");
     updateWidget(ctx);
     const done = () => { shoutingState = false; updateStatus(ctx, "idle"); updateWidget(ctx); };
     // 三层音频区分：🚨需要你→完整三段式 / ✅完成→2声+完成语音 / 📈小阶段→1声+轻声（都不播自定义歌）
@@ -563,27 +568,26 @@ async function fireAlert(alert: Alert, ctx: CookingCtx, opts: { forceSound?: boo
   return await pushAlert(alert);
 }
 
-/** 更新状态栏：idle=🍳 离开中 / shouting=📣 正在喊你（带本次停止提示） */
-function updateStatus(ctx: CookingCtx, phase: "idle" | "shouting", urgency?: string): void {
+/** 更新状态栏：idle=🍳 离开中（带待处理计数）/ shouting=📢 正在广播中（带停止提示） */
+function updateStatus(ctx: CookingCtx, phase: "idle" | "shouting"): void {
   if (!ctx?.ui) return;
   if (!config.cooking) { ctx.ui.setStatus("i-am-cooking", ""); return; }
-  ctx.ui.setStatus(
-    "i-am-cooking",
-    phase === "shouting"
-      ? ctx.ui.theme.fg("warning", `📣 正在喊你！[${urgency ?? ""}]（Ctrl+Alt+M 停止本次播放）`)
-      : "🍳 离开中（I am cooking）",
-  );
+  if (phase === "shouting") {
+    const text = "📢 正在广播中...（Ctrl+Alt+M 静音）";
+    ctx.ui.setStatus("i-am-cooking", ctx.ui.theme?.fg ? ctx.ui.theme.fg("warning", text) : text);
+  } else {
+    ctx.ui.setStatus("i-am-cooking", `🍳 离开中 · ⚠${pendingActionAlerts().length} 待处理`);
+  }
 }
 
 function updateWidget(ctx: CookingCtx): void {
   if (!ctx?.ui) return;
   if (!config.tuiBanner) { ctx.ui.setWidget("i-am-cooking", []); return; }
-  const pending = pendingAlerts();
+  const n = pendingActionAlerts().length;
   const lines = config.cooking
     ? [
-        "🍳 离开中（I am cooking）— 需要你时我会大声喊你。",
-        ...(shoutingState ? ["  🔕 正在响铃 — 按 Ctrl+Alt+M 停止本次播放（下次照常）"] : []),
-        ...pending.map((a, i) => `  ⚠ ${i + 1}. [${a.urgency}] ${a.message}`),
+        `🍳 离开中 · ⚠${n} 待处理 · /status 看全部`,
+        ...(shoutingState ? ["  📢 正在广播中...（Ctrl+Alt+M 静音）"] : []),
       ]
     : [];
   ctx.ui.setWidget("i-am-cooking", lines);
@@ -612,6 +616,7 @@ function scheduleRepeats(alert: Alert, ctx: CookingCtx): void {
     const iv = Math.max(1, config.urgentRepeatMinutes) * 60_000;
     const timer = setInterval(() => {
       if (!config.cooking) return;
+      if (alert.acked) { clearInterval(timer); return; } // 已被用户响应，停止重复喊
       alert.repeatCount++;
       void writeConfig(config);
       void fireAlert(alert, ctx);
@@ -623,6 +628,7 @@ function scheduleRepeats(alert: Alert, ctx: CookingCtx): void {
   } else if (alert.urgency === "normal") {
     const timer = setTimeout(() => {
       if (!config.cooking) return;
+      if (alert.acked) return; // 已被用户响应，不再重喊
       alert.repeatCount++;
       void writeConfig(config);
       void fireAlert(alert, ctx);
@@ -1519,7 +1525,23 @@ export default function (pi: ExtensionAPI) {
       setAutonomyLevel(level, `你说了："${event.text.slice(0, 40)}"`, ctx);
     }
 
-    // ② 用户打字 = 正常输入：不触发任何关闭，交给 agent 处理
-    //    关闭离开模式由 agent 语义理解调用 exit_cooking_mode，或用户手动 /off
+    // ② 用户打字 = 人在场 + 已响应：停掉正在响的铃声，旧呼喊标记处理，横幅回基础状态
+    //    agent 继续自主干活；之后的呼喊是新信号，照常显示/响铃
+    const hadUnacked = pendingAlerts().length > 0;
+    if (hadUnacked || shoutingState || hasActiveAudio()) {
+      stopAudioAll(); // 人在场：立即安静
+      for (const a of config.alerts) a.acked = true;
+      void writeConfig(config);
+      updateStatus(ctx, "idle");
+      updateWidget(ctx);
+      ctx.ui.notify(
+        hadUnacked
+          ? `✍️ 收到你的信息，之前的 ${hadUnacked} 条呼喊已标记处理。agent 继续干活，有新的再喊你。`
+          : "🔕 已停止响铃。",
+        "info",
+      );
+    }
+
+    // ③ 关闭离开模式由 agent 语义理解调用 exit_cooking_mode，或用户手动 /off
   });
 }
