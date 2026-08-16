@@ -16,9 +16,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **完成后不再定时汇报**：收到 ✅ 完成通知时自动停掉定时汇报 timer，任务完成后不再继续刷进度。
 - **进度类不去重**：`progress`/`milestone` 跳过 10 分钟同内容去重——即使两次进度内容相同也要每次都推（如连续“无新进展”）。
 
+## [0.5.1] - 2026-08-16
+
 ### Fixed
 - **ntfy 推送标题含 emoji → 整条推送报错**：HTTP header 只允许 Latin-1，`📈 进度`/`✅ 任务完成` 导致 `fetch` 抛 ByteString 异常，进度类与完成通知的手机推送全部失败（仅普通呼喊正常）。修复：header Title 改纯 ASCII（progress / task done / pi alert!），分类 emoji 前缀移到 body（UTF-8 安全）；新增回归测试（header 必须纯 ASCII）防再犯。
-- **关闭离开模式不再发“请汇报喊了什么”的 followUp**：agent 结束时会自行总结进度，off 只负责关闭（本地一条轻提示）；`exit_cooking_mode` 工具返回文案与文档同步。
+
+### Changed
+- **关闭离开模式不再发“请汇报喊了什么”的 followUp**：agent 结束时会自行总结进度，off 只负责关闭（本地一条轻提示）；`exit_cooking_mode` 工具返回文案、`turnOff` 签名与文档同步。
+
+### Docs
+- **rules.default.md 补充「进度汇报」规则段**：小阶段（milestone）定时（progress）只推手机、完成后不再汇报——与 0.5.0 进度策略对齐。
 
 ## [0.4.0] - 2026-08-16
 
