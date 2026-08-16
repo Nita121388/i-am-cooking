@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 - **published to npm**: `pi install npm:i-am-cooking` now works. Package trimmed via `files` field (excludes tests/tsconfig); verified install from clean dir with lib/ intact.
 
-## [Unreleased]
+## [0.4.0] - 2026-08-16
 
 ### Refactored
 - **代码整洁性大轮次（行为不变，纯重构）**：
