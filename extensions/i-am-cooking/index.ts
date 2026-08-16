@@ -803,6 +803,7 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
     `请自主推进任务：能自己解决的就自己解决（采用最合理的默认方案，并在回复里注明你的假设），保证质量，不要降低标准；` +
     `只有达到当前等级的喊我阈值（见 [自主等级指南]）时才调用 shout_for_user 工具大声喊我。` +
     `调用前先准备好交接内容（刚好够用：决策给选项和推荐，凭据给获取方式，手动操作给步骤），准备好再喊，喊出的消息即最终版。\n` +
+    `呼喊后：被卡住的那件事已交接，不再继续处理；但其他不依赖用户的工作照常推进（进度/完成类通知后亦然）。\n` +
     `任务全部完成或达到重要里程碑时，调用 shout_for_user（category="completion", urgency="info"）通知我。` +
     progressHint,
     // steer：agent 干活途中在下一次 LLM 调用前投递，让它尽快知道自己已进入离开模式（followUp 会压队列等到 settle）
@@ -1166,15 +1167,20 @@ export default function (pi: ExtensionAPI) {
     name: "shout_for_user",
     label: "Shout For User",
     description:
-      "大声呼喊离开的用户（例如在做饭）。仅当你被真正卡住、且只有用户能解决时调用。\n" +
+      "大声呼喊离开的用户（例如在做饭）。用于两类场景：\n" +
+      "① 阻塞类（decision / credential / approval / clarification / help / auto-error / auto-question）：被真正卡住、只有用户能解决时调用；调用前先准备好交接内容。\n" +
+      "② 通知类（progress / milestone / completion）：推进中把进度推送手机（只推手机、不响铃不弹窗）；任务全部完成时通知（照常响铃+弹窗+手机）。\n" +
       "**调用时机（重要）**：必须在交接内容准备好之后一次性呼喊，禁止先喊再准备。\n" +
       "**准备标准**：刚好够用——只整理用户立即行动所必需的信息：决策给选项和推荐；凭据给获取方式；手动操作给步骤。不要面面俱到、不要塞无关背景。\n" +
-      "喊出的 message 即最终版，事后不再补充。若 cooking 模式未开启，它只会告诉你用户就在电脑前，直接在对话里问即可。",
-    promptSnippet: "Loudly alert the away user when you are blocked and need their input",
+      "喊出的 message 即最终版，事后不再补充。\n" +
+      "**喊完之后**：阻塞类——被卡住的那件事已交接，不再继续处理；但其他不依赖用户的工作照常推进。通知类——照常干活或自然收尾，不要停。\n" +
+      "若 cooking 模式未开启，它只会告诉你用户就在电脑前，直接在对话里问即可。",
+    promptSnippet: "Loudly alert the away user when blocked, or push progress/completion info",
     promptGuidelines: [
       "Call shout_for_user only AFTER the handoff is ready — never shout first and prepare later.",
       "'Ready' means JUST ENOUGH: the minimal info the user needs to act immediately (options + your recommendation for decisions; how to obtain credentials; steps for manual actions). Don't over-collect or pad with irrelevant context.",
-      "Use shout_for_user only when truly blocked and only the user can unblock you. Shout once with the final message; no preparing-after-shouting.",
+      "Shout once with the final message; no preparing-after-shouting. The message is the final version.",
+      "After shouting: a blocked item is handed off (stop working on that item only) — other independent work continues normally. Progress/completion shouts are info pushes: keep working (or wrap up naturally on completion).",
     ],
     parameters: Type.Object({
       message: Type.String({
@@ -1196,9 +1202,15 @@ export default function (pi: ExtensionAPI) {
         };
       }
       const queued = queueAlert(params.message, params.urgency, params.category ?? "other", ctx, params.ttsText);
+      const cat = params.category ?? "other";
+      const statusLine = isProgressCategory(cat)
+        ? "进度类只推手机（不响铃不弹窗）。"
+        : cat === "completion"
+          ? "任务完成通知已送达（响铃/推送）。"
+          : "等待用户回来处理。";
       return {
         content: [{ type: "text", text: queued
-          ? `呼喊已发出（${params.urgency}）${params.ttsText ? `，语音：${params.ttsText}` : ""}。\n交接内容已包含在呼喊消息里。**现在请停止自主推进，暂停当前回合，等待用户回来处理**——不要再继续处理其他任务，也不要再次调用本工具；用户回来后会自动收到你的汇报并给你新指令。`
+          ? `呼喊已发出（${params.urgency}）${params.ttsText ? `，语音：${params.ttsText}` : ""}。${statusLine}`
           : "已有同内容的未确认呼喊，不重复发送。" }],
         details: { fired: queued, urgency: params.urgency, category: params.category ?? "other", ttsText: params.ttsText ?? null },
       };
