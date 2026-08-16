@@ -31,268 +31,35 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Key } from "@earendil-works/pi-tui"; // 快捷键（停止本次播放）
-import { execFile, spawn } from "node:child_process";
-import { promisify } from "node:util";
-import { mkdir, readFile, rm, writeFile, readdir, rename } from "node:fs/promises";
-import { watch } from "node:fs";
+import { mkdir, readFile, rm, writeFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
 // 纯逻辑模块（可测试）
-import { suggestTopic as suggestTopicImpl } from "./lib/topic.ts";
-import { acquireAudioLock as acquireAudioLockImpl, releaseAudioLock as releaseAudioLockImpl, isProcessAlive as isProcessAliveImpl } from "./lib/audio-lock.ts";
+import { suggestTopic } from "./lib/topic.ts";
 import { renderTts as renderTtsImpl } from "./lib/tts.ts";
+import { CONFIG_DIR, CONFIG_PATH, DEFAULT_RULES_PATH, RULES_PATH, SCRIPTS, TMP_DIR } from "./lib/config.ts";
+import type { Alert, AutonomyLevel, CallingMode, Config, Urgency } from "./lib/config.ts";
+import { DEFAULTS, readConfig, writeConfig } from "./lib/config.ts";
+import { hasActiveAudio, playSound, stopAllAudio } from "./lib/audio.ts";
+import { AUTONOMY_LABEL, CALLING_MODE_LABEL, detectAutonomyLevel, detectPreference, shouldSuppress as shouldSuppressLib } from "./lib/prefs.ts";
+import { pushPhone, pushWebhook, resolveValue } from "./lib/push.ts";
+import { boostVolume, getSystemVolume, restoreVolume, setSystemVolume, toggleMute } from "./lib/volume.ts";
+import { runCommand, runPowerShellScript } from "./lib/platform.ts";
+import { buildRulesPrompt, ensureRulesFile, fileExists, GUARD_RAIL, loadDefaultRules, loadRules } from "./lib/rules.ts";
 
-const execFileAsync = promisify(execFile);
-
-const HOME       = homedir();
-// scripts 与 index.ts 同目录：本地开发 / pi install / git clone 任何安装方式都能正确定位
-const SCRIPTS    = fileURLToPath(new URL("./scripts", import.meta.url));
-// 出厂默认规则文件（仓库内，进 git）：随插件版本更新，运行时首次创建用户文件时从它拷贝
-const DEFAULT_RULES_PATH = fileURLToPath(new URL("./rules.default.md", import.meta.url));
-const CONFIG_DIR  = join(HOME, ".pi", "i-am-cooking");
-const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const RULES_PATH  = join(CONFIG_DIR, "rules.md");
-const TMP_DIR     = join(CONFIG_DIR, "tmp");
-const AUDIO_LOCK_PATH = join(CONFIG_DIR, "audio.lock"); // 跨 Agent 音频互斥锁
-
-// 底线规则（不可删除，永远追加在用户规则后面）
-const GUARD_RAIL = "- 绝不要默默结束回合等用户回复。";
-
-// ── 自主等级指南（按当前等级动态注入 system prompt） ───────────────────────
-const AUTONOMY_GUIDE: Record<AutonomyLevel, string> = {
-  conservative: `## 当前自主等级：谨慎（conservative）—— 遇到阻塞就喊我
-- 遇到任何必须人工处理的阻塞（人类墙：验证码 / 登录 / 手动点击 / 真实设备操作等）→ 立即调用 shout_for_user 喊我。
-- 需要决策 / 审批 / 凭据 / 澄清时，先喊我确认，不要擅自选择。
-- 需求模糊、假设不确定时，先问清楚。
-- 自主只做完全确定、无风险的部分。
-- 保证质量：拿不准的方案宁可不做，也不要用降低质量的方式推进。`,
-  balanced: `## 当前自主等级：平衡（balanced）—— 有点难度才喊我（默认）
-- 遇到必须人工处理的阻塞（人类墙：验证码 / 登录 / 手动点击 / 真实设备操作等）→ 调用 shout_for_user 喊我。
-- 普通决策 / 模糊处 / 小选择 → 用最合理的默认方案自主推进，并在回复里注明你的假设。
-- 只有"自主尝试后仍无法推进"或"选错代价很大"时才喊我。
-- 保证质量：自主推进不等于降低标准，拿不准时选最稳妥方案。`,
-  autonomous: `## 当前自主等级：放手（autonomous）—— 能不喊就不喊
-- 尽量不喊我。所有决策、假设、选择自己定，记录在案即可。
-- 只有任务彻底无法继续（无权限 / 外部服务故障 / 违反硬性约束）才调用 shout_for_user 喊我。
-- 保证质量：自主不等于降低标准，拿不准时选最稳妥方案，并在回复里说明。`,
-};
-
-const AUTONOMY_LABEL: Record<AutonomyLevel, string> = {
-  conservative: "谨慎（遇墙就喊）",
-  balanced: "平衡（有点难度才喊，默认）",
-  autonomous: "放手（能不喊就不喊）",
-};
-
-type Urgency = "info" | "normal" | "urgent";
-
-type CallingMode = "normal" | "silence" | "completion_only" | "urgent_only" | "eager";
-
-// 自主等级：遇到阻塞时「该不该喊用户」的阈值
-//   conservative —— 遇墙就喊（人类墙：验证码/登录/手动点击等必须人手动的阻塞）
-//   balanced     —— 有点难度才喊（默认；普通决策自主推进，人类墙/代价大才喊）
-//   autonomous   —— 能不喊就不喊（尽量自决，只有彻底无法继续才喊）
-type AutonomyLevel = "conservative" | "balanced" | "autonomous";
-
-interface Alert {
-  id: string;
-  time: number;
-  message: string;
-  urgency: Urgency;
-  category: string;
-  repeatCount: number;
-  acked: boolean;
-  ttsText?: string; // Agent 自由语音：非空则 TTS 原样念这段，不走模板
-}
-
-interface Config {
-  cooking: boolean;
-  since?: number;
-  alerts: Alert[];
-  lastShout?: number;
-
-  // channels
-  sound: boolean;
-  beeps: number;
-  soundPath: string; // optional .wav/mp3, played AFTER beeps+tts as the user's custom ringtone
-  soundSeconds: number; // 声音播放总时长上限（秒），到点强制停止，默认 60
-  tts: boolean;
-  ttsTemplate: string; // 模板，支持 {message} 和 {shoutPhrase} 占位
-  shoutPhrase: string; // 呼喊短语（默认 "agent 需要你"），用户可自定义，用于所有呼喊文案
-  toast: boolean;
-  tuiBanner: boolean;
-  phonePush: boolean;
-  pushProvider: "ntfy" | "webhook"; // 手机推送服务商
-  ntfyTopic: string;
-  ntfyServer: string;
-  ntfyToken: string; // ntfy 私有 topic 访问 token，支持 ${ENV_VAR} 引用
-  webhookUrl: string; // generic webhook (Bark/Server酱...), receives JSON
-  webhookToken: string; // webhook 认证 token，支持 ${ENV_VAR} 引用
-  webhookTokenHeader: string; // token 放在哪个 header（默认 Authorization）
-  setupDone: boolean; // 是否已完成手机推送配置（初次使用提示用）
-
-  // behavior
-  autoDetect: boolean;      // agent 以"？"结尾等回复时自动喊
-  repeatIntervalMinutes: number; // normal 重复间隔
-  urgentRepeatMinutes: number;   // urgent 重复间隔
-  maxUrgentRepeats: number;      // -1 = 一直喊到回来
-  boostVolume: boolean;          // 离开时自动提升系统音量（需用户允许）
-  boostLevel: number;            // 提升到多少（0-100，默认 80）
-  callingMode: CallingMode;      // 呼喊偏好（agent 依据用户原话动态设置）
-  autonomyLevel: AutonomyLevel;  // 自主等级（持久化；遇到阻塞时该不该喊）
-  maxCompletionNotices: number;  // 每次离开最多喊几次完成（防打扰）
-  ttsTemplateCompletion: string; // 完成时的 TTS 文案
-  progressReporting: "milestone" | "interval" | "none"; // 进度汇报模式：小阶段完成时 / 定时 / 不汇报
-  reportIntervalMinutes: number;   // 定时汇报间隔（分钟，默认 15）
-  ttsTemplateMilestone: string;  // 小阶段完成时的 TTS 文案
-  milestoneBeeps: number;        // 小阶段完成时的提示音次数（默认 1，轻声）
-}
-
-const DEFAULTS: Config = {
-  cooking: false,
-  alerts: [],
-  sound: true,
-  beeps: 4,
-  soundPath: "",
-  soundSeconds: 60,
-  tts: true,
-  ttsTemplate: "主人，快来！{shoutPhrase}！{message}",
-  shoutPhrase: "agent 需要你",
-  toast: true,
-  tuiBanner: true,
-  phonePush: false,
-  pushProvider: "ntfy",
-  ntfyTopic: "",
-  ntfyServer: "https://ntfy.sh",
-  ntfyToken: "",
-  webhookUrl: "",
-  webhookToken: "",
-  webhookTokenHeader: "Authorization",
-  setupDone: false,
-  autoDetect: true,
-  repeatIntervalMinutes: 3,
-  urgentRepeatMinutes: 1,
-  maxUrgentRepeats: -1,
-  boostVolume: false, // 默认关，需在 setup 里允许
-  boostLevel: 80,
-  callingMode: "normal",
-  autonomyLevel: "balanced", // 默认：有点难度才喊
-  maxCompletionNotices: 3,
-  ttsTemplateCompletion: "主人，好消息！任务完成了！{message}",
-  progressReporting: "milestone", // 默认：小阶段完成时汇报
-  reportIntervalMinutes: 15,
-  ttsTemplateMilestone: "小进展：{message}",
-  milestoneBeeps: 1,
-};
+// 全局状态（单例，由入口持有）：
+// config 读写逻辑在 lib/config.ts（readConfig/writeConfig），此处只保留内存单例。
+let config: Config = { ...DEFAULTS };
 
 // ── state ────────────────────────────────────────────────────────────────
 let api: ExtensionAPI; // set by factory; needed by turnOn/turnOff
-let config: Config = { ...DEFAULTS };
 let repeatTimers: ReturnType<typeof setInterval>[] = [];
 // 当前是否正在响铃播放（状态栏/横幅指示用；仅反映本实例，多 Agent 间互不影响）
 let shoutingState = false;
 
-async function loadConfig(): Promise<void> {
-  try {
-    const raw = await readFile(CONFIG_PATH, "utf8");
-    config = { ...DEFAULTS, ...JSON.parse(raw) };
-    config.alerts = config.alerts ?? [];
-  } catch {
-    config = { ...DEFAULTS };
-    await saveConfig();
-  }
-}
-
-async function saveConfig(): Promise<void> {
-  try {
-    await mkdir(CONFIG_DIR, { recursive: true });
-    await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), "utf8");
-  } catch (e) {
-    console.error("[i-am-cooking] save config failed:", e);
-  }
-}
-
 function pendingAlerts(): Alert[] {
   return config.alerts.filter((a) => !a.acked);
-}
-
-// ── 规则加载（单一来源）──────────────────────────────────────────────────
-/**
- * 剥掉规则文本中的 HTML 注释块（`<!-- ... -->`，用于放开发说明，不等同于规则），
- * 并去除首尾空白，只保留实际生效的规则内容。
- */
-function stripMeta(raw: string): string {
-  const withoutComments = raw.replace(/<!--[\s\S]*?-->/g, "").trim();
-  return withoutComments;
-}
-
-/**
- * 读取出厂默认规则文件（仓库内 rules.default.md，进 git，随版本更新）。
- * 文件缺失（异常情况）时回退到内联兜底文本。
- */
-async function loadDefaultRules(): Promise<string> {
-  try {
-    const raw = await readFile(DEFAULT_RULES_PATH, "utf8");
-    return stripMeta(raw);
-  } catch {
-    return (
-      "## 自主推进\n" +
-      "- 能自己决断的就自己决断，采用最合理的默认方案，并在回复里注明你的假设。\n" +
-      "- 不要停下来等，除非真的被卡住。\n\n" +
-      "## 什么时候需要喊我\n" +
-      "- 需要决策 / 凭据 / 审批 / 澄清，且只有我能解决时。\n\n" +
-      "## 完成通知\n" +
-      "- 任务全部完成或达到重要里程碑时通知我（category=completion, urgency=info）。\n" +
-      "- 普通小步骤不值得喊。"
-    );
-  }
-}
-
-/**
- * 规则现在是「唯一且完整可编辑」的，用户改的就是唯一生效的那份。
- * 出厂默认只作为首次创建时的"种子"填入 `rules.md`，之后完全由用户接管。
- * 已存在则直接读取；文件缺失（异常情况）才回退出厂默认。
- */
-async function loadRules(): Promise<string> {
-  try {
-    const raw = await readFile(RULES_PATH, "utf8");
-    return raw.trim();
-  } catch {
-    return loadDefaultRules();
-  }
-}
-
-/** 组装注入 system prompt 的规则文本（生效规则 + 自主等级指南 + 机制提示 + 底线） */
-async function buildRulesPrompt(): Promise<string> {
-  const rules = await loadRules();
-  const level = config.autonomyLevel || "balanced";
-  return (
-    `\n\n[IAM COOKING MODE] 用户不在电脑前（去做饭了）。\n\n` +
-    `[生效规则（来自 ${RULES_PATH}，首次创建时以出厂默认填充，之后完全由你接管）]\n${rules}\n\n` +
-    `[自主等级指南（当前等级：${level}，由机制控制，用户可在 rules 之外单独设置）]\n${AUTONOMY_GUIDE[level]}\n\n` +
-    `[机制提示]\n- 用户明确表达偏好时（如"别喊了""完成后喊我""只有紧急才找我""随时汇报"），调用 set_calling_preference 调整呼喊方式。\n- 用户明确表达自主程度时（如"拿不准就问我"→谨慎 / "能不喊就不喊"→放手），调用 set_autonomy_level 调整自主等级。\n\n` +
-    `[底线规则（系统强制，无法从规则文件删除）]\n${GUARD_RAIL}`
-  );
-}
-
-/** 确保规则文件存在（首次创建时从出厂默认拷贝；之后完全由用户接管） */
-async function ensureRulesFile(): Promise<void> {
-  try {
-    await readFile(RULES_PATH, "utf8");
-  } catch {
-    await mkdir(CONFIG_DIR, { recursive: true });
-    await writeFile(RULES_PATH, await loadDefaultRules(), "utf8");
-  }
-}
-
-async function fileExists(p: string): Promise<boolean> {
-  try {
-    await readFile(p, "utf8");
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 // ── 音频文件浏览（sound 命令用）──────────────────────────────────────────
@@ -362,161 +129,18 @@ async function browseAudioFile(ui: any, startDir: string): Promise<string | null
 }
 
 // ── notification channels ────────────────────────────────────────────────
-/**
- * 解析配置值：支持 ${ENV_VAR} 或 $ENV_VAR 引用环境变量（避免 token 明文落盘）。
- * 例："ntfyToken": "${NTFY_TOKEN}" → 从环境变量 NTFY_TOKEN 读取。
- */
-function resolveValue(v: string): string {
-  if (typeof v !== "string" || !v) return v ?? "";
-  const m = v.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/) ?? v.match(/^\$([A-Za-z_][A-Za-z0-9_]*)$/);
-  if (m) return process.env[m[1]] ?? "";
-  return v;
-}
 
-function runPowerShellScript(script: string, data: Record<string, unknown>): Promise<void> {
-  if (process.platform !== "win32") return Promise.resolve();
-  const dataFile = join(TMP_DIR, `${randomUUID()}.json`);
-  return (async () => {
-    try {
-      await mkdir(TMP_DIR, { recursive: true });
-      await writeFile(dataFile, JSON.stringify(data), "utf8");
-      await execFileAsync("powershell.exe", [
-        "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", join(SCRIPTS, script),
-        "-DataFile", dataFile,
-      ], { timeout: 30_000, windowsHide: true });
-    } catch (e) {
-      console.error(`[i-am-cooking] ${script} failed:`, (e as Error).message);
-    } finally {
-      try { await rm(dataFile, { force: true }); } catch { /* ignore */ }
-    }
-  })();
-}
-
-// ── cross-platform helpers ───────────────────────────────────────────────
-function runCommand(cmd: string, args: string[], opts: { timeoutMs?: number } = {}): Promise<void> {
-  return execFileAsync(cmd, args, {
-    timeout: opts.timeoutMs ?? 30_000,
-    windowsHide: true,
-  }).catch((e) => {
-    console.error(`[i-am-cooking] ${cmd} failed:`, (e as Error).message);
-  });
-}
-
-// 全局跟踪正在播放的音频进程（用户回来/关会话时 stopAllAudio 立即掐断）
-let activeAudioProcs: ReturnType<typeof spawn>[] = [];
-
-/**
- * spawn 播放器进程，最多播放 maxMs 毫秒后强制 kill（避免超长歌曲一直响）。
- * 返回 Promise（进程退出/出错/被杀 都 resolve）。
- */
-function playProcess(cmd: string, args: string[], maxMs: number): Promise<void> {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => { if (!done) { done = true; resolve(); } };
-    const proc = spawn(cmd, args, { stdio: "ignore", windowsHide: true });
-    activeAudioProcs.push(proc);
-    proc.on("error", () => { activeAudioProcs = activeAudioProcs.filter((p) => p !== proc); finish(); });
-    proc.on("exit", () => { activeAudioProcs = activeAudioProcs.filter((p) => p !== proc); finish(); });
-    if (maxMs > 0) setTimeout(() => { proc.kill(); finish(); }, maxMs);
-  });
-}
-
-/** 停止所有正在播放的音频（用户回来/关会话/停止本次播放时调用，立即安静） */
-function stopAllAudio(): void {
-  for (const proc of activeAudioProcs) {
-    try { proc.kill(); } catch { /* ignore */ }
-  }
-  activeAudioProcs = [];
+/** 本地包装：停止所有音频并复位 UI 响铃状态（lib/audio.ts 只管进程，UI 状态归入口管） */
+function stopAudioAll(): void {
+  stopAudioAll();
   shoutingState = false; // 已安静，状态栏/横幅恢复
-}
-
-// ── 跨 Agent 音频互斥锁（逻辑在 lib/audio-lock.ts，可测试）────────────────────
-function isProcessAlive(pid: number): boolean { return isProcessAliveImpl(pid); }
-async function acquireAudioLock(force: boolean): Promise<boolean> {
-  return acquireAudioLockImpl(AUDIO_LOCK_PATH, force);
-}
-async function releaseAudioLock(): Promise<void> {
-  await releaseAudioLockImpl(AUDIO_LOCK_PATH);
-}
-
-
-/**
- * 三段式顺序播放：① 短铃声(beeps) → ② Agent 语音(TTS) → ③ 用户自定义歌曲(soundPath)。
- * 共用 soundSeconds 总预算：从开始响到强制停止，到点 kill 掉还在播的歌曲。
- * 跨 Agent 互斥：多个 pi 同时离开时，同一时刻只放一个声音（后到的跳过声音）。
- */
-async function playSound(beeps: number, soundPath: string, ttsText: string, opts: { force?: boolean } = {}): Promise<void> {
-  // 音频互斥锁：其他 Agent 正在播 → 本次跳过声音（只留弹窗/推送/横幅）
-  const acquired = await acquireAudioLock(opts.force ?? false);
-  if (!acquired) return;
-  try {
-    const totalMs = Math.max(5, (config.soundSeconds ?? 60)) * 1000;
-    const startedAt = Date.now();
-    const remainingMs = () => Math.max(0, totalMs - (Date.now() - startedAt));
-    const p = process.platform;
-
-    // ① 短铃声（beeps）
-    if (beeps > 0) {
-      try {
-        if (p === "win32") {
-          await runPowerShellScript("shout.ps1", { beeps, soundPath: "", ttsText: "" });
-        } else if (p === "darwin") {
-          await runCommand("osascript", ["-e", `beep ${Math.min(beeps, 5)}`], { timeoutMs: 3000 });
-        } else {
-          await runCommand("canberra-gtk-play", ["-i", "message"], { timeoutMs: 3000 }).catch(() => {});
-        }
-      } catch { /* best effort */ }
-    }
-
-    // ② Agent 语音（TTS）
-    if (ttsText) {
-      await speakTts(ttsText);
-    }
-
-    // ③ 用户自定义歌曲（soundPath）— 最多播到总预算剩余
-    if (soundPath && remainingMs() > 500) {
-      try {
-        if (p === "win32") {
-          await runPowerShellScript("shout.ps1", { beeps: 0, soundPath, ttsText: "" });
-        } else if (p === "darwin") {
-          await playProcess("afplay", [soundPath], remainingMs());
-        } else {
-        await playProcess("paplay", [soundPath], remainingMs()).catch(() =>
-          playProcess("aplay", [soundPath], remainingMs()),
-        );
-      }
-    } catch { /* best effort */ }
-  }
-  } finally {
-    await releaseAudioLock(); // 播放完/被中断都释放锁
-  }
-}
-
-async function speakTts(text: string): Promise<void> {
-  if (!text) return;
-  const p = process.platform;
-  try {
-    if (p === "win32") {
-      await runPowerShellScript("shout.ps1", { beeps: 0, soundPath: "", ttsText: text });
-    } else if (p === "darwin") {
-      // macOS say：Tingting 是内置中文普通话语音，失败则用系统默认
-      await runCommand("say", ["-v", "Tingting", text]).catch(() =>
-        runCommand("say", [text]),
-      );
-    } else {
-      await runCommand("espeak-ng", ["-v", "zh", text]).catch(() =>
-        runCommand("espeak", ["-v", "zh", text]),
-      );
-    }
-  } catch { /* best effort */ }
 }
 
 async function showNotification(title: string, body: string): Promise<void> {
   const p = process.platform;
   try {
     if (p === "win32") {
-      await runPowerShellScript("toast.ps1", { title, body });
+      await runPowerShellScript(SCRIPTS, TMP_DIR, "toast.ps1", { title, body });
     } else if (p === "darwin") {
       // macOS 原生通知：支持中文、emoji，带提示音 Glass
       await runCommand("osascript", [
@@ -529,217 +153,7 @@ async function showNotification(title: string, body: string): Promise<void> {
   } catch { /* best effort */ }
 }
 
-// ── volume control（需用户允许 boostVolume 才启用） ──────────────────────
-let savedVolumePct: number | null = null; // 离开前的原始音量（0-100）
-let savedMuted: boolean | null = null;    // macOS：离开前的静音标志（restore 时还原）
-
-/** 读取当前系统音量（0-100）；失败返回 null */
-async function getSystemVolume(): Promise<number | null> {
-  const p = process.platform;
-  try {
-    if (p === "win32") {
-      const { stdout } = await execFileAsync("powershell.exe", [
-        "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", join(SCRIPTS, "volume.ps1"), "-Action", "get",
-      ], { timeout: 15_000, windowsHide: true });
-      const m = stdout.match(/volume=([\d.]+)/);
-      return m ? Math.round(parseFloat(m[1]) * 100) : null;
-    } else if (p === "darwin") {
-      const { stdout } = await execFileAsync("osascript", ["-e", "output volume of (get volume settings)"], { windowsHide: true });
-      const n = parseInt(stdout.trim(), 10);
-      return isNaN(n) ? null : n;
-    } else {
-      const { stdout } = await execFileAsync("pactl", ["get-sink-volume", "@DEFAULT_SINK@"], { windowsHide: true });
-      const m = stdout.match(/(\d+)%/);
-      return m ? parseInt(m[1], 10) : null;
-    }
-  } catch {
-    return null;
-  }
-}
-
-/** 设置系统音量（0-100）；返回是否成功 */
-async function setSystemVolume(level: number): Promise<boolean> {
-  const clamped = Math.max(0, Math.min(100, Math.round(level)));
-  const p = process.platform;
-  try {
-    if (p === "win32") {
-      await runPowerShellScript("volume.ps1", { action: "set", level: clamped / 100 });
-    } else if (p === "darwin") {
-      // macOS：设置音量会自动解除静音
-      await execFileAsync("osascript", ["-e", `set volume output volume ${clamped}`], { windowsHide: true });
-    } else {
-      await execFileAsync("pactl", ["set-sink-volume", "@DEFAULT_SINK@", `${clamped}%`], { windowsHide: true });
-    }
-    return true;
-  } catch (e) {
-    console.error("[i-am-cooking] setSystemVolume failed:", (e as Error).message);
-    return false;
-  }
-}
-
-/** 切换静音（macOS/Linux 支持）；返回操作后的静音状态，失败返回 null */
-async function toggleMute(mute: boolean): Promise<boolean | null> {
-  const p = process.platform;
-  try {
-    if (p === "darwin") {
-      await execFileAsync("osascript", ["-e", `set volume output muted ${mute}`], { windowsHide: true });
-      return mute;
-    } else if (p === "linux") {
-      const arg = mute ? "mute" : "unmute";
-      await execFileAsync("pactl", ["set-sink-mute", "@DEFAULT_SINK@", arg], { windowsHide: true });
-      return mute;
-    } else if (p === "win32") {
-      // Windows：走 volume.ps1 的 mute/unmute action（Core Audio API）
-      await runPowerShellScript("volume.ps1", { action: mute ? "mute" : "unmute" });
-      return mute;
-    }
-    return null;
-  } catch (e) {
-    console.error("[i-am-cooking] toggleMute failed:", (e as Error).message);
-    return null;
-  }
-}
-
-/** 离开时提升音量到 boostLevel（只升不降），并记住原值 */
-async function boostVolume(): Promise<void> {
-  if (!config.boostVolume) return;
-  const target = Math.max(1, Math.min(100, config.boostLevel || 80));
-  const p = process.platform;
-  try {
-    if (p === "win32") {
-      await mkdir(TMP_DIR, { recursive: true });
-      const saveFile = join(TMP_DIR, "volume.json");
-      const { stdout } = await execFileAsync("powershell.exe", [
-        "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", join(SCRIPTS, "volume.ps1"),
-        "-Action", "save", "-Level", String(target / 100), "-SaveFile", saveFile,
-      ], { timeout: 15_000, windowsHide: true });
-      const m = stdout.match(/saved=([\d.]+)/);
-      if (m) savedVolumePct = Math.round(parseFloat(m[1]) * 100);
-    } else if (p === "darwin") {
-      // 同时记录音量和静音标志：macOS 的 `set volume output volume N` 会自动取消静音，
-      // 所以离开前若是静音（或 Mute 键触发的 muted=true 但音量非 0），回来时必须还原 muted。
-      const { stdout } = await execFileAsync("osascript", ["-e", "get volume settings"], { windowsHide: true });
-      const mutedMatch = stdout.match(/output\s+muted:(true|false)/);
-      const volMatch = stdout.match(/output\s+volume:(\d+)/);
-      savedMuted = mutedMatch ? mutedMatch[1] === "true" : null;
-      const cur = volMatch ? parseInt(volMatch[1], 10) : NaN;
-      savedVolumePct = isNaN(cur) ? null : cur;
-      const newLevel = Math.max(isNaN(cur) ? 0 : cur, target);
-      // 设置音量（会自动取消静音，保证能喊醒你）
-      await execFileAsync("osascript", ["-e", `set volume output volume ${newLevel}`], { windowsHide: true });
-    } else {
-      // Linux: pactl (PulseAudio)
-      const { stdout } = await execFileAsync("pactl", ["get-sink-volume", "@DEFAULT_SINK@"], { windowsHide: true });
-      const m = stdout.match(/(\d+)%/);
-      savedVolumePct = m ? parseInt(m[1], 10) : null;
-      const newLevel = Math.max(savedVolumePct ?? 0, target);
-      await execFileAsync("pactl", ["set-sink-volume", "@DEFAULT_SINK@", `${newLevel}%`], { windowsHide: true });
-    }
-  } catch (e) {
-    console.error("[i-am-cooking] boostVolume failed:", (e as Error).message);
-    savedVolumePct = null; // 读不到原值就不恢复，避免误改
-    savedMuted = null;
-  }
-}
-
-/** 回来时恢复离开前的音量 */
-async function restoreVolume(): Promise<void> {
-  if (savedVolumePct === null) return;
-  const p = process.platform;
-  try {
-    if (p === "win32") {
-      await execFileAsync("powershell.exe", [
-        "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", join(SCRIPTS, "volume.ps1"),
-        "-Action", "restore", "-SaveFile", join(TMP_DIR, "volume.json"),
-      ], { timeout: 15_000, windowsHide: true });
-    } else if (p === "darwin") {
-      // 恢复音量和静音状态（离开前若是静音，这里必须还原 muted）
-      await execFileAsync("osascript", ["-e", `set volume output volume ${savedVolumePct}`], { windowsHide: true });
-      if (savedMuted !== null) {
-        await execFileAsync("osascript", ["-e", `set volume output muted ${savedMuted}`], { windowsHide: true });
-      }
-    } else {
-      await execFileAsync("pactl", ["set-sink-volume", "@DEFAULT_SINK@", `${savedVolumePct}%`], { windowsHide: true });
-    }
-  } catch (e) {
-    console.error("[i-am-cooking] restoreVolume failed:", (e as Error).message);
-  }
-  savedVolumePct = null;
-  savedMuted = null;
-}
-
-async function pushPhone(alert: Alert): Promise<boolean> {
-  // 返回是否发送成功（未配置 topic / 网络失败均视为失败）
-  const topic = config.ntfyTopic?.trim();
-  if (!topic) return false;
-  const server = (config.ntfyServer?.trim() || "https://ntfy.sh").replace(/\/+$/, "");
-  const priority = alert.urgency === "urgent" ? 5 : alert.urgency === "normal" ? 3 : 1;
-  const headers: Record<string, string> = {
-    Title: "[pi] alert!",
-    Priority: String(priority),
-    Tags: "potable_water",
-  };
-  // ntfy 私有 topic：携带访问 token（Authorization: Bearer <token>）
-  const token = resolveValue(config.ntfyToken).trim();
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  try {
-    const res = await fetch(`${server}/${encodeURIComponent(topic)}`, {
-      method: "POST",
-      body: `[${alert.urgency}] ${alert.message}`,
-      headers,
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!res.ok) {
-      console.error(`[i-am-cooking] ntfy push failed: HTTP ${res.status} ${res.statusText}`);
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.error("[i-am-cooking] ntfy push failed:", (e as Error).message);
-    return false;
-  }
-}
-
-async function pushWebhook(alert: Alert): Promise<boolean> {
-  // 返回是否发送成功（未配置 URL / 网络失败均视为失败）
-  const url = config.webhookUrl?.trim();
-  if (!url) return false;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  // webhook 认证：token 放在指定 header（默认 Authorization: Bearer <token>）
-  const token = resolveValue(config.webhookToken).trim();
-  if (token) {
-    const headerName = config.webhookTokenHeader?.trim() || "Authorization";
-    const value = headerName.toLowerCase() === "authorization" && !/^Bearer\s/i.test(token)
-      ? `Bearer ${token}`
-      : token;
-    headers[headerName] = value;
-  }
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        title: `🍳 ${config.shoutPhrase || "agent 需要你"}！`,
-        message: alert.message,
-        urgency: alert.urgency,
-        category: alert.category,
-        time: new Date(alert.time).toISOString(),
-      }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!res.ok) {
-      console.error(`[i-am-cooking] webhook push failed: HTTP ${res.status} ${res.statusText}`);
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.error("[i-am-cooking] webhook push failed:", (e as Error).message);
-    return false;
-  }
-}
+// ── 音量控制（逻辑在 lib/volume.ts，可测试）───────────────────────────────
 
 function renderTts(alert: Alert): string {
   // 逻辑在 lib/tts.ts（可测试）
@@ -754,119 +168,43 @@ function renderTts(alert: Alert): string {
   );
 }
 
+// ── 手机推送 ──────────────────────────────────────────────────────────────
+// 逻辑在 lib/push.ts（ntfy/webhook 双通道，可测试）；此处只提供 config.<channel> 分发。
+async function pushAlert(alert: Alert): Promise<boolean> {
+  // 兼容旧配置：未走向导但直接填了 webhookUrl
+  if (config.phonePush) {
+    return config.pushProvider === "ntfy" ? pushPhone(config, alert) : pushWebhook(config, alert);
+  }
+  if (config.webhookUrl) return pushWebhook(config, alert);
+  return true;
+}
+
 /**
- * 偏好拦截：根据 callingMode 判断是否抑制响铃（降级为仅 TUI 横幅）。
+ * 偏好拦截：根据 callingMode 判断是否抑制响铃（逻辑在 lib/prefs.ts，可测试）。
  * 返回 true = 不响铃/不推送，只留 widget + TUI notify。
  */
 function shouldSuppress(alert: Alert): boolean {
-  const mode = config.callingMode || "normal";
-  if (mode === "silence") return true;                        // 全部静音
-  if (mode === "completion_only") return alert.category !== "completion"; // 只有完成才响
-  if (mode === "urgent_only") return alert.urgency !== "urgent";         // 只有紧急才响
-  if (mode === "eager") return false;                        // 全喊
-  return false; // normal
+  return shouldSuppressLib(config.callingMode || "normal", alert);
 }
 
 // completion 通知计数器（每次 turnOn 清零）
 let completionNoticeCount = 0;
 
-// ── 偏好文字匹配规则（保险丝：保证"别喊了"这类直接指令一定生效） ──────────
-const PREFERENCE_PATTERNS: { mode: CallingMode; patterns: RegExp[] }[] = [
-  {
-    mode: "silence",
-    patterns: [
-      /别喊|别叫|别吵|安静|静音|别打扰|别通知|不用喊|不用叫|quiet|silence|stop\s+(calling|notify|bother)|shut\s*up/i,
-    ],
-  },
-  {
-    mode: "completion_only",
-    patterns: [
-      /完成后?(喊|叫|通知|告诉|提醒)|干完(喊|叫|通知)|好了(喊|叫|通知|叫我)|搞完(喊|叫|通知)|完工(喊|叫|通知)|结束时(喊|叫|通知)|notify\s+(me\s+)?when\s+(done|finished|complete)|tell\s+me\s+when\s+done/i,
-    ],
-  },
-  {
-    mode: "urgent_only",
-    patterns: [
-      /只有紧急才|紧急才(喊|找|通知)|只(有)?紧急(时)?(才)?(喊|找|通知)|重要的事才|only\s+(if\s+)?urgent|only\s+when\s+urgent/i,
-    ],
-  },
-  {
-    mode: "eager",
-    patterns: [
-      /随时(汇报|通知|喊|告诉我)|每步(告诉|通知|汇报)|全程(汇报|通知)|有进展就(说|通知|喊)|keep\s+me\s+posted|report\s+progress|update\s+me\s+(often|frequently)/i,
-    ],
-  },
-  {
-    mode: "normal",
-    patterns: [
-      /需要(你|我)?(时)?再喊|恢复默认|恢复正常|need\s+you\s+when|back\s+to\s+normal|reset/i,
-    ],
-  },
-];
-
-/** 从用户原话中文字匹配偏好，命中返回模式，否则 null */
-function detectPreference(text: string): CallingMode | null {
-  for (const rule of PREFERENCE_PATTERNS) {
-    if (rule.patterns.some((p) => p.test(text))) return rule.mode;
-  }
-  return null;
-}
-
-// ── 自主等级文字匹配（保险丝："遇墙就喊/能不喊就不喊"这类直接指令一定生效） ──
-const AUTONOMY_PATTERNS: { level: AutonomyLevel; patterns: RegExp[] }[] = [
-  {
-    level: "conservative",
-    patterns: [
-      /遇(到|见)?(人类墙|墙|阻塞|卡住|难关|problem\s+wall|human\s+wall).*?(喊|叫我|问我|找我|通知)/i,
-      /谨慎(点|一些)?|小心(点|些)?|保守(点|些)?|拿不准就(喊|问|找)我|不确定就(喊|问|找)我|先问我|问清楚再(做|干)|重要的事先(问|喊)我/i,
-    ],
-  },
-  {
-    level: "balanced",
-    patterns: [
-      /平衡(点|一些)?|恢复默认|默认就好|正常做|balanced|back\s+to\s+normal/i,
-      /有(点)?难度才(喊|找|叫)我|难度大?才(喊|找|叫)我/i,
-    ],
-  },
-  {
-    level: "autonomous",
-    patterns: [
-      /能不喊就不喊|尽量(别|不要)(喊|吵|打扰)我|少喊(我)?|非(常|常)?紧要勿扰|自主(处理|解决|推进|决定|搞定)|自己搞定|别来烦我|除非(真|彻底|完全)?没法(继续|推进)才(喊|叫|找)我/i,
-    ],
-  },
-];
-
-/** 从用户原话中文字匹配自主等级，命中返回等级，否则 null */
-function detectAutonomyLevel(text: string): AutonomyLevel | null {
-  for (const rule of AUTONOMY_PATTERNS) {
-    if (rule.patterns.some((p) => p.test(text))) return rule.level;
-  }
-  return null;
-}
-
 /** 切换自主等级并提示（持久化：跨离开会话保留） */
 function setAutonomyLevel(level: AutonomyLevel, reason: string, ctx: { ui: any }): void {
   const prev = config.autonomyLevel || "balanced";
   config.autonomyLevel = level;
-  void saveConfig();
+  void writeConfig(config);
   if (level !== prev) {
     ctx.ui.notify(`🚀 自主等级已切换：${AUTONOMY_LABEL[level]}（依据：${reason}）`, "info");
   }
 }
 
-const CALLING_MODE_LABEL: Record<CallingMode, string> = {
-  normal: "默认（需要你 + 完成都喊）",
-  silence: "安静模式（全部静音，只留横幅）",
-  completion_only: "只在完成时喊",
-  urgent_only: "只在紧急时喊",
-  eager: "随时汇报（需要你/完成/进度都喊）",
-};
-
 /** 切换偏好并提示 */
 function setCallingMode(mode: CallingMode, reason: string, ctx: { ui: any }): void {
   const prev = config.callingMode || "normal";
   config.callingMode = mode;
-  void saveConfig();
+  void writeConfig(config);
   if (mode !== prev) {
     ctx.ui.notify(`🔔 呼喊偏好已切换：${CALLING_MODE_LABEL[mode]}（依据：${reason}）`, "info");
   }
@@ -906,11 +244,12 @@ async function fireAlert(alert: Alert, ctx: { ui: any }, opts: { forceSound?: bo
     updateWidget(ctx);
     const done = () => { shoutingState = false; updateStatus(ctx, "idle"); updateWidget(ctx); };
     if (isMilestone) {
-      void playSound(config.sound ? config.milestoneBeeps : 0, "", config.tts ? renderTts(alert) : "", { force: forceSound }).then(done).catch(done);
+      void playSound(config, config.sound ? config.milestoneBeeps : 0, "", config.tts ? renderTts(alert) : "", { force: forceSound }).then(done).catch(done);
     } else if (isCompletion) {
-      void playSound(config.sound ? 2 : 0, "", config.tts ? renderTts(alert) : "", { force: forceSound }).then(done).catch(done);
+      void playSound(config, config.sound ? 2 : 0, "", config.tts ? renderTts(alert) : "", { force: forceSound }).then(done).catch(done);
     } else {
       void playSound(
+        config,
         config.sound ? config.beeps : 0,
         config.sound ? config.soundPath : "",
         config.tts ? renderTts(alert) : "",
@@ -924,11 +263,7 @@ async function fireAlert(alert: Alert, ctx: { ui: any }, opts: { forceSound?: bo
   }
 
   // ── 手机推送（按 pushProvider 分发；兼容旧配置：未走向导但直接填了 webhookUrl）──
-  if (config.phonePush) {
-    return config.pushProvider === "ntfy" ? await pushPhone(alert) : await pushWebhook(alert);
-  }
-  if (config.webhookUrl) return await pushWebhook(alert);
-  return true;
+  return await pushAlert(alert);
 }
 
 /** 更新状态栏：idle=🍳 离开中 / shouting=📣 正在喊你（带本次停止提示） */
@@ -959,8 +294,8 @@ function updateWidget(ctx: { ui: any }): void {
 
 /** 停止本次播放：只掐当前音频，不改配置、不清待处理呼喊、不影响下次呼喊 */
 function stopCurrentSound(ctx: { ui: any }): void {
-  const hadAudio = shoutingState || activeAudioProcs.length > 0;
-  stopAllAudio();
+  const hadAudio = shoutingState || hasActiveAudio();
+  stopAudioAll();
   updateStatus(ctx, "idle");
   updateWidget(ctx);
   ctx.ui.notify(
@@ -981,7 +316,7 @@ function scheduleRepeats(alert: Alert, ctx: { ui: any }): void {
     const timer = setInterval(() => {
       if (!config.cooking) return;
       alert.repeatCount++;
-      void saveConfig();
+      void writeConfig(config);
       void fireAlert(alert, ctx);
       if (config.maxUrgentRepeats > 0 && alert.repeatCount >= config.maxUrgentRepeats) {
         clearInterval(timer);
@@ -992,7 +327,7 @@ function scheduleRepeats(alert: Alert, ctx: { ui: any }): void {
     const timer = setTimeout(() => {
       if (!config.cooking) return;
       alert.repeatCount++;
-      void saveConfig();
+      void writeConfig(config);
       void fireAlert(alert, ctx);
     }, Math.max(1, config.repeatIntervalMinutes) * 60_000);
     repeatTimers.push(timer as unknown as ReturnType<typeof setInterval>);
@@ -1055,7 +390,7 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: { 
     ttsText,
   };
   config.alerts.push(alert);
-  void saveConfig();
+  void writeConfig(config);
   void fireAlert(alert, ctx);
   scheduleRepeats(alert, ctx);
   return true;
@@ -1068,14 +403,14 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: { 
  */
 function resetCookingState(ctx: { ui: any }): void {
   clearRepeatTimers();
-  stopAllAudio(); // 用户回来/新会话：立即停止正在播放的音频
+  stopAudioAll(); // 用户回来/新会话：立即停止正在播放的音频
   const hadCooking = config.cooking;
   const hadPending = pendingAlerts().length;
   config.cooking = false;
   config.since = undefined;
   config.alerts = [];
   config.callingMode = "normal"; // 偏好是会话级的，每次会话重置
-  void saveConfig();
+  void writeConfig(config);
   ctx.ui.setStatus("i-am-cooking", "");
   ctx.ui.setWidget("i-am-cooking", []);
   void restoreVolume(); // 若上次离开拉高了音量，恢复原值
@@ -1090,13 +425,13 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
   config.cooking = true;
   config.since = Date.now();
   completionNoticeCount = 0; // 新的一轮离开，重置完成通知计数
-  void saveConfig();
+  void writeConfig(config);
   ctx.ui.notify(`🍳 离开模式已开启。${config.shoutPhrase || "agent 需要你"}时我会大声喊你。`, "info");
   updateStatus(ctx, "idle");
   updateWidget(ctx);
 
   // 自动提升音量（只在用户允许时生效）
-  void boostVolume();
+  void boostVolume(config);
 
   // 备注里带偏好关键词 → 立即切换（如 /i-am-cooking on 完成后喊我）
   if (note) {
@@ -1126,7 +461,7 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
         else config.reportIntervalMinutes = 15;
       }
       else config.progressReporting = "none";
-      await saveConfig();
+      await writeConfig(config);
     }
   }
 
@@ -1157,13 +492,13 @@ async function turnOn(ctx: { ui: any; hasUI?: boolean; mode?: string }, note: st
 
 function turnOff(ctx: { ui: any }, source: "command" | "agent-exit", userText?: string): void {
   clearRepeatTimers();
-  stopAllAudio(); // 关闭离开：立即停止正在播放的音频
+  stopAudioAll(); // 关闭离开：立即停止正在播放的音频
   const pending = pendingAlerts();
   config.cooking = false;
   config.since = undefined;
   config.alerts = [];
   config.callingMode = "normal"; // 偏好是会话级的，下次离开重新判断
-  void saveConfig();
+  void writeConfig(config);
   ctx.ui.setStatus("i-am-cooking", "");
   ctx.ui.setWidget("i-am-cooking", []);
 
@@ -1210,14 +545,6 @@ function maskToken(token: string): string {
   if (!t) return "未配置";
   if (t.length <= 8) return "已配置(***)";
   return `已配置(${t.slice(0, 3)}***${t.slice(-3)})`;
-}
-
-/**
- * 生成建议的随机 topic 名：可爱词池（编程/算法/LLM 风）+ 6 位随机数字。
- * 逻辑在 lib/topic.ts（可测试）。
- */
-function suggestTopic(): string {
-  return suggestTopicImpl();
 }
 
 /**
@@ -1271,7 +598,7 @@ async function setupWizard(ctx: { mode: string; hasUI: boolean; ui: any }): Prom
   if (provider.includes("暂不")) {
     config.phonePush = false;
     config.setupDone = true;
-    await saveConfig();
+    await writeConfig(config);
     ui.notify("已关闭手机推送。其他通道（声音/TTS/Toast）不受影响。", "info");
     return;
   }
@@ -1320,7 +647,7 @@ async function setupWizard(ctx: { mode: string; hasUI: boolean; ui: any }): Prom
       config.ntfyToken = finalToken;
       config.phonePush = true;
       config.setupDone = true;
-      await saveConfig();
+      await writeConfig(config);
 
       // ── 自动提升音量（需用户明确允许）──
       const volOk = await ui.confirm(
@@ -1329,7 +656,7 @@ async function setupWizard(ctx: { mode: string; hasUI: boolean; ui: any }): Prom
         "防止静音状态下听不到呼喊。\n\n允许？",
       );
       config.boostVolume = volOk === true;
-      await saveConfig();
+      await writeConfig(config);
 
       // ── 测试推送 ──
       const test = await ui.confirm(
@@ -1385,7 +712,7 @@ async function setupWizard(ctx: { mode: string; hasUI: boolean; ui: any }): Prom
     config.webhookTokenHeader = finalHeader;
     config.phonePush = true;
     config.setupDone = true;
-    await saveConfig();
+    await writeConfig(config);
 
     // ── 自动提升音量（需用户明确允许）──
     const volOk = await ui.confirm(
@@ -1394,7 +721,7 @@ async function setupWizard(ctx: { mode: string; hasUI: boolean; ui: any }): Prom
       "防止静音状态下听不到呼喊。\n\n允许？",
     );
     config.boostVolume = volOk === true;
-    await saveConfig();
+    await writeConfig(config);
 
     const test = await ui.confirm("配置已保存！现在测试手机推送？", "是 / 否");
     if (test) {
@@ -1419,7 +746,7 @@ async function testPush(provider: "ntfy" | "webhook", ctx: { ui: any }): Promise
     acked: false,
   };
   ctx.ui.notify("⌛️ 正在发送手机测试推送，请留意手机通知…（最长等待 15 秒）", "info");
-  const ok = provider === "ntfy" ? await pushPhone(alert) : await pushWebhook(alert);
+  const ok = provider === "ntfy" ? await pushPhone(config, alert) : await pushWebhook(config, alert);
   return ok;
 }
 
@@ -1600,7 +927,7 @@ export default function (pi: ExtensionAPI) {
           config.maxCompletionNotices = Math.max(1, num);
           ui.notify(`✅ 每次离开最多完成通知已设为 ${config.maxCompletionNotices} 次。`, "info");
         }
-        await saveConfig();
+        await writeConfig(config);
         return;
       }
       if (arg === "sound") {
@@ -1659,7 +986,7 @@ export default function (pi: ExtensionAPI) {
             config.toast = !config.toast;
             ui.notify(`✅ 桌面弹窗已${config.toast ? "开启" : "关闭"}。`, "info");
           }
-          await saveConfig();
+          await writeConfig(config);
           return;
         }
         if (choose.includes("设置自定义歌曲")) {
@@ -1677,13 +1004,14 @@ export default function (pi: ExtensionAPI) {
           }
           if (!picked) { ui.notify("已取消。", "info"); return; }
           config.soundPath = picked;
-          await saveConfig();
+          await writeConfig(config);
           ui.notify(`✅ 自定义歌曲已设置：${config.soundPath}\n试听：/i-am-cooking sound 选"试听"；或下次呼喊时自动播放。`, "info");
           return;
         }
         if (choose.includes("试听")) {
           ui.notify("🔊 正在试听：哔哔 + Agent语音 + 自定义歌曲（最长 10 秒）…", "info");
           await playSound(
+            config,
             config.sound ? config.beeps : 0,
             config.sound ? config.soundPath : "",
             config.tts ? `主人，这是测试语音！${config.shoutPhrase || "agent 需要你"}！` : "",
@@ -1697,13 +1025,13 @@ export default function (pi: ExtensionAPI) {
           const n = parseInt(v.trim(), 10);
           if (isNaN(n) || n < 1 || n > 300) { ui.notify("❌ 请输入 1-300 的数字。", "warning"); return; }
           config.soundSeconds = n;
-          await saveConfig();
+          await writeConfig(config);
           ui.notify(`✅ 总时长上限已设为 ${n} 秒（到点强制停止）。`, "info");
           return;
         }
         if (choose.includes("清除自定义歌曲")) {
           config.soundPath = "";
-          await saveConfig();
+          await writeConfig(config);
           ui.notify("✅ 已清除自定义歌曲（回到哔哔 + Agent 语音）。", "info");
           return;
         }
@@ -1745,13 +1073,13 @@ export default function (pi: ExtensionAPI) {
           if (isNaN(n) || n < 1 || n > 100) { ui.notify("❌ 请输入 1-100 的数字。", "warning"); return; }
           config.boostLevel = n;
           config.boostVolume = true;
-          await saveConfig();
+          await writeConfig(config);
           ui.notify(`✅ 离开时自动拉高到 ${n}%（已自动开启该功能）。`, "info");
           return;
         }
         if (choose.includes("开关")) {
           config.boostVolume = !config.boostVolume;
-          await saveConfig();
+          await writeConfig(config);
           ui.notify(`✅ "离开自动拉高音量"已${config.boostVolume ? "开启" : "关闭"}。`, "info");
           return;
         }
@@ -1842,7 +1170,7 @@ export default function (pi: ExtensionAPI) {
       }
       setCallingMode(params.mode, params.reason, ctx);
       return {
-        content: [{ type: "text", text: `呼喊偏好已切换为：${CALLING_MODE_LABEL[params.mode]}（依据：${params.reason}）` }],
+        content: [{ type: "text", text: `呼喊偏好已切换为：${CALLING_MODE_LABEL[params.mode as CallingMode]}（依据：${params.reason}）` }],
         details: { mode: params.mode, applied: true, reason: params.reason },
       };
     },
@@ -1869,7 +1197,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       setAutonomyLevel(params.level, params.reason, ctx);
       return {
-        content: [{ type: "text", text: `自主等级已切换为：${AUTONOMY_LABEL[params.level]}（依据：${params.reason}）` }],
+        content: [{ type: "text", text: `自主等级已切换为：${AUTONOMY_LABEL[params.level as AutonomyLevel]}（依据：${params.reason}）` }],
         details: { level: params.level, applied: true, reason: params.reason },
       };
     },
@@ -1954,7 +1282,7 @@ export default function (pi: ExtensionAPI) {
         const n = Math.max(1, Math.min(300, Math.round(params.soundSeconds)));
         config.soundSeconds = n;
       }
-      void saveConfig();
+      void writeConfig(config);
       ctx.ui.notify(`🔊 呼喊铃声已更新：${p}`, "info");
       return {
         content: [{ type: "text", text: `已设置呼喊铃声：${p}${params.soundSeconds !== undefined ? `（总时长 ${config.soundSeconds} 秒）` : ""}。下次呼喊时会先播短铃声+语音，再播这首歌。用户可随时用 /i-am-cooking sound 试听。` }],
@@ -2064,7 +1392,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── events ──
   pi.on("session_start", async (_event, ctx) => {
-    await loadConfig();
+    config = await readConfig();
     await ensureRulesFile(); // 首次启动用内置默认创建规则文件，已存在则不动
     // 离开状态不跨会话存活：任何会话启动都从"在岗"开始（需要时用户或 Agent 再 on）
     resetCookingState(ctx);
@@ -2079,16 +1407,16 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     clearRepeatTimers();
-    stopAllAudio(); // 会话关闭：停止正在播放的音频
+    stopAudioAll(); // 会话关闭：停止正在播放的音频
     void restoreVolume(); // 退出时恢复音量
-    await saveConfig();
+    await writeConfig(config);
   });
 
   // 离开模式时，每回合注入自主推进规则
   pi.on("before_agent_start", async (event, _ctx) => {
     if (!config.cooking) return;
     return {
-      systemPrompt: event.systemPrompt + (await buildRulesPrompt()),
+      systemPrompt: event.systemPrompt + (await buildRulesPrompt(config.autonomyLevel || "balanced")),
     };
   });
 
