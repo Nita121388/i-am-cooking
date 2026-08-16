@@ -50,6 +50,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Agent 自主开启离开模式**：新增 `enter_cooking_mode` 工具，用户说"我去做饭了/我离开一下/I'm cooking"等明确表达时 agent 理解并自动开启（无需手输命令）；工具描述严格限定仅在用户意图非常明确时调用，避免误开。
 
 ### Fixed
+- **消息投递不及时（followUp 压队列）**：开启/关闭离开模式的消息和定时汇报此前用 `deliverAs: "followUp"`（等 agent 整个回合 settle 才投递），agent 自主连续干活时会出现——状态栏已开但 agent 还不知道、定时汇报堆积迟到。全部改为 `deliverAs: "steer"`（agent 干活途中在下一次 LLM 调用前投递，空闲时照常立即发送）；定时汇报加 `hasPendingMessages` 守卫：上一条还在排队则跳过本次，避免超长工具调用期间堆积重复催促。
 - **回来输入被忽略**：cooking 模式中用户打字回来时，输入内容现在会作为新指令转交给 agent（之前 followUp 只发固定"汇报进度"消息，用户补充内容被丢弃导致 agent 继续原方向）。input handler 返回 `handled` 避免消息重复。
 
 ### Changed

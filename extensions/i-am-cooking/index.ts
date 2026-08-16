@@ -78,6 +78,8 @@ type CookingCtx = {
   ui: CookingUI;
   mode?: string;
   hasUI?: boolean;
+  /** 是否有消息正排队待投递给 agent（steer/followUp 队列非空）——定时汇报守卫用 */
+  hasPendingMessages?: () => boolean;
 };
 
 // ── state ────────────────────────────────────────────────────────────────
@@ -643,9 +645,12 @@ function startReportTimer(ctx: CookingCtx): void {
   const minutes = Math.max(1, Math.min(120, config.reportIntervalMinutes || 15));
   reportTimer = setInterval(() => {
     if (!config.cooking) return;
+    // 上一条汇报（或其他消息）还压在待投递队列里（如 agent 卡在超长工具调用中）→ 跳过本次，避免堆积重复催促
+    if (ctx.hasPendingMessages?.()) return;
     const msg = `[定时汇报] 到点了，请汇报当前进度：\n` +
       `- 已完成什么？\n- 正在做什么？\n- 有无进展（没有新进展就如实说明原因，卡住了就说卡在哪、是否需要用户）`;
-    void api.sendUserMessage(msg, { deliverAs: "followUp" });
+    // steer：agent 干活途中在下一次 LLM 调用前投递，不等整个回合结束（followUp 会压队列等到 settle）
+    void api.sendUserMessage(msg, { deliverAs: "steer" });
   }, minutes * 60_000);
   repeatTimers.push(reportTimer); // 并入重复计时器，随 off/会话结束一起清理
 }
@@ -781,7 +786,8 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
     `调用前先准备好交接内容（刚好够用：决策给选项和推荐，凭据给获取方式，手动操作给步骤），准备好再喊，喊出的消息即最终版。\n` +
     `任务全部完成或达到重要里程碑时，调用 shout_for_user（category="completion", urgency="info"）通知我。` +
     progressHint,
-    { deliverAs: "followUp" },
+    // steer：agent 干活途中在下一次 LLM 调用前投递，让它尽快知道自己已进入离开模式（followUp 会压队列等到 settle）
+    { deliverAs: "steer" },
   );
 }
 
@@ -807,7 +813,8 @@ function turnOff(ctx: CookingCtx, source: "command" | "agent-exit", userText?: s
     source === "command"
       ? `[I am cooking] 我回来了（执行 off 命令）。\n我不在的时候你喊了我这些事：\n${summary}\n请简要汇报当前进度，然后继续处理这些事项。`
       : `[I am cooking] 用户结束了离开模式（agent 理解判定）。\n我不在的时候你喊了我这些事：\n${summary}\n请简要汇报当前进度，然后继续处理这些事项。`;
-  void api.sendUserMessage(followUp, { deliverAs: "followUp" });
+  // steer：agent 干活途中在下一次 LLM 调用前投递，让“我回来了”尽快送达（followUp 会压队列等到 settle）
+  void api.sendUserMessage(followUp, { deliverAs: "steer" });
 }
 
 function showStatus(ctx: CookingCtx): void {
