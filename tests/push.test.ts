@@ -1,7 +1,8 @@
 // 手机推送通道测试：resolveValue / pushPhone（mock fetch） / pushWebhook（mock fetch）
+// + 回归：ntfy header 必须纯 ASCII（emoji/中文放 body，否则 fetch 抛 ByteString 错误）
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { resolveValue, pushPhone, pushWebhook } from "../extensions/i-am-cooking/lib/push.ts";
+import { resolveValue, pushPhone, pushWebhook, ntfyTitle, ntfyBody } from "../extensions/i-am-cooking/lib/push.ts";
 import type { Alert, Config } from "../extensions/i-am-cooking/lib/config.ts";
 import { DEFAULTS } from "../extensions/i-am-cooking/lib/config.ts";
 
@@ -98,4 +99,35 @@ test("pushWebhook 成功路径 → JSON body + token header", async () => {
   assert.equal(body.urgency, "normal");
   assert.equal((call.opts.headers as Record<string,string>).Authorization, "Bearer wh-token");
   teardownFetchMock();
+});
+
+test("回归：ntfy header 必须纯 ASCII（emoji/中文会抛 ByteString 错误）", async () => {
+  setupFetchMock();
+  const cfg: Config = { ...DEFAULTS, ntfyTopic: "t", ntfyServer: "https://ntfy.example.com", ntfyToken: "" };
+  for (const category of ["progress", "milestone", "completion", "decision"]) {
+    await pushPhone(cfg, { ...fakeAlert, category });
+  }
+  assert.equal(fetchCalls.length, 4);
+  for (const call of fetchCalls) {
+    const headers = call.opts.headers as Record<string,string>;
+    for (const [k, v] of Object.entries(headers)) {
+      assert.match(v, /^[\x00-\x7F]*$/, `header ${k}=${JSON.stringify(v)} 含非 ASCII 字符`);
+    }
+  }
+  teardownFetchMock();
+});
+
+test("ntfyTitle 分类：标题纯文本，进度类/完成/普通都有区分", () => {
+  assert.equal(ntfyTitle("progress"), "progress");
+  assert.equal(ntfyTitle("milestone"), "progress");
+  assert.equal(ntfyTitle("completion"), "task done");
+  assert.equal(ntfyTitle("decision"), "pi alert!");
+  assert.equal(ntfyTitle("auto-error"), "pi alert!");
+});
+
+test("ntfyBody 分类：进度/完成带 emoji 前缀（body UTF-8 安全），普通不带", () => {
+  assert.equal(ntfyBody("milestone", "info", "下载 3/10"), "📈 [info] 下载 3/10");
+  assert.equal(ntfyBody("progress", "info", "无新进展"), "📈 [info] 无新进展");
+  assert.equal(ntfyBody("completion", "info", "全部完成"), "✅ [info] 全部完成");
+  assert.equal(ntfyBody("decision", "urgent", "需要你"), "[urgent] 需要你");
 });

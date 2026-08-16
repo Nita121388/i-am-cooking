@@ -14,7 +14,25 @@ export function resolveValue(v: string): string {
 }
 
 /**
- * ntfy 推送：POST {server}/{topic}，body 为 `[urgency] message`。
+ * ntfy 标题：HTTP header 只允许 Latin-1（0-255），emoji/中文都会让 fetch 抛异常。
+ * 所以标题用纯 ASCII 精简表达，分类信息改用 body 前缀 emoji（body 是 UTF-8 安全）。
+ */
+export function ntfyTitle(category: string): string {
+  if (category === "completion") return "task done";
+  if (category === "progress" || category === "milestone") return "progress";
+  return "pi alert!";
+}
+
+/** ntfy body：分类前缀（emoji，UTF-8 安全）+ `[urgency] message` */
+export function ntfyBody(category: string, urgency: string, message: string): string {
+  const prefix =
+    category === "completion" ? "✅ " :
+    category === "progress" || category === "milestone" ? "📈 " : "";
+  return `${prefix}[${urgency}] ${message}`;
+}
+
+/**
+ * ntfy 推送：POST {server}/{topic}，body 为 `[urgency] message`（分类带 emoji 前缀）。
  * 私有 topic 携带 Authorization: Bearer <token>；失败只记日志不抛。
  * 返回是否发送成功。
  */
@@ -23,13 +41,9 @@ export async function pushPhone(cfg: Config, alert: Alert): Promise<boolean> {
   if (!topic) return false;
   const server = (cfg.ntfyServer?.trim() || "https://ntfy.sh").replace(/\/+$/, "");
   const priority = alert.urgency === "urgent" ? 5 : alert.urgency === "normal" ? 3 : 1;
-  // 手机标题按类型区分：进度类/完成/普通呼喊，让你在锁屏上一眼看出是哪类
-  const title =
-    alert.category === "completion" ? "✅ 任务完成"
-    : alert.category === "progress" || alert.category === "milestone" ? "📈 进度"
-    : "[pi] alert!";
+  // 标题必须纯 ASCII（header 限制）；分类用 body 前缀 emoji 表达，锁屏一看便知是哪类
   const headers: Record<string, string> = {
-    Title: title,
+    Title: ntfyTitle(alert.category),
     Priority: String(priority),
     Tags: "potable_water",
   };
@@ -38,7 +52,7 @@ export async function pushPhone(cfg: Config, alert: Alert): Promise<boolean> {
   try {
     const res = await fetch(`${server}/${encodeURIComponent(topic)}`, {
       method: "POST",
-      body: `[${alert.urgency}] ${alert.message}`,
+      body: ntfyBody(alert.category, alert.urgency, alert.message),
       headers,
       signal: AbortSignal.timeout(15_000),
     });

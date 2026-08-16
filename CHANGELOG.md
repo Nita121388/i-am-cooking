@@ -16,6 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **完成后不再定时汇报**：收到 ✅ 完成通知时自动停掉定时汇报 timer，任务完成后不再继续刷进度。
 - **进度类不去重**：`progress`/`milestone` 跳过 10 分钟同内容去重——即使两次进度内容相同也要每次都推（如连续“无新进展”）。
 
+### Fixed
+- **ntfy 推送标题含 emoji → 整条推送报错**：HTTP header 只允许 Latin-1，`📈 进度`/`✅ 任务完成` 导致 `fetch` 抛 ByteString 异常，进度类与完成通知的手机推送全部失败（仅普通呼喊正常）。修复：header Title 改纯 ASCII（progress / task done / pi alert!），分类 emoji 前缀移到 body（UTF-8 安全）；新增回归测试（header 必须纯 ASCII）防再犯。
+
 ## [0.4.0] - 2026-08-16
 
 ### Refactored
