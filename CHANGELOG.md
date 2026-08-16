@@ -9,6 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 - **published to npm**: `pi install npm:i-am-cooking` now works. Package trimmed via `files` field (excludes tests/tsconfig); verified install from clean dir with lib/ intact.
 
+## [0.5.0] - 2026-08-16
+
+### Added
+- **进度只推手机（里程碑/定时汇报）**：进度类（`milestone` / `progress`）不再响铃/弹窗/进横幅，只推手机通知（本地仅一条轻提示）；手机标题按类型区分（📈 进度 / ✅ 完成 / alert）；定时汇报改成 agent 收到提醒后用 `shout_for_user(category="progress")` 汇报，内容只上手机。
+- **完成后不再定时汇报**：收到 ✅ 完成通知时自动停掉定时汇报 timer，任务完成后不再继续刷进度。
+- **进度类不去重**：`progress`/`milestone` 跳过 10 分钟同内容去重——即使两次进度内容相同也要每次都推（如连续“无新进展”）。
+
 ## [0.4.0] - 2026-08-16
 
 ### Refactored

@@ -94,6 +94,14 @@ export function detectAutonomyLevel(text: string): AutonomyLevel | null {
 }
 
 /**
+ * 进度类 category：小阶段完成（milestone）/ 定时进度汇报（progress）。
+ * 通道策略：只推手机（不响铃 / 不弹窗 / 不进横幅），本地仅留轻提示。
+ */
+export function isProgressCategory(category: string): boolean {
+  return category === "progress" || category === "milestone";
+}
+
+/**
  * 偏好拦截：根据 callingMode 判断是否抑制响铃（降级为仅 TUI 横幅）。
  * 返回 true = 不响铃/不推送，只留 widget + TUI notify。
  */

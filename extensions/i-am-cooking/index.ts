@@ -50,7 +50,7 @@ import { CONFIG_DIR, CONFIG_PATH, DEFAULT_RULES_PATH, RULES_PATH, SCRIPTS, TMP_D
 import type { Alert, AutonomyLevel, CallingMode, Config, Urgency } from "./lib/config.ts";
 import { DEFAULTS, readConfig, writeConfig } from "./lib/config.ts";
 import { hasActiveAudio, playSound, stopAllAudio } from "./lib/audio.ts";
-import { AUTONOMY_LABEL, CALLING_MODE_LABEL, detectAutonomyLevel, detectPreference, shouldSuppress as shouldSuppressLib } from "./lib/prefs.ts";
+import { AUTONOMY_LABEL, CALLING_MODE_LABEL, detectAutonomyLevel, detectPreference, isProgressCategory, shouldSuppress as shouldSuppressLib } from "./lib/prefs.ts";
 import { pushPhone, pushWebhook, resolveValue } from "./lib/push.ts";
 import { boostVolume, getSystemVolume, restoreVolume, setSystemVolume, toggleMute } from "./lib/volume.ts";
 import { runCommand, runPowerShellScript } from "./lib/platform.ts";
@@ -94,7 +94,7 @@ function pendingAlerts(): Alert[] {
 
 /** 需要用户处理的行动项（完成/进度等纯告知类不计入“待处理”） */
 function pendingActionAlerts(): Alert[] {
-  return config.alerts.filter((a) => !a.acked && a.category !== "completion" && a.category !== "milestone");
+  return config.alerts.filter((a) => !a.acked && !isProgressCategory(a.category) && a.category !== "completion");
 }
 
 
@@ -527,10 +527,19 @@ async function fireAlert(alert: Alert, ctx: CookingCtx, opts: { forceSound?: boo
   const isMilestone = alert.category === "milestone";
   const forceSound = opts.forceSound ?? false;
 
+  // ── 进度类（milestone / progress）：只推手机 ──
+  // 不响铃 / 不弹窗 / 不进横幅；本地保留一条轻提示（电脑前的人可见），主通道是手机
+  if (isProgressCategory(alert.category)) {
+    if (ctx?.ui) {
+      ctx.ui.notify(`📈 ${isMilestone ? "小阶段完成" : "进度汇报"}（已推手机）：${alert.message}`, "info");
+    }
+    return suppress ? true : await pushAlert(alert);
+  }
+
   // ── widget + TUI notify（无论是否 suppress 都显示）──
   if (ctx?.ui) {
-    const icon = isCompletion ? "✅" : isMilestone ? "📈" : "⚠";
-    const label = isCompletion ? "完成通知" : isMilestone ? "小阶段完成" : `${config.shoutPhrase || "agent 需要你"}！[${alert.urgency}]`;
+    const icon = isCompletion ? "✅" : "⚠";
+    const label = isCompletion ? "完成通知" : `${config.shoutPhrase || "agent 需要你"}！[${alert.urgency}]`;
     ctx.ui.notify(`🍳 ${icon} ${label} ${alert.message}`, suppress ? "info" : "warning");
     updateWidget(ctx);
   }
@@ -540,7 +549,6 @@ async function fireAlert(alert: Alert, ctx: CookingCtx, opts: { forceSound?: boo
   // 三层音频区分：
   //   🚨 需要你  → 完整三段式（beeps + 语音 + 自定义歌曲），最醒目
   //   ✅ 整个完成 → beeps 2 声 + 完成语音（不播歌曲，安静报喜）
-  //   📈 小阶段   → beeps 1 声 + 简短语音（轻声，不打断思路）
   // 声音不阻塞后续通道：fire-and-forget，最长 soundSeconds 秒后自动停
   if (config.sound || config.tts) {
     // 状态栏/横幅：响铃期间显示“正在广播”，播完自动恢复“🍳 离开中”
@@ -548,9 +556,9 @@ async function fireAlert(alert: Alert, ctx: CookingCtx, opts: { forceSound?: boo
     updateStatus(ctx, "shouting");
     updateWidget(ctx);
     const done = () => { shoutingState = false; updateStatus(ctx, "idle"); updateWidget(ctx); };
-    // 三层音频区分：🚨需要你→完整三段式 / ✅完成→2声+完成语音 / 📈小阶段→1声+轻声（都不播自定义歌）
-    const beeps = isMilestone ? (config.milestoneBeeps ?? 1) : isCompletion ? 2 : config.beeps;
-    const playPath = isMilestone || isCompletion ? "" : config.soundPath;
+    // 音频区分：🚨需要你→完整三段式 / ✅完成→2声+完成语音（都不播自定义歌）
+    const beeps = isCompletion ? 2 : config.beeps;
+    const playPath = isCompletion ? "" : config.soundPath;
     void playSound(
       config,
       config.sound ? beeps : 0,
@@ -560,7 +568,7 @@ async function fireAlert(alert: Alert, ctx: CookingCtx, opts: { forceSound?: boo
     ).then(done).catch(done);
   }
   if (config.toast) {
-    const title = isCompletion ? "任务完成" : isMilestone ? "小阶段完成" : config.shoutPhrase || "agent 需要你";
+    const title = isCompletion ? "任务完成" : config.shoutPhrase || "agent 需要你";
     await showNotification(`🍳 ${title}`, `[${alert.urgency}] ${alert.message}`);
   }
 
@@ -645,7 +653,7 @@ function clearRepeatTimers(): void {
 // ── 定时汇报（progressReporting = interval）──────────────────────────────
 let reportTimer: ReturnType<typeof setInterval> | null = null;
 
-/** 启动定时汇报：每 N 分钟给 agent 发"请汇报进度"，agent 响应后汇报到本地+手机 */
+/** 启动定时汇报：每 N 分钟提醒 agent 汇报，agent 用 shout_for_user(category="progress") 推送到手机（不响铃不弹窗） */
 function startReportTimer(ctx: CookingCtx): void {
   stopReportTimer();
   const minutes = Math.max(1, Math.min(120, config.reportIntervalMinutes || 15));
@@ -654,7 +662,8 @@ function startReportTimer(ctx: CookingCtx): void {
     // 上一条汇报（或其他消息）还压在待投递队列里（如 agent 卡在超长工具调用中）→ 跳过本次，避免堆积重复催促
     if (ctx.hasPendingMessages?.()) return;
     const msg = `[定时汇报] 到点了，请汇报当前进度：\n` +
-      `- 已完成什么？\n- 正在做什么？\n- 有无进展（没有新进展就如实说明原因，卡住了就说卡在哪、是否需要用户）`;
+      `- 已完成什么？\n- 正在做什么？\n- 有无进展（没有新进展就如实说明原因，卡住了就说卡在哪、是否需要用户）。\n` +
+      `汇报方式：调用 shout_for_user（category="progress", urgency="info"），内容只会推送到手机（不响铃不弹窗）；任务未完成就会继续收到此提示。`;
     // steer：agent 干活途中在下一次 LLM 调用前投递，不等整个回合结束（followUp 会压队列等到 settle）
     void api.sendUserMessage(msg, { deliverAs: "steer" });
   }, minutes * 60_000);
@@ -678,12 +687,16 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: Co
     const max = config.maxCompletionNotices ?? 3;
     if (completionNoticeCount >= max) return false;
     completionNoticeCount++;
+    stopReportTimer(); // 任务完成：定时汇报不再需要，到此为止
   }
 
-  const dup = config.alerts.find(
-    (a) => !a.acked && a.message === message && Date.now() - a.time < 10 * 60_000,
-  );
-  if (dup) return false;
+  // 进度类（progress/milestone）不参与去重：即使内容相同，每次进度都要推手机
+  if (!isProgressCategory(category)) {
+    const dup = config.alerts.find(
+      (a) => !a.acked && a.message === message && Date.now() - a.time < 10 * 60_000,
+    );
+    if (dup) return false;
+  }
 
   const alert: Alert = {
     id: randomUUID(),
@@ -755,7 +768,7 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
       "② 定时（每15分钟）",
       "③ 不汇报",
     ], {
-      footer: "紧急 / 完成 → 照常声音+弹窗+手机通知",
+      footer: "进度类只推手机（不响铃不弹窗）；紧急 / 完成 → 照常声音+弹窗+手机通知",
     });
     if (pick) {
       if (pick.includes("①")) config.progressReporting = "milestone";
@@ -780,9 +793,9 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
   const level = config.autonomyLevel || "balanced";
   const progressHint =
     config.progressReporting === "milestone"
-      ? `\n小阶段完成提醒已开启：达到重要小节点时，调用 shout_for_user（category="milestone", urgency="info"）轻声通知我。`
+      ? `\n小阶段完成提醒已开启：达到重要小节点时，调用 shout_for_user（category="milestone", urgency="info"）只推送手机通知。`
       : config.progressReporting === "interval"
-        ? `\n定时汇报已开启：每 ${config.reportIntervalMinutes || 15} 分钟，你会收到一条“请汇报当前进度”的消息，届时汇报当前进展（即使没有新进展也要如实说明，卡住了就说卡在哪）。`
+        ? `\n定时汇报已开启：每 ${config.reportIntervalMinutes || 15} 分钟，你会收到一条“请汇报当前进度”的消息，届时调用 shout_for_user（category="progress", urgency="info"）汇报（只推手机，不响铃不弹窗）。即使没有新进展也要如实说明，卡住了就说卡在哪。`
         : "";
   void api.sendUserMessage(
     `[I am cooking] 我离开去做饭了，不在电脑前。${noteText}\n` +
@@ -1170,7 +1183,7 @@ export default function (pi: ExtensionAPI) {
       }),
       urgency: StringEnum(["info", "normal", "urgent"] as const),
       category: Type.Optional(Type.String({
-        description: "分类：decision / credential / approval / clarification / help / completion（全部完成）/ milestone（小阶段完成，仅当用户开启了小阶段提醒时用）等",
+        description: "分类：decision / credential / approval / clarification / help / completion（全部完成）/ progress（定时进度汇报，只推手机不响铃）/ milestone（小阶段完成，只推手机不响铃）等",
       })),
       ttsText: Type.Optional(Type.String({
         description: "可选：想让用户听到的语音原文（TTS 将原样念出，不走默认模板）。例如：\"主人！方案 A 和 B 我拿不准，快回来看看！\" 不填则用默认模板（\"主人，快来！agent 需要你！+消息\"）。",

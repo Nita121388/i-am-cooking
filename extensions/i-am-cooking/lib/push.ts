@@ -23,8 +23,13 @@ export async function pushPhone(cfg: Config, alert: Alert): Promise<boolean> {
   if (!topic) return false;
   const server = (cfg.ntfyServer?.trim() || "https://ntfy.sh").replace(/\/+$/, "");
   const priority = alert.urgency === "urgent" ? 5 : alert.urgency === "normal" ? 3 : 1;
+  // 手机标题按类型区分：进度类/完成/普通呼喊，让你在锁屏上一眼看出是哪类
+  const title =
+    alert.category === "completion" ? "✅ 任务完成"
+    : alert.category === "progress" || alert.category === "milestone" ? "📈 进度"
+    : "[pi] alert!";
   const headers: Record<string, string> = {
-    Title: "[pi] alert!",
+    Title: title,
     Priority: String(priority),
     Tags: "potable_water",
   };
@@ -70,7 +75,10 @@ export async function pushWebhook(cfg: Config, alert: Alert): Promise<boolean> {
       method: "POST",
       headers,
       body: JSON.stringify({
-        title: `🍳 ${cfg.shoutPhrase || "agent 需要你"}！`,
+        title:
+          alert.category === "completion" ? "✅ 任务完成"
+          : alert.category === "progress" || alert.category === "milestone" ? "📈 进度"
+          : `🍳 ${cfg.shoutPhrase || "agent 需要你"}！`,
         message: alert.message,
         urgency: alert.urgency,
         category: alert.category,

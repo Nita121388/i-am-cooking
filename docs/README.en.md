@@ -276,15 +276,15 @@ Stopping **only kills the currently playing audio** — it changes no config, do
 
 > ⚠️ Note: pi's terminal status bar has no mouse click support, so a keyboard shortcut replaces "click to close"; it only affects audio playing in this terminal (each agent stops its own).
 
-**Three messages, three sounds** (know what happened by the sound):
+**Three messages, three channels** (know what happened by the sound/notification):
 
-| Message | Audio | Example |
+| Message | Channel | Example |
 |---|---|---|
-| 🚨 Need you | full 3-stage: 4 beeps + voice + your song (most attention-grabbing) | "need you to decide A or B" |
-| ✅ Whole completion | 2 beeps + completion voice (no song, quiet good news) | "all tasks done!" |
-| 📈 Milestone | 1 beep + short voice (subtle) | "downloaded 3/10 files" |
+| 🚨 Need you | full 3-stage ring: 4 beeps + voice + your song (most attention-grabbing) + toast/banner/phone | "need you to decide A or B" |
+| ✅ Whole completion | 2 beeps + completion voice (no song, quiet good news) + toast/banner/phone | "all tasks done!" |
+| 📈 Progress (milestone / interval) | **phone-push only** (no ring / toast / banner), one lightweight local notice | "downloaded 3/10 files" |
 
-> 📈 **Progress reporting mode (pick one of three)**: each time you manually enter cooking mode it asks "进度汇报" — ① milestone (default, soft ping) / ② interval (every 15 min, even without progress) / ③ none. Urgent/completion notifications are unaffected.
+> 📈 **Progress reporting mode (pick one of three)**: each time you manually enter cooking mode it asks "进度汇报" — ① milestone (default) / ② interval (every 15 min, even without progress) / ③ none. **Progress goes to your phone only** (visible on the lock screen, unobtrusive); urgent/completion are unaffected. **Once a ✅ completion notice arrives, the interval timer stops automatically** — no more progress pings after the task is done.
 
 ## 📱 Phone push setup
 
@@ -349,8 +349,8 @@ and restores the original value **and mute state** on exit (macOS reads both `ou
 |---|---|---|---|
 | Same task completion never repeats | ✅ whole completion | never repeats | fixed |
 | Max completion notices per away period (different tasks) | ✅ whole completion | 3 | `/i-am-cooking limits` |
-| Milestone reminders | 📈 milestone | ① milestone (default, ask on enter) | ask on enter |
-| Interval progress reports | ⏰ progress | off (② → every 15 min) | ask on enter |
+| Milestone reminders | 📈 milestone | ① milestone (default, ask on enter); phone-push only | ask on enter |
+| Interval progress reports | ⏰ progress | off (② → every 15 min); phone-push only; auto-stops after completion | ask on enter |
 | Normal shout repeat | ⚠️ normal shout | **3 minutes** (once) | `/i-am-cooking limits` |
 | Urgent shout repeats | 🚨 urgent shout | **1 minute**, until you return | `/i-am-cooking limits` |
 | Deduplicate same message | all messages | within 10 min | fixed |
