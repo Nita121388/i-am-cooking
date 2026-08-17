@@ -50,7 +50,7 @@ import { CONFIG_DIR, CONFIG_PATH, DEFAULT_RULES_PATH, RULES_PATH, SCRIPTS, TMP_D
 import type { Alert, AutonomyLevel, CallingMode, Config, Urgency } from "./lib/config.ts";
 import { DEFAULTS, readConfig, writeConfig } from "./lib/config.ts";
 import { hasActiveAudio, playSound, stopAllAudio } from "./lib/audio.ts";
-import { AUTONOMY_LABEL, CALLING_MODE_LABEL, detectAutonomyLevel, detectPreference, isProgressCategory, shouldSuppress as shouldSuppressLib } from "./lib/prefs.ts";
+import { AUTONOMY_LABEL, CALLING_MODE_LABEL, detectAutonomyLevel, detectPreference, detectTaskFinale, isProgressCategory, shouldSuppress as shouldSuppressLib } from "./lib/prefs.ts";
 import { pushPhone, pushWebhook, resolveValue } from "./lib/push.ts";
 import { boostVolume, getSystemVolume, restoreVolume, setSystemVolume, toggleMute } from "./lib/volume.ts";
 import { runCommand, runPowerShellScript } from "./lib/platform.ts";
@@ -663,7 +663,8 @@ function startReportTimer(ctx: CookingCtx): void {
     if (ctx.hasPendingMessages?.()) return;
     const msg = `[定时汇报] 到点了，请汇报当前进度：\n` +
       `- 已完成什么？\n- 正在做什么？\n- 有无进展（没有新进展就如实说明原因，卡住了就说卡在哪、是否需要用户）。\n` +
-      `汇报方式：调用 shout_for_user（category="progress", urgency="info"），内容只会推送到手机（不响铃不弹窗）；任务未完成就会继续收到此提示。`;
+      `汇报方式：调用 shout_for_user（category="progress", urgency="info"），内容只会推送到手机（不响铃不弹窗）。\n` +
+      `若任务已全部完成：调用 shout_for_user（category="completion", urgency="info"）收尾（或在总结里明确说明任务结束），进度汇报会随之停止，不要再发进度。`;
     // steer：agent 干活途中在下一次 LLM 调用前投递，不等整个回合结束（followUp 会压队列等到 settle）
     void api.sendUserMessage(msg, { deliverAs: "steer" });
   }, minutes * 60_000);
@@ -686,10 +687,10 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: Co
 
   // completion 防打扰：每次离开最多 maxCompletionNotices 次完成通知
   if (category === "completion") {
+    stopReportTimer(); // 任务完成：定时汇报不再需要，到此为止（即使达到防打扰上限也要停表）
     const max = config.maxCompletionNotices ?? 3;
     if (completionNoticeCount >= max) return "limit";
     completionNoticeCount++;
-    stopReportTimer(); // 任务完成：定时汇报不再需要，到此为止
   }
 
   // 进度类（progress/milestone）不参与去重：即使内容相同，每次进度都要推手机
@@ -1502,9 +1503,9 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  // 自动检测: 回合结束且以"？"结尾 → agent 在等用户 → 自动呼喊（安全网）
+  // 回合收尾检测：定时汇报自动停表 + 自动呼喊安全网（agent 在等用户/报错）
   pi.on("agent_settled", async (_event, ctx) => {
-    if (!config.cooking || !config.autoDetect) return;
+    if (!config.cooking) return;
     try {
       const entries = ctx.sessionManager.getEntries();
       let lastAssistant: { text: string; stopReason?: string } | undefined;
@@ -1525,6 +1526,14 @@ export default function (pi: ExtensionAPI) {
 
       if (!lastAssistant || trailingWork) return;
       const text = lastAssistant.text;
+
+      // 定时汇报自动停表：agent 最后一句表明任务已全部收尾 → 不再要求进度汇报
+      // （不依赖 agent 主动调 completion；保守匹配避免把"已完成：X"式进度措辞误判为收尾）
+      if (config.progressReporting === "interval" && detectTaskFinale(text)) {
+        stopReportTimer();
+      }
+
+      if (!config.autoDetect) return;
 
       // 回合报错 → 需要用户看一眼（任何等级都喊）
       if (lastAssistant.stopReason === "error") {

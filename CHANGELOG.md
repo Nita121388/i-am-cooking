@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 - **shout_for_user 被模式拦截时不误报“去重”**：queueAlert 返回值从 boolean 改为区分原因（duplicate / mode-off / limit / not-cooking），工具返回错误文案对应区分——非 milestone 模式下调 milestone 会明确提示“当前进度模式不支持”，不再误说“已有同内容不重复发送”。
+- **定时汇报任务完成后不再一直催**：interval 模式下，agent 回合收尾时若明确表示任务已全部完成（如“任务全部完成 / 收工 / done”），系统自动停掉定时汇报（detectTaskFinale 保守匹配，排除“已完成：X”式进度措辞与否定表述），不再继续要求进度——不依赖 agent 主动调 completion；[定时汇报] 提示文案同步引导 agent 收尾时调用 completion；completion 即使达到防打扰上限也停表。
 
 ### Docs
 - **rules.default.md「呼喊交接」补充喊后行为**：被卡住的事已交接，其他独立工作照常推进；「进度汇报」补一句“喊完继续干活，不要停”。

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   detectPreference,
   detectAutonomyLevel,
+  detectTaskFinale,
   isProgressCategory,
   shouldSuppress,
 } from "../extensions/i-am-cooking/lib/prefs.ts";
@@ -76,4 +77,21 @@ test("shouldSuppress 对进度类：normal/eager 推手机，silence/completion_
   assert.equal(shouldSuppress("silence", progress), true);
   assert.equal(shouldSuppress("completion_only", progress), true);
   assert.equal(shouldSuppress("urgent_only", progress), true);
+});
+
+test("detectTaskFinale 识别任务收尾（定时汇报自动停表用）", () => {
+  // 命中：明确全部完成
+  assert.ok(detectTaskFinale("任务已全部完成"));
+  assert.ok(detectTaskFinale("任务完成"));
+  assert.ok(detectTaskFinale("全部搞定"));
+  assert.ok(detectTaskFinale("所有阶段都完成了"));
+  assert.ok(detectTaskFinale("已完成全部功能，收工"));
+  assert.ok(detectTaskFinale("The task is done."));
+  // 不命中：进度措辞 / 否定表述 / 部分完成
+  assert.equal(detectTaskFinale("阶段 2 完成，继续阶段 3"), false);
+  assert.equal(detectTaskFinale("已完成：X，正在做 Y"), false);
+  assert.equal(detectTaskFinale("任务未完成"), false);
+  assert.equal(detectTaskFinale("还有任务没完成"), false);
+  assert.equal(detectTaskFinale("任务完成了一半"), false);
+  assert.equal(detectTaskFinale("完成 2/4 阶段"), false);
 });

@@ -93,6 +93,19 @@ export function detectAutonomyLevel(text: string): AutonomyLevel | null {
   return null;
 }
 
+// ── 定时汇报自动收尾检测（interval 模式：任务收尾即停表）────────────────
+// agent 回合最后一句话表明"任务已全部收尾"时停掉定时汇报——不依赖 agent 主动调 completion。
+// 保守匹配：必须有 任务/全部/整体 等前缀才命中，避免把进度措辞（已完成：X）当收尾；
+// 否定表述（未完成 / 还没完成 / 完成了一半）不触发。
+const TASK_NOT_DONE_RE = /(未|没有|还没|尚未|没).{0,8}(完成|搞定|结束|收工)|(完成|搞定|结束|收工).{0,8}(未|没有|还没|尚未|不)|(完成|搞定|结束).{0,4}(一半|部分)/;
+const TASK_DONE_RE = /(任务|全部|整体|所有|整个|一切).{0,10}(已?全部)?(完成|搞定|结束|收工)|(已完成全部|任务完成|都完成|全部到位|\b(all\s+)?done\b|\btask\s+complete\b)/i;
+
+/** 文本是否表明任务已全部收尾（定时汇报自动停表用） */
+export function detectTaskFinale(text: string): boolean {
+  if (TASK_NOT_DONE_RE.test(text)) return false;
+  return TASK_DONE_RE.test(text);
+}
+
 /**
  * 进度类 category：小阶段完成（milestone）/ 定时进度汇报（progress）。
  * 通道策略：只推手机（不响铃 / 不弹窗 / 不进横幅），本地仅留轻提示。
