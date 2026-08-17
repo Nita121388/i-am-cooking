@@ -49,3 +49,12 @@ test("AUTONOMY_GUIDE 覆盖全部三个等级", () => {
   assert.ok(AUTONOMY_GUIDE.balanced.includes("平衡"));
   assert.ok(AUTONOMY_GUIDE.autonomous.includes("放手"));
 });
+
+test("buildRulesPrompt 机制提示反映当前进度模式", async () => {
+  const milestone = await buildRulesPrompt("balanced", "milestone");
+  assert.ok(milestone.includes("当前进度汇报模式：小阶段（milestone）"));
+  const interval = await buildRulesPrompt("balanced", "interval");
+  assert.ok(interval.includes("当前进度汇报模式：定时（interval）"));
+  const none = await buildRulesPrompt("balanced", "none");
+  assert.ok(none.includes("当前进度汇报模式：关闭（none）"));
+});

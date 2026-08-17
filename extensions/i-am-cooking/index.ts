@@ -674,18 +674,20 @@ function stopReportTimer(): void {
   if (reportTimer) { clearInterval(reportTimer); reportTimer = null; }
 }
 
-function queueAlert(message: string, urgency: Urgency, category: string, ctx: CookingCtx, ttsText?: string): boolean {
-  if (!config.cooking) return false;
+type QueueResult = "queued" | "not-cooking" | "mode-off" | "limit" | "duplicate";
+
+function queueAlert(message: string, urgency: Urgency, category: string, ctx: CookingCtx, ttsText?: string): QueueResult {
+  if (!config.cooking) return "not-cooking";
 
   // milestone（小阶段完成）仅在 progressReporting = milestone 模式提醒；interval/none 忽略
   if (category === "milestone") {
-    if (config.progressReporting !== "milestone") return false;
+    if (config.progressReporting !== "milestone") return "mode-off";
   }
 
   // completion 防打扰：每次离开最多 maxCompletionNotices 次完成通知
   if (category === "completion") {
     const max = config.maxCompletionNotices ?? 3;
-    if (completionNoticeCount >= max) return false;
+    if (completionNoticeCount >= max) return "limit";
     completionNoticeCount++;
     stopReportTimer(); // 任务完成：定时汇报不再需要，到此为止
   }
@@ -695,7 +697,7 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: Co
     const dup = config.alerts.find(
       (a) => !a.acked && a.message === message && Date.now() - a.time < 10 * 60_000,
     );
-    if (dup) return false;
+    if (dup) return "duplicate";
   }
 
   const alert: Alert = {
@@ -712,7 +714,7 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: Co
   void writeConfig(config);
   void fireAlert(alert, ctx);
   scheduleRepeats(alert, ctx);
-  return true;
+  return "queued";
 }
 
 // ── mode control ─────────────────────────────────────────────────────────
@@ -1201,18 +1203,25 @@ export default function (pi: ExtensionAPI) {
           details: { fired: false },
         };
       }
-      const queued = queueAlert(params.message, params.urgency, params.category ?? "other", ctx, params.ttsText);
       const cat = params.category ?? "other";
+      const result = queueAlert(params.message, params.urgency, cat, ctx, params.ttsText);
       const statusLine = isProgressCategory(cat)
         ? "进度类只推手机（不响铃不弹窗）。"
         : cat === "completion"
           ? "任务完成通知已送达（响铃/推送）。"
           : "等待用户回来处理。";
+      const sentText = result === "queued"
+        ? `呼喊已发出（${params.urgency}）${params.ttsText ? `，语音：${params.ttsText}` : ""}。${statusLine}`
+        : result === "duplicate"
+          ? "已有同内容的未确认呼喊，不重复发送。"
+          : result === "mode-off"
+            ? "当前进度模式不支持小阶段汇报（milestone）。进度模式以开启时的提示为准，本次忽略。"
+            : result === "limit"
+              ? "本次离开的完成通知已达上限（防打扰），不再发送。"
+              : "";
       return {
-        content: [{ type: "text", text: queued
-          ? `呼喊已发出（${params.urgency}）${params.ttsText ? `，语音：${params.ttsText}` : ""}。${statusLine}`
-          : "已有同内容的未确认呼喊，不重复发送。" }],
-        details: { fired: queued, urgency: params.urgency, category: params.category ?? "other", ttsText: params.ttsText ?? null },
+        content: [{ type: "text", text: sentText }],
+        details: { fired: result === "queued", urgency: params.urgency, category: cat, ttsText: params.ttsText ?? null },
       };
     },
   });
@@ -1489,7 +1498,7 @@ export default function (pi: ExtensionAPI) {
     if (!config.cooking) return;
     const base = event.systemPrompt.endsWith("\n") ? event.systemPrompt : event.systemPrompt + "\n";
     return {
-      systemPrompt: base + (await buildRulesPrompt(config.autonomyLevel || "balanced")),
+      systemPrompt: base + (await buildRulesPrompt(config.autonomyLevel || "balanced", config.progressReporting || "milestone")),
     };
   });
 

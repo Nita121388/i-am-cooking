@@ -73,7 +73,7 @@ export async function loadRules(rulesPath = RULES_PATH): Promise<string> {
 }
 
 /** 组装注入 system prompt 的规则文本（生效规则 + 自主等级指南 + 机制提示 + 底线） */
-export async function buildRulesPrompt(level: AutonomyLevel, rulesPath = RULES_PATH): Promise<string> {
+export async function buildRulesPrompt(level: AutonomyLevel, progressReporting: "milestone" | "interval" | "none" = "milestone", rulesPath = RULES_PATH): Promise<string> {
   const rules = await loadRules(rulesPath);
   // 每个区块之间用 \n\n 分隔，末尾保留 \n 防止与后续文本粘连
   return (
@@ -86,8 +86,9 @@ export async function buildRulesPrompt(level: AutonomyLevel, rulesPath = RULES_P
     `## 自主等级指南（当前等级：${level}，由机制控制，用户可在 rules 之外单独设置）\n${AUTONOMY_GUIDE[level]}\n\n` +
 
     `## 机制提示\n` +
-    `- 用户明确表达偏好时（如“别喊了”“完成后喊我”“只有紧急才找我”“随时汇报”），调用 set_calling_preference 调整呼喊方式。\n` +
-    `- 用户明确表达自主程度时（如“拿不准就问我”→谨慎 / “能不喊就不喊”→放手），调用 set_autonomy_level 调整自主等级。\n\n` +
+    `- 当前进度汇报模式：${progressReporting === "milestone" ? "小阶段（milestone）" : progressReporting === "interval" ? "定时（interval）" : "关闭（none）"}——由本次离开开启时的选择决定，规则文件中两种模式只生效当前一种。\n` +
+    `- 用户明确表达偏好时（如"别喊了""完成后喊我""只有紧急才找我""随时汇报"），调用 set_calling_preference 调整呼喊方式。\n` +
+    `- 用户明确表达自主程度时（如"拿不准就问我"→谨慎 / "能不喊就不喊"→放手），调用 set_autonomy_level 调整自主等级。\n\n` +
 
     `## 底线规则（系统强制，无法从规则文件删除）\n${GUARD_RAIL}\n` +
     `---\n`  // ── 后置分隔符：标记注入区域结束 ──

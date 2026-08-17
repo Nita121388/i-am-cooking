@@ -16,6 +16,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **完成后不再定时汇报**：收到 ✅ 完成通知时自动停掉定时汇报 timer，任务完成后不再继续刷进度。
 - **进度类不去重**：`progress`/`milestone` 跳过 10 分钟同内容去重——即使两次进度内容相同也要每次都推（如连续“无新进展”）。
 
+## [0.7.0] - 2026-08-16
+
+### Changed
+- **进度汇报规则段重写（规则文件 → system prompt 讲清楚定位）**：明确三类呼喊的分工（阻塞=响铃等用户 / 完成=响铃报喜 / 进度=只推手机），说明两种进度模式（小阶段 agent 自驱 / 定时系统自驱）互斥且二选一，给出里程碑“值得报/不值得报”的判断标准，并提示进度无去重保护、同一阶段报一次即可、完成通知后自动停止。
+- **完成通知边界收敛**：只有任务全部完成、可验收时才发 completion；中途关键进展改用 milestone（只推手机）或阻塞呼喊，消除“重要里程碑 vs 重要小节点”的模糊地带。
+- **system prompt 显式标注当前进度模式**：`buildRulesPrompt` 增加进度模式参数，`before_agent_start` 注入时把本次离开的模式（小阶段/定时/关闭）写进机制提示，agent 不再靠猜。
+
+### Fixed
+- **shout_for_user 被模式拦截时不误报“去重”**：queueAlert 返回值从 boolean 改为区分原因（duplicate / mode-off / limit / not-cooking），工具返回错误文案对应区分——非 milestone 模式下调 milestone 会明确提示“当前进度模式不支持”，不再误说“已有同内容不重复发送”。
+
+### Tests
+- 新增 buildRulesPrompt 机制提示反映当前进度模式的测试。
+
 ## [0.6.0] - 2026-08-16
 
 ### Changed
