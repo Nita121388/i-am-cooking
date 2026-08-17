@@ -353,7 +353,7 @@ async function cmdVolume(ctx: CookingCtx): Promise<void> {
 
 // 子命令注册表（handler 只做分发，具体逻辑见上面各函数）
 const commandHandlers: Record<string, (ctx: CookingCtx, fullArg: string) => Promise<void> | void> = {
-  off: (ctx) => { turnOff(ctx); },
+  off: (ctx) => { turnOff(ctx, "command"); },
   status: (ctx) => { showStatus(ctx); },
   setup: async (ctx) => { await setupWizard(ctx); },
   test: async (ctx) => { await testShout(ctx); },
@@ -814,7 +814,7 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
   );
 }
 
-function turnOff(ctx: CookingCtx): void {
+function turnOff(ctx: CookingCtx, source: "command" | "tool" = "command"): void {
   clearRepeatTimers();
   stopAudioAll(); // 关闭离开：立即停止正在播放的音频
   const pending = pendingAlerts();
@@ -829,8 +829,17 @@ function turnOff(ctx: CookingCtx): void {
   // 恢复音量
   void restoreVolume();
 
-  // 不再给 agent 发“请汇报喊了什么”的 followUp：agent 结束时会自己汇报进度，
-  // 关闭就是关闭。给用户本地一条轻提示即可（不发给 agent）。
+  // 手动 /off 关闭时 agent 不知情（它的上下文仍是"离开中"，还会继续定时汇报等离开模式行为）
+  // → 发一条明确消息告知回到在线状态。exit_cooking_mode 工具路径已在工具返回文案里告知，不重复发。
+  if (source === "command") {
+    void api.sendUserMessage(
+      `[I am cooking] 离开模式已关闭，你已回到在线状态：离开模式规则不再生效` +
+      `（不再有定时汇报 / 自主等级指南 / 呼喊工具调用），请停止一切离开模式行为，` +
+      `按正常方式继续任务，在本会话直接汇报即可。`,
+      { deliverAs: "steer" },
+    );
+  }
+
   ctx.ui.notify(
     pending.length
       ? `🍳 离开模式已关闭（离开期间喊了你 ${pending.length} 次，内容见对话记录）。`
@@ -1463,9 +1472,9 @@ export default function (pi: ExtensionAPI) {
           details: { closed: false, alreadyOff: true },
         };
       }
-      turnOff(ctx);
+      turnOff(ctx, "tool");
       return {
-        content: [{ type: "text", text: `已关闭离开模式（依据：${params.reason}）。无需汇报——结束时会自行总结。` }],
+        content: [{ type: "text", text: `已关闭离开模式（依据：${params.reason}）。你已回到在线状态，离开模式规则不再生效；无需汇报——结束时会自行总结。` }],
         details: { closed: true, reason: params.reason },
       };
     },

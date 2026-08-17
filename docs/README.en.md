@@ -27,7 +27,7 @@ _"Agent 需要你！" (Agent needs you!)_
 | 🚀 Autonomy levels | how much the agent should call you when blocked: `conservative` (shout on any human wall) / `balanced` (default) / `autonomous` (avoid shouting) |
 | 🤝 Multi-agent independence | with multiple pi's away at once: each is fully independent — only one plays sound at a time; closing one does not affect others |
 | 🛡️ Safety net | if the agent ends its turn with a question while you're away, it auto-shouts (under `autonomous` level, only errors shout) |
-| 🔙 Semantic exit | say "我不离开了/保持在线" → agent understands and exits; or manual `/i-am-cooking off` |
+| 🔙 Semantic exit | say "我不离开了/保持在线" → agent understands and exits; or manual `/i-am-cooking off` (closing immediately tells the agent it is back online, stopping away-mode behavior) |
 | 🔊 Volume boost | opt-in: auto-raise system volume when you leave, restore when you return (mute state included) |
 | 🗣️ Setup wizard | `/i-am-cooking setup` — guided, with ntfy explainer, auto-random topic, preview-then-confirm |
 | 🔐 Token security | token fields support `${ENV_VAR}` so secrets never hit disk |
@@ -86,7 +86,7 @@ Reload pi (`/reload`) after installing.
 /i-am-cooking setup                     # ① configure phone push (guided wizard)
 /i-am-cooking test                      # ② test all channels
 /i-am-cooking on 继续做登录模块           # ③ enter cooking mode, then leave
-/i-am-cooking off                       # ④ I'm back
+/i-am-cooking off                       # ④ I'm back (closing tells the agent it is back online)
 /i-am-cooking status                    # view mode / pending shouts / channels / preference
 ```
 
@@ -101,7 +101,7 @@ Reload pi (`/reload`) after installing.
 | Command | Description | Example |
 |---|---|---|
 | `/i-am-cooking on [note]` | Enter cooking mode. Note can carry preferences & autonomy level | `on 完成后喊我` / `on 谨慎点继续调研` |
-| `/i-am-cooking off` | Leave cooking mode (close only, no debrief — the agent summarizes when it finishes) | `off` |
+| `/i-am-cooking off` | Leave cooking mode (immediately tells the agent it is back online and to stop away-mode behavior; the agent summarizes when it finishes) | `off` |
 | `/i-am-cooking status` | Mode, pending shouts, channels, volume, preferences, level, anti-noise params | `status` |
 | `/i-am-cooking setup` | Interactive wizard: phone push + volume + autonomy level | `setup` |
 | `/i-am-cooking test` | Test all channels, per-channel real result | `test` |

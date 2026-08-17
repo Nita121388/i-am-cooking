@@ -24,7 +24,7 @@
 | 🚀 自主等级 | 该不该喊你的阈值：谨慎(遇墙就喊) / 平衡(默认) / 放手(能不喊就不喊) |
 | 🤝 多 Agent 独立 | 多个 pi 同时离开时互不干扰：同一时刻只放一个声音；关闭某个 Agent 不影响其他 |
 | 🛡️ 安全网 | agent 以"？"结尾等你回复时自动喊（放手等级下仅报错才喊） |
-| 🔙 语义退出 | 说"我不离开了/保持在线"→ agent 理解后关闭；或手动 `/i-am-cooking off` |
+| 🔙 语义退出 | 说"我不离开了/保持在线"→ agent 理解后关闭；或手动 `/i-am-cooking off`（关闭即告知 agent 回到在线状态，停止离开模式行为） |
 | 🔊 音量控制 | 可选：离开时自动拉高音量（含解除静音），回来恢复原值 |
 | 🗣️ 交互式配置 | `/i-am-cooking setup` — 向导式，含 ntfy 引导 + 预览确认 + 配错可重填 |
 | 🔐 Token 安全 | 配置值支持 `${ENV_VAR}`，token 不落盘明文 |
@@ -80,7 +80,7 @@ pi install /path/to/your/local/checkout
 /i-am-cooking setup                     # ① 配置手机推送（交互式向导）
 /i-am-cooking test                      # ② 测试所有通道（声音/TTS/弹窗/手机）
 /i-am-cooking on 继续做登录模块          # ③ 开启离开模式，走人
-/i-am-cooking off                       # ④ 结束离开模式（关闭即关闭，无需 agent 汇报）
+/i-am-cooking off                       # ④ 结束离开模式（关闭即告知 agent 回到在线状态）
 /i-am-cooking status                    # 查看状态
 ```
 
@@ -95,7 +95,7 @@ pi install /path/to/your/local/checkout
 | 命令 | 说明 | 示例 |
 |---|---|---|
 | `/i-am-cooking on [备注]` | 开启离开模式。备注可带偏好和自主等级 | `on 完成后喊我` / `on 谨慎点继续调研` |
-| `/i-am-cooking off` | 关闭离开模式（只关闭，不发汇报——agent 结束时会自行总结） | `off` |
+| `/i-am-cooking off` | 关闭离开模式（立即告知 agent 回到在线状态、停止离开模式行为；agent 结束时会自行总结） | `off` |
 | `/i-am-cooking status` | 查看模式/待处理呼喊/通道/音量/偏好/等级/防打扰参数 | `status` |
 | `/i-am-cooking setup` | 交互式配置向导（手机推送 + 音量 + 自主等级） | `setup` |
 | `/i-am-cooking test` | 测试所有通道，逐通道汇报真实结果 | `test` |
