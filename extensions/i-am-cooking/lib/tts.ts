@@ -24,7 +24,7 @@ export function renderTts(config: TtsConfig, alert: TtsAlert): string {
     alert.category === "milestone"
       ? (config.ttsTemplateMilestone || "小进展：{message}")
       : alert.category === "completion"
-        ? (config.ttsTemplateCompletion || "主人，好消息！任务完成了！{message}")
+        ? (config.ttsTemplateCompletion || "叮咚！好消息！任务完成了！{message}")
         : config.ttsTemplate;
   return template
     .replaceAll("{shoutPhrase}", config.shoutPhrase || "agent 需要你")

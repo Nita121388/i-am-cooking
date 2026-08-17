@@ -281,7 +281,7 @@ async function cmdSound(ctx: CookingCtx): Promise<void> {
       config,
       config.sound ? config.beeps : 0,
       config.sound ? config.soundPath : "",
-      config.tts ? `主人，这是测试语音！${config.shoutPhrase || "agent 需要你"}！` : "",
+      config.tts ? `叮咚，这是测试语音！${config.shoutPhrase || "agent 需要你"}！` : "",
       { force: true },
     );
     return;
@@ -1191,7 +1191,7 @@ export default function (pi: ExtensionAPI) {
         description: "分类：decision / credential / approval / clarification / help / completion（全部完成）/ progress（定时进度汇报，只推手机不响铃）/ milestone（小阶段完成，只推手机不响铃）等",
       })),
       ttsText: Type.Optional(Type.String({
-        description: "可选：想让用户听到的语音原文（TTS 将原样念出，不走默认模板）。例如：\"主人！方案 A 和 B 我拿不准，快回来看看！\" 不填则用默认模板（\"主人，快来！agent 需要你！+消息\"）。",
+        description: "可选：想让用户听到的语音原文（TTS 将原样念出，不走默认模板）。例如：\"叮咚！方案 A 和 B 我拿不准，快回来看看！\" 不填则用默认模板（\"叮咚！agent 需要你！+消息\"）。",
       })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1483,11 +1483,13 @@ export default function (pi: ExtensionAPI) {
     await writeConfig(config);
   });
 
-  // 离开模式时，每回合注入自主推进规则
+  // 离开模式时，每回合注入自主推进规则（buildRulesPrompt 开头有 \n\n--- 强分隔符；
+  // 这里额外保证 base prompt 末尾有 \n，双重保险避免粘连）
   pi.on("before_agent_start", async (event, _ctx) => {
     if (!config.cooking) return;
+    const base = event.systemPrompt.endsWith("\n") ? event.systemPrompt : event.systemPrompt + "\n";
     return {
-      systemPrompt: event.systemPrompt + (await buildRulesPrompt(config.autonomyLevel || "balanced")),
+      systemPrompt: base + (await buildRulesPrompt(config.autonomyLevel || "balanced")),
     };
   });
 

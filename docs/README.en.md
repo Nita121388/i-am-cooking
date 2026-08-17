@@ -20,7 +20,7 @@ _"Agent 需要你！" (Agent needs you!)_
 | 🎵 Custom ringtone | 3-stage playback: short beeps → agent voice → **your own song** (`/i-am-cooking sound`), auto-stops after a total budget |
 | 🗣️ Agent free speech | when shouting, the agent can speak exactly what it wants (`ttsText`), not just the default template |
 | 📱 Phone push | ntfy.sh (free, zero-config) — the key channel when you're in the kitchen |
-| 🔔 Completion alerts | agent notifies you when the task is done: "主人，好消息！任务完成了！" |
+| 🔔 Completion alerts | agent notifies you when the task is done: "叮咚！好消息！任务完成了！" |
 | 🗣️ Custom shout phrase | default "agent 需要你", fully customizable (with placeholder) |
 | 🎭 Cute Topic names | auto-generated programming/algorithm-style names (e.g. "幻觉的提示词-483726"), guaranteed unique |
 | 🎛️ Dynamic preferences | agent adjusts alert mode from your words: "别喊了" → silence, "完成后喊我" → completion only, "随时汇报" → eager… |
@@ -247,7 +247,7 @@ You can also just tell the agent "帮我换个铃声" with a path — it calls t
 | Stage | Description |
 |---|---|
 | ① Short beeps | system beeps (default 4) |
-| ② Agent voice | Chinese TTS. The agent can pass `ttsText` to `shout_for_user` to **speak exactly what it wants** (e.g. "主人！方案 A 和 B 我拿不准，快回来看看！"); otherwise the default template is used |
+| ② Agent voice | Chinese TTS. The agent can pass `ttsText` to `shout_for_user` to **speak exactly what it wants** (e.g. "叮咚！方案 A 和 B 我拿不准，快回来看看！"); otherwise the default template is used |
 | ③ Custom song | your audio file (macOS: mp3/wav/m4a; Linux: wav/ogg; Windows: wav recommended) |
 | ⏱ Total duration | default 60 s, force-stopped at the limit, adjustable (1–300 s) |
 
@@ -376,7 +376,7 @@ The "agent 需要你" in all shout copy (TTS / toast / push / banner) can be cha
 { "shoutPhrase": "快来救我" }
 ```
 
-TTS templates use the `{shoutPhrase}` placeholder (default `主人，快来！{shoutPhrase}！{message}`) — change once, applies everywhere.
+TTS templates use the `{shoutPhrase}` placeholder (default `叮咚！{shoutPhrase}！{message}`) — change once, applies everywhere.
 
 ## 🖥️ Platform support
 

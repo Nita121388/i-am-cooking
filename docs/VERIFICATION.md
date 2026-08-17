@@ -16,7 +16,7 @@
 - [ ] `/i-am-cooking on 完成后喊我` → preference becomes `completion_only` (only completions ring)
 - [ ] Typing "别喊了" while away → preference becomes `silence` (banner only, no sounds)
 - [ ] `set_calling_preference` tool switches modes (simulate via agent)
-- [ ] `completion` category shout → "主人，好消息！" TTS, ✅ icon, no repeat
+- [ ] `completion` category shout → "叮咚！好消息！" TTS, ✅ icon, no repeat
 - [ ] `maxCompletionNotices` cap works (3 per session)
 - [ ] `/i-am-cooking level autonomous` → agent_settled no longer shouts on "？" questions (errors still shout)
 - [ ] Saying "我离开一下" / "I'm cooking" → agent calls `enter_cooking_mode` and enters away-mode

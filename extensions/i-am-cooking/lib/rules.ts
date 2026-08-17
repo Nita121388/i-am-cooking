@@ -7,7 +7,7 @@ import type { AutonomyLevel } from "./config.ts";
 import { CONFIG_DIR, DEFAULT_RULES_PATH, RULES_PATH } from "./config.ts";
 
 // 底线规则（不可删除，永远追加在用户规则后面）
-export const GUARD_RAIL = "- 绝不要默默结束回合等用户回复。";
+export const GUARD_RAIL = "- 要么遇到阻塞呼喊后暂停，要么完成，绝不要默默结束回合等用户回复。";
 
 // ── 自主等级指南（按当前等级动态注入 system prompt） ───────────────────────
 export const AUTONOMY_GUIDE: Record<AutonomyLevel, string> = {
@@ -75,12 +75,22 @@ export async function loadRules(rulesPath = RULES_PATH): Promise<string> {
 /** 组装注入 system prompt 的规则文本（生效规则 + 自主等级指南 + 机制提示 + 底线） */
 export async function buildRulesPrompt(level: AutonomyLevel, rulesPath = RULES_PATH): Promise<string> {
   const rules = await loadRules(rulesPath);
+  // 每个区块之间用 \n\n 分隔，末尾保留 \n 防止与后续文本粘连
   return (
-    `\n\n[IAM COOKING MODE] 用户不在电脑前（去做饭了）。\n\n` +
-    `[生效规则（来自 ${rulesPath}，首次创建时以出厂默认填充，之后完全由你接管）]\n${rules}\n\n` +
-    `[自主等级指南（当前等级：${level}，由机制控制，用户可在 rules 之外单独设置）]\n${AUTONOMY_GUIDE[level]}\n\n` +
-    `[机制提示]\n- 用户明确表达偏好时（如"别喊了""完成后喊我""只有紧急才找我""随时汇报"），调用 set_calling_preference 调整呼喊方式。\n- 用户明确表达自主程度时（如"拿不准就问我"→谨慎 / "能不喊就不喊"→放手），调用 set_autonomy_level 调整自主等级。\n\n` +
-    `[底线规则（系统强制，无法从规则文件删除）]\n${GUARD_RAIL}`
+    // ── 前置强分隔符：无论 systemPrompt 末尾是什么内容，\n\n--- 能断开上文 ──
+    `\n\n---\n` +
+    `# [IAM COOKING MODE] 用户不在电脑前（去做饭了）\n\n` +
+
+    `## 生效规则（来自 ${rulesPath}，首次创建时以出厂默认填充，之后完全由你接管）\n${rules}\n\n` +
+
+    `## 自主等级指南（当前等级：${level}，由机制控制，用户可在 rules 之外单独设置）\n${AUTONOMY_GUIDE[level]}\n\n` +
+
+    `## 机制提示\n` +
+    `- 用户明确表达偏好时（如“别喊了”“完成后喊我”“只有紧急才找我”“随时汇报”），调用 set_calling_preference 调整呼喊方式。\n` +
+    `- 用户明确表达自主程度时（如“拿不准就问我”→谨慎 / “能不喊就不喊”→放手），调用 set_autonomy_level 调整自主等级。\n\n` +
+
+    `## 底线规则（系统强制，无法从规则文件删除）\n${GUARD_RAIL}\n` +
+    `---\n`  // ── 后置分隔符：标记注入区域结束 ──
   );
 }
 

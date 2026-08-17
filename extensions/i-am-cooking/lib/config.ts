@@ -90,7 +90,7 @@ export const DEFAULTS: Config = {
   soundPath: "",
   soundSeconds: 60,
   tts: true,
-  ttsTemplate: "主人，快来！{shoutPhrase}！{message}",
+  ttsTemplate: "叮咚！快来！{shoutPhrase}！{message}",
   shoutPhrase: "agent 需要你",
   toast: true,
   tuiBanner: true,
@@ -112,7 +112,7 @@ export const DEFAULTS: Config = {
   callingMode: "normal",
   autonomyLevel: "balanced", // 默认：有点难度才喊
   maxCompletionNotices: 3,
-  ttsTemplateCompletion: "主人，好消息！任务完成了！{message}",
+  ttsTemplateCompletion: "叮咚！好消息！任务完成了！{message}",
   progressReporting: "milestone", // 默认：小阶段完成时汇报
   reportIntervalMinutes: 15,
   ttsTemplateMilestone: "小进展：{message}",
