@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.8.0] - 2026-08-22
+
+### Added
+- **milestone 模式接入进度心跳（治“进度汇报被遗忘”）**：小阶段模式此前完全依赖 system prompt 静态规则，长回合中指令显著性衰减，agent 经常忘记主动报 milestone。现在与 interval 模式共用同一个进度心跳定时器：每 N 分钟发一条单行 `[milestone check]` 自查提醒——有值得报的小阶段就 `shout_for_user(category="milestone")` 只推手机，没有就忽略提醒本身。
+- **心跳只在回合进行中触发**：新增 `agentActive` 标记（`before_agent_start` 置 true / `agent_settled` 置 false），回合结束（等用户 / 已收尾）时心跳自动暂停，新回合开始自动恢复——顺带修了 agent 停着等用户时也会收到进度提醒的旧问题。
+
+### Fixed
+- **任务收尾后心跳不再空转（对两种进度模式生效）**：`detectTaskFinale` 自动停表从仅 interval 放宽为所有进度模式；即使收尾正则漏判（agent 换了种说法说“做完了”），回合结束本身也会让心跳暂停。停表现在有三重保险：completion 调用 / 收尾措辞 / 回合自然结束，任一先到即停。
+
+### Docs
+- rules.default.md 小阶段模式补充自查提醒说明（无内容忽略、任务收尾自动停止）；milestone 开启提示语同步更新。
+
 ## [0.7.0] - 2026-08-17
 
 ### Changed

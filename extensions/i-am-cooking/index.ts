@@ -650,21 +650,32 @@ function clearRepeatTimers(): void {
   repeatTimers = [];
 }
 
-// ── 定时汇报（progressReporting = interval）──────────────────────────────
+// ── 进度心跳（interval=定时汇报 / milestone=小阶段自查），两种模式共用一套启停 ──
 let reportTimer: ReturnType<typeof setInterval> | null = null;
+/** 回合是否进行中：before_agent_start 置 true，agent_settled 置 false。
+ *  心跳只在回合进行中触发——回合结束（含任务收尾正则漏判的情况）自然停催，新回合自动恢复。 */
+let agentActive = false;
 
-/** 启动定时汇报：每 N 分钟提醒 agent 汇报，agent 用 shout_for_user(category="progress") 推送到手机（不响铃不弹窗） */
+/** 启动进度心跳：每 N 分钟给 agent 注入一条提醒（steer，只推手机不响铃）。
+ *  - interval 模式：三问定时汇报（category="progress"）
+ *  - milestone 模式：单行自查，有无值得报的小阶段（category="milestone"） */
 function startReportTimer(ctx: CookingCtx): void {
   stopReportTimer();
   const minutes = Math.max(1, Math.min(120, config.reportIntervalMinutes || 15));
   reportTimer = setInterval(() => {
     if (!config.cooking) return;
+    // 回合已结束（等用户 / 已收尾）→ 无进度可报，跳过；下次回合开始自动恢复
+    if (!agentActive) return;
     // 上一条汇报（或其他消息）还压在待投递队列里（如 agent 卡在超长工具调用中）→ 跳过本次，避免堆积重复催促
     if (ctx.hasPendingMessages?.()) return;
-    const msg = `[定时汇报] 到点了，请汇报当前进度：\n` +
-      `- 已完成什么？\n- 正在做什么？\n- 有无进展（没有新进展就如实说明原因，卡住了就说卡在哪、是否需要用户）。\n` +
-      `汇报方式：调用 shout_for_user（category="progress", urgency="info"），内容只会推送到手机（不响铃不弹窗）。\n` +
-      `若任务已全部完成：调用 shout_for_user（category="completion", urgency="info"）收尾（或在总结里明确说明任务结束），进度汇报会随之停止，不要再发进度。`;
+    const msg = config.progressReporting === "milestone"
+      ? `[milestone check] 一句话自查：当前是否有值得让用户知道的小阶段？\n` +
+        `有 → 调用 shout_for_user（category="milestone", urgency="info"）只推手机；没有 → 忽略本条，不要回复提醒本身。\n` +
+        `若任务已全部完成：调用 shout_for_user（category="completion", urgency="info"）收尾（或在总结里明确说明任务结束），本提醒会随之停止。`
+      : `[定时汇报] 到点了，请汇报当前进度：\n` +
+        `- 已完成什么？\n- 正在做什么？\n- 有无进展（没有新进展就如实说明原因，卡住了就说卡在哪、是否需要用户）。\n` +
+        `汇报方式：调用 shout_for_user（category="progress", urgency="info"），内容只会推送到手机（不响铃不弹窗）。\n` +
+        `若任务已全部完成：调用 shout_for_user（category="completion", urgency="info"）收尾（或在总结里明确说明任务结束），进度汇报会随之停止，不要再发进度。`;
     // steer：agent 干活途中在下一次 LLM 调用前投递，不等整个回合结束（followUp 会压队列等到 settle）
     void api.sendUserMessage(msg, { deliverAs: "steer" });
   }, minutes * 60_000);
@@ -787,8 +798,8 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
     }
   }
 
-  // interval 模式：启动定时汇报定时器
-  if (config.progressReporting === "interval") {
+  // interval / milestone 模式：启动进度心跳（milestone=自查提醒，interval=定时汇报；停表逻辑共用）
+  if (config.progressReporting === "interval" || config.progressReporting === "milestone") {
     startReportTimer(ctx);
   }
 
@@ -796,7 +807,7 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
   const level = config.autonomyLevel || "balanced";
   const progressHint =
     config.progressReporting === "milestone"
-      ? `\n小阶段完成提醒已开启：达到重要小节点时，调用 shout_for_user（category="milestone", urgency="info"）只推送手机通知。`
+      ? `\n小阶段完成提醒已开启：达到重要小节点时，调用 shout_for_user（category="milestone", urgency="info"）只推送手机通知。系统还会每 ${config.reportIntervalMinutes || 15} 分钟发一条 [milestone check] 自查提醒，无值得报的内容就忽略；任务收尾后自动停止。`
       : config.progressReporting === "interval"
         ? `\n定时汇报已开启：每 ${config.reportIntervalMinutes || 15} 分钟，你会收到一条“请汇报当前进度”的消息，届时调用 shout_for_user（category="progress", urgency="info"）汇报（只推手机，不响铃不弹窗）。即使没有新进展也要如实说明，卡住了就说卡在哪。`
         : "";
@@ -1506,6 +1517,7 @@ export default function (pi: ExtensionAPI) {
   // 这里额外保证 base prompt 末尾有 \n，双重保险避免粘连）
   pi.on("before_agent_start", async (event, _ctx) => {
     if (!config.cooking) return;
+    agentActive = true; // 回合开始：进度心跳恢复触发
     const base = event.systemPrompt.endsWith("\n") ? event.systemPrompt : event.systemPrompt + "\n";
     return {
       systemPrompt: base + (await buildRulesPrompt(config.autonomyLevel || "balanced", config.progressReporting || "milestone")),
@@ -1514,6 +1526,7 @@ export default function (pi: ExtensionAPI) {
 
   // 回合收尾检测：定时汇报自动停表 + 自动呼喊安全网（agent 在等用户/报错）
   pi.on("agent_settled", async (_event, ctx) => {
+    agentActive = false; // 回合结束：进度心跳暂停（新回合开始时恢复）
     if (!config.cooking) return;
     try {
       const entries = ctx.sessionManager.getEntries();
@@ -1536,9 +1549,10 @@ export default function (pi: ExtensionAPI) {
       if (!lastAssistant || trailingWork) return;
       const text = lastAssistant.text;
 
-      // 定时汇报自动停表：agent 最后一句表明任务已全部收尾 → 不再要求进度汇报
-      // （不依赖 agent 主动调 completion；保守匹配避免把"已完成：X"式进度措辞误判为收尾）
-      if (config.progressReporting === "interval" && detectTaskFinale(text)) {
+      // 进度心跳自动停表：agent 最后一句表明任务已全部收尾 → 不再要求进度汇报
+      // （不依赖 agent 主动调 completion；保守匹配避免把"已完成：X"式进度措辞误判为收尾。
+      //  对两种进度模式都生效——即使正则漏判收尾，回合结束本身也会让心跳暂停，不会空转催促）
+      if (config.progressReporting !== "none" && detectTaskFinale(text)) {
         stopReportTimer();
       }
 
