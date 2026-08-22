@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.9.1] - 2026-08-22
 
 ### Fixed
 - **呼喊重复触发不再刷屏横幅**：urgent 呼喊每分钟重发时（repeatCount>0）只保留响铃 + 手机推送 + 桌面弹窗，不再往 TUI 重打整段警告——此前人不在电脑前时，auto-error 等紧急呼喊会每分钟全量重放一条 300 字 Warning 把横幅淹没。首条 notify 也改为只展示前 80 字摘要（详情在对话记录 / `/i-am-cooking status`），符合“横幅只显示计数+状态”的设计原则。
