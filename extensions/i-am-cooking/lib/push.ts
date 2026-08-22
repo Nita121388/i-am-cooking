@@ -32,11 +32,12 @@ export function ntfyBody(category: string, urgency: string, message: string): st
 }
 
 /**
- * ntfy 推送：POST {server}/{topic}，body 为 `[urgency] message`（分类带 emoji 前缀）。
+ * ntfy 推送：默认 header 方式 POST {server}/{topic}；带 actionUrl 时改用 JSON 发布
+ * （actions 字段只在 JSON body 里支持，且 UTF-8 安全——按钮文案可用中文/emoji）。
  * 私有 topic 携带 Authorization: Bearer <token>；失败只记日志不抛。
  * 返回是否发送成功。
  */
-export async function pushPhone(cfg: Config, alert: Alert): Promise<boolean> {
+export async function pushPhone(cfg: Config, alert: Alert, actionUrl?: string): Promise<boolean> {
   const topic = cfg.ntfyTopic?.trim();
   if (!topic) return false;
   const server = (cfg.ntfyServer?.trim() || "https://ntfy.sh").replace(/\/+$/, "");
@@ -50,9 +51,28 @@ export async function pushPhone(cfg: Config, alert: Alert): Promise<boolean> {
   const token = resolveValue(cfg.ntfyToken).trim();
   if (token) headers["Authorization"] = `Bearer ${token}`;
   try {
-    const res = await fetch(`${server}/${encodeURIComponent(topic)}`, {
+    let body: string = ntfyBody(alert.category, alert.urgency, alert.message);
+    if (actionUrl) {
+      // JSON 发布：actions 放 body（UTF-8 安全）；clear=true 点按后自动清除通知
+      // http 动作由手机 App 点击时直接向该 URL 发请求 → 局域网内可达本机停止端点
+      headers["Content-Type"] = "application/json";
+      body = JSON.stringify({
+        topic,
+        message: body,
+        title: headers.Title,
+        priority,
+        tags: ["potable_water"],
+        actions: [
+          { action: "http", label: "🔕 停止响铃", url: actionUrl, method: "POST", clear: true },
+        ],
+      });
+      delete headers.Title; // JSON 发布时 title/message 走 body，header 版字段不再需要
+      delete headers.Priority;
+      delete headers.Tags;
+    }
+    const res = await fetch(actionUrl ? server : `${server}/${encodeURIComponent(topic)}`, {
       method: "POST",
-      body: ntfyBody(alert.category, alert.urgency, alert.message),
+      body,
       headers,
       signal: AbortSignal.timeout(15_000),
     });

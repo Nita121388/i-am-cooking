@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- **手机推送带「停止响铃」按钮（远程静音，不退出离开模式）**：开启离开模式时插件在本机启动一个小型停止端点（随机端口 + 会话级随机 token），ntfy 呼喊推送自动附带 `http` 动作按钮（JSON 发布，UTF-8 安全）。人在厨房听到响铃，手机点一下 → 手机直接向本机内网 IP 发请求杀掉音频，旧呼喊标记已处理，agent 继续自主干活。仅同一局域网可用；仅 ntfy 通道支持；`off` / 会话关闭即停服并作废 token（旧推送按钮立即失效）；可用 `config.remoteStop: false` 关闭。
+
 ## [0.8.0] - 2026-08-22
 
 ### Added

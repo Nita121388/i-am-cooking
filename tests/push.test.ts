@@ -131,3 +131,22 @@ test("ntfyBody 分类：进度/完成带 emoji 前缀（body UTF-8 安全），�
   assert.equal(ntfyBody("completion", "info", "全部完成"), "✅ [info] 全部完成");
   assert.equal(ntfyBody("decision", "urgent", "需要你"), "[urgent] 需要你");
 });
+
+test("pushPhone 带 actionUrl → 改用 JSON 发布：POST 到 server 根路径，actions 含停止按钮", async () => {
+  setupFetchMock();
+  const cfg: Config = { ...DEFAULTS, ntfyTopic: "mytopic", ntfyServer: "https://ntfy.example.com", ntfyToken: "sk" };
+  const ok = await pushPhone(cfg, { ...fakeAlert, category: "decision" }, "http://192.168.1.5:1234/stop?token=x");
+  assert.equal(ok, true);
+  assert.equal(fetchCalls.length, 1);
+  const [call] = fetchCalls;
+  // JSON 发布 POST 到根路径；Authorization header 保留
+  assert.equal(call.url, "https://ntfy.example.com");
+  assert.equal((call.opts.headers as Record<string,string>).Authorization, "Bearer sk");
+  const body = JSON.parse(String(call.opts.body));
+  assert.equal(body.topic, "mytopic");
+  assert.ok(Array.isArray(body.actions) && body.actions.length === 1);
+  assert.equal(body.actions[0].action, "http");
+  assert.equal(body.actions[0].url, "http://192.168.1.5:1234/stop?token=x");
+  assert.equal(body.actions[0].clear, true);
+  teardownFetchMock();
+});

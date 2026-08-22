@@ -52,6 +52,7 @@ import { DEFAULTS, readConfig, writeConfig } from "./lib/config.ts";
 import { hasActiveAudio, playSound, stopAllAudio } from "./lib/audio.ts";
 import { AUTONOMY_LABEL, CALLING_MODE_LABEL, detectAutonomyLevel, detectPreference, detectTaskFinale, isProgressCategory, shouldSuppress as shouldSuppressLib } from "./lib/prefs.ts";
 import { pushPhone, pushWebhook, resolveValue } from "./lib/push.ts";
+import { startRemoteStopServer, type RemoteStopHandle } from "./lib/remote-stop.ts";
 import { boostVolume, getSystemVolume, restoreVolume, setSystemVolume, toggleMute } from "./lib/volume.ts";
 import { runCommand, runPowerShellScript } from "./lib/platform.ts";
 import { buildRulesPrompt, ensureRulesFile, fileExists, GUARD_RAIL, loadDefaultRules, loadRules } from "./lib/rules.ts";
@@ -476,9 +477,11 @@ function renderTts(alert: Alert): string {
 // ── 手机推送 ──────────────────────────────────────────────────────────────
 // 逻辑在 lib/push.ts（ntfy/webhook 双通道，可测试）；此处只提供 config.<channel> 分发。
 async function pushAlert(alert: Alert): Promise<boolean> {
+  // 远程停止：响铃类推送带「停止响铃」按钮（进度类不响铃，无需按钮）
+  const actionUrl = remoteStopSrv && !isProgressCategory(alert.category) ? remoteStopSrv.url : undefined;
   // 兼容旧配置：未走向导但直接填了 webhookUrl
   if (config.phonePush) {
-    return config.pushProvider === "ntfy" ? pushPhone(config, alert) : pushWebhook(config, alert);
+    return config.pushProvider === "ntfy" ? pushPhone(config, alert, actionUrl) : pushWebhook(config, alert);
   }
   if (config.webhookUrl) return pushWebhook(config, alert);
   return true;
@@ -494,6 +497,44 @@ function shouldSuppress(alert: Alert): boolean {
 
 // completion 通知计数器（每次 turnOn 清零）
 let completionNoticeCount = 0;
+
+// ── 远程停止服务（手机推送「停止响铃」按钮的后端）──
+// 每次离开会话随机 token；仅 ntfy + phonePush 开启时随离开模式启停
+let remoteStopSrv: RemoteStopHandle | null = null;
+let remoteStopToken = randomUUID();
+
+/** 启动远程停止端点（已启动则跳过）；失败只记日志不抛——按钮缺失不影响其他功能 */
+async function startRemoteStop(ctx: CookingCtx): Promise<void> {
+  if (remoteStopSrv || !config.remoteStop) return;
+  if (!config.phonePush || config.pushProvider !== "ntfy" || !config.ntfyTopic?.trim()) return;
+  try {
+    remoteStopSrv = await startRemoteStopServer({
+      token: remoteStopToken,
+      onStop: () => {
+        // 手机点「停止响铃」= 人已知悉：停本次播放 + 旧呼喊标记已处理（不退出离开模式，agent 继续干活）
+        stopAudioAll();
+        shoutingState = false;
+        for (const a of config.alerts) a.acked = true;
+        void writeConfig(config);
+        updateStatus(ctx, "idle");
+        updateWidget(ctx);
+        ctx.ui.notify("🔕 手机端已停止本次播放。下次呼喊照常响铃。", "info");
+      },
+    });
+    ctx.ui.notify("📱 呼喊推送已带「🔕 停止响铃」按钮（手机与本机同一局域网时可点击静音）。", "info");
+  } catch (e) {
+    console.error("[i-am-cooking] remote stop server failed:", (e as Error).message);
+    remoteStopSrv = null;
+  }
+}
+
+/** 关闭远程停止端点（幂等；off / 会话关闭时调用） */
+function stopRemoteStop(): void {
+  const srv = remoteStopSrv;
+  remoteStopSrv = null;
+  remoteStopToken = randomUUID(); // 换 token：旧推送里的按钮立即失效
+  void srv?.close().catch(() => {});
+}
 
 /** 切换自主等级并提示（持久化：跨离开会话保留） */
 function setAutonomyLevel(level: AutonomyLevel, reason: string, ctx: CookingCtx): void {
@@ -763,6 +804,9 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
   updateStatus(ctx, "idle");
   updateWidget(ctx);
 
+  // 远程停止端点：呼喊推送带「停止响铃」按钮（仅 ntfy 推送开启时；off 即停服）
+  void startRemoteStop(ctx);
+
   // 自动提升音量（只在用户允许时生效）
   void boostVolume(config);
 
@@ -828,6 +872,7 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
 function turnOff(ctx: CookingCtx, source: "command" | "tool" = "command"): void {
   clearRepeatTimers();
   stopAudioAll(); // 关闭离开：立即停止正在播放的音频
+  stopRemoteStop(); // 关闭远程停止端点 + 作废 token
   const pending = pendingAlerts();
   config.cooking = false;
   config.since = undefined;
@@ -1509,6 +1554,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     clearRepeatTimers();
     stopAudioAll(); // 会话关闭：停止正在播放的音频
+    stopRemoteStop(); // 会话关闭：停掉远程停止端点
     void restoreVolume(); // 退出时恢复音量
     await writeConfig(config);
   });

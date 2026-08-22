@@ -60,6 +60,7 @@ export interface Config {
   ntfyTopic: string;
   ntfyServer: string;
   ntfyToken: string; // ntfy 私有 topic 访问 token，支持 ${ENV_VAR} 引用
+  remoteStop: boolean; // 呼喊推送带「停止响铃」按钮（本地小端点，仅局域网可达；off/关会话即停服）
   webhookUrl: string; // generic webhook (Bark/Server酱...), receives JSON
   webhookToken: string; // webhook 认证 token，支持 ${ENV_VAR} 引用
   webhookTokenHeader: string; // token 放在哪个 header（默认 Authorization）
@@ -99,6 +100,7 @@ export const DEFAULTS: Config = {
   ntfyTopic: "",
   ntfyServer: "https://ntfy.sh",
   ntfyToken: "",
+  remoteStop: true,
   webhookUrl: "",
   webhookToken: "",
   webhookTokenHeader: "Authorization",
