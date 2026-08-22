@@ -1,6 +1,6 @@
 {
   "name": "i-am-cooking",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Pi extension: when the user is away cooking, the agent works autonomously. When blocked or when work is done, it shouts loudly — through sound, TTS, desktop toast, and phone push — so the user can come back from the kitchen.",
   "license": "MIT",
   "type": "module",
