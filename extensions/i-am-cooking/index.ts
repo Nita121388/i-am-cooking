@@ -578,10 +578,14 @@ async function fireAlert(alert: Alert, ctx: CookingCtx, opts: { forceSound?: boo
   }
 
   // ── widget + TUI notify（无论是否 suppress 都显示）──
-  if (ctx?.ui) {
+  // 重复触发（repeatCount>0）不再重打 TUI notify：内容用户已看过，响铃/手机推送/桌面弹窗照旧——
+  // 否则紧急呼喊每分钟全量重放一条整段警告，人不在时横幅被刷屏（首条 notify 已足够定位问题）
+  if (ctx?.ui && alert.repeatCount === 0) {
     const icon = isCompletion ? "✅" : "⚠";
     const label = isCompletion ? "完成通知" : `${config.shoutPhrase || "agent 需要你"}！[${alert.urgency}]`;
-    ctx.ui.notify(`🍳 ${icon} ${label} ${alert.message}`, suppress ? "info" : "warning");
+    // 首条也只展示摘要：长内容（如 auto-error 带的报错上下文）不进横幅，详情在对话记录 / status 里
+    const summary = alert.message.length > 80 ? `${alert.message.slice(0, 80)}…` : alert.message;
+    ctx.ui.notify(`🍳 ${icon} ${label} ${summary}`, suppress ? "info" : "warning");
     updateWidget(ctx);
   }
 
