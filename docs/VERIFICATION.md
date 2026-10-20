@@ -65,6 +65,18 @@
 - [ ] TTS/toast copy says "pi 需要你" / "任务完成" (not "I am cooking 需要你")
 - [ ] Extension loads in fresh install: `pi install git:...` → `/reload` → `/i-am-cooking status` works
 
+## 8b. Health watch
+
+- [ ] `/i-am-cooking health` shows state; `health now` fires a manual check immediately
+- [ ] Idle agent past threshold → `[健康巡检]` message delivered; banner shows `🩺 已催 1/5`
+- [ ] Agent calls `set_task_state(done)` → banner shows `🩺 已完成`; further checks stay silent
+- [ ] Typing anything → state returns to working; next idle check nudges again
+- [ ] Nudge cap (5) exhausted → one `normal` shout fires, then checks go silent (`🩺 无响应（已喊人）`)
+- [ ] With `silence` preference (`别喊了`) → checks keep nudging forever, never escalate to ringing
+- [ ] Active async subagent → check skips (banner shows `🤖 子代理 N 个在跑`)
+- [ ] Unacked blocking shout + long idle → check marks `waiting_user`, does not nudge
+- [ ] `health off` disables it; `/status` shows `健康巡检: 关`
+
 ## 9. Cross-platform (if available)
 
 - [ ] Windows: all channels + volume (Core Audio)

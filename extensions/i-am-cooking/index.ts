@@ -20,9 +20,11 @@
  *   /i-am-cooking limits       — 查看/调整防打扰参数（交互式中文）
  *   /i-am-cooking sound        — 自定义呼喊铃声（歌曲/试听/总时长，交互式中文）
  *   /i-am-cooking volume       — 音量控制（查看/手动调整/离开自动拉高，交互式中文）
+ *   /i-am-cooking health        — 健康巡检（开关/频率/空闲判定/催问上限/立刻巡检一次）
  *
  * 工具 (LLM 调用):
  *   shout_for_user            — 卡住且只有用户能解决时调用
+ *   set_task_state            — 向健康巡检表态：已完成 / 在等你 / 仍在推进
  *   set_calling_preference    — 根据用户原话调整呼喊偏好（别喊了/完成后喊我/…）
  *   set_autonomy_level        — 根据用户原话调整自主等级（遇墙就喊/能不喊就不喊/…）
  *   enter_cooking_mode        — 用户明确说"去做饭了"时自动开启离开模式
@@ -32,6 +34,8 @@
  *
  * 自动检测:
  *   agent_settled 后若回合以"？"结尾且没有后续工具调用 → 自动呼喊（安全网）
+ *   健康巡检: 定时检查 agent 是否真的在运行（回合/工具/子代理/队列）；停住就催它表态，
+ *             催满上限还没动静才升级喊用户；用户一开口自动恢复追问
  *
  * 配置: ~/.pi/i-am-cooking/config.json （可热改，/reload 生效）
  */
@@ -46,6 +50,8 @@ import { randomUUID } from "node:crypto";
 // 纯逻辑模块（可测试）
 import { suggestTopic } from "./lib/topic.ts";
 import { renderTts as renderTtsImpl } from "./lib/tts.ts";
+import { buildStallAlert, buildHealthPrompt, decideHealthTick, applyHealthDecision, formatHealthLine, formatIdle, markRealWork, markUserInput, newHealthState, setPhase, touchActivity } from "./lib/health.ts";
+import type { HealthPhase, HealthState } from "./lib/health.ts";
 import { CONFIG_DIR, CONFIG_PATH, DEFAULT_RULES_PATH, RULES_PATH, SCRIPTS, TMP_DIR } from "./lib/config.ts";
 import type { Alert, AutonomyLevel, CallingMode, Config, Urgency } from "./lib/config.ts";
 import { DEFAULTS, readConfig, writeConfig } from "./lib/config.ts";
@@ -81,6 +87,14 @@ type CookingCtx = {
   hasUI?: boolean;
   /** 是否有消息正排队待投递给 agent（steer/followUp 队列非空）——定时汇报守卫用 */
   hasPendingMessages?: () => boolean;
+  /** 代理是否空闲（未在流式输出）——健康巡检守卫用 */
+  isIdle?: () => boolean;
+  /** 只读会话管理器（健康巡检读上一回合结束原因 / 会话 id 用） */
+  sessionManager?: {
+    getEntries?: () => readonly any[];
+    getSessionFile?: () => string | undefined;
+    getSessionId?: () => string;
+  };
 };
 
 // ── state ────────────────────────────────────────────────────────────────
@@ -88,6 +102,21 @@ let api: ExtensionAPI; // set by factory; needed by turnOn/turnOff
 let repeatTimers: ReturnType<typeof setInterval>[] = [];
 // 当前是否正在响铃播放（状态栏/横幅指示用；仅反映本实例，多 Agent 间互不影响）
 let shoutingState = false;
+
+// ── health watch（健康巡检）─────────────────────────────────────────────
+// 离开模式开着但 agent 可能意外停住（报错/上下文超限/进程抖动）：
+// 定时探测「是否真的在运行」，没在运行就催它表态（done / waiting_user / 继续），
+// 催到上限还没动静才升级喊用户。用户一开口就回到 working，下次继续问。
+let health: HealthState = newHealthState(Date.now());
+let healthTimer: ReturnType<typeof setInterval> | null = null;
+/** 正在执行中的工具数（tool_execution_start++ / end--）：长 bash、同步 subagent() 都算在跑 */
+let runningTools = 0;
+/** 当前会话里还在跑的 async 子代理 id（事件驱动；registry 探测兜底） */
+const activeSubagents = new Set<string>();
+/** 上一回合结束原因（health 巡检文案用：判断是不是「意外终止」） */
+let lastStopReason: string | undefined;
+/** 上一回合最后一条 agent 文本（健康巡检 / stalled 升级喊人时带上） */
+let lastAssistantText = "";
 
 function pendingAlerts(): Alert[] {
   return config.alerts.filter((a) => !a.acked);
@@ -352,6 +381,113 @@ async function cmdVolume(ctx: CookingCtx): Promise<void> {
   }
 }
 
+// ── 健康巡检子命令 ───────────────────────────────────────────────────
+async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
+  const sub = fullArg.trim().split(/\s+/)[1]?.toLowerCase() ?? "";
+  const now = Date.now();
+  const idleFor = formatIdle(now - health.idleSince);
+  const nudgeLine = health.lastNudgeAt
+    ? `最近一次追问: ${new Date(health.lastNudgeAt).toLocaleTimeString("zh-CN")}（本段已催 ${health.nudges}/${config.healthMaxNudges}）`
+    : `本段尚未催过`;
+  const summary =
+    `🩺 健康巡检\n` +
+    `  开关: ${config.healthCheck ? "开" : "关"}\n` +
+    `  频率: 每 ${config.healthCheckMinutes} 分钟查一次（空闲 ${config.healthIdleMinutes} 分钟才算「没在运行」）\n` +
+    `  催问上限: ${config.healthMuteEscalation ? "用户说了别喊 → 一直催、不升级喊人" : `${config.healthMaxNudges} 次，之后喊你一次`}\n` +
+    `  状态: ${formatHealthLine(health, now, {
+      enabled: config.healthCheck,
+      checkMinutes: config.healthCheckMinutes,
+      idleMinutes: config.healthIdleMinutes,
+      maxNudges: config.healthMaxNudges,
+      muteEscalation: config.healthMuteEscalation,
+    })}\n` +
+    `  空闲时长: ${idleFor}\n` +
+    `  ${nudgeLine}\n` +
+    `  正在运行的子代理: ${config.cooking ? countActiveSubagents(ctx) : "—"}\n` +
+    (health.note ? `  最后表态: ${health.note}\n` : "") +
+    `  模式: ${config.cooking ? "离开中（巡检生效）" : "在岗（巡检只在离开模式下工作）"}`;
+
+  // 非交互：支持 health on / off / now / 直接看
+  if (sub === "on" || sub === "off") {
+    config.healthCheck = sub === "on";
+    await writeConfig(config);
+    if (config.cooking) {
+      if (config.healthCheck) startHealthTimer(ctx);
+      else stopHealthTimer();
+    }
+    ctx.ui.notify(`🩺 健康巡检已${config.healthCheck ? "开启" : "关闭"}。`, "info");
+    return;
+  }
+  if (sub === "now") {
+    if (!config.cooking) { ctx.ui.notify("当前不在离开模式，巡检只在离开模式下工作（先 /i-am-cooking on）。", "warning"); return; }
+    // 手动立刻巡一次：忽略「空闲不够久」这道门，方便测试
+    health.idleSince = 0;
+    ctx.ui.notify("🩺 手动触发一次巡检…", "info");
+    healthTick(ctx);
+    return;
+  }
+
+  if (ctx.mode !== "tui" || !ctx.hasUI) {
+    ctx.ui.notify(summary + `\n\n（TUI 模式下运行 /i-am-cooking health 可交互调整；也可用 health on|off|now）`, "info");
+    return;
+  }
+  const ui = ctx.ui;
+  const choose = await ui.select("🩺 健康巡检（Esc 退出）:", [
+    `开关巡检（当前 ${config.healthCheck ? "开" : "关"}）`,
+    `立刻巡检一次（测试用，无需等待）`,
+    `检查频率（当前每 ${config.healthCheckMinutes} 分钟）`,
+    `空闲多久算没在运行（当前 ${config.healthIdleMinutes} 分钟）`,
+    `催问上限（当前 ${config.healthMaxNudges} 次，之后喊你）`,
+    `催满后是否喊人（当前 ${config.healthMuteEscalation ? "不喊，一直催" : "喊你一次"}）`,
+  ], { footer: summary });
+  if (!choose) { ui.notify("已退出。", "info"); return; }
+
+  if (choose.includes("开关巡检")) {
+    config.healthCheck = !config.healthCheck;
+    await writeConfig(config);
+    if (config.cooking) {
+      if (config.healthCheck) startHealthTimer(ctx);
+      else stopHealthTimer();
+    }
+    ui.notify(`🩺 健康巡检已${config.healthCheck ? "开启" : "关闭"}。`, "info");
+    return;
+  }
+  if (choose.includes("立刻巡检")) {
+    if (!config.cooking) { ui.notify("当前不在离开模式，巡检只在离开模式下工作（先 /i-am-cooking on）。", "warning"); return; }
+    health.idleSince = 0;
+    ui.notify("🩺 手动触发一次巡检…", "info");
+    healthTick(ctx);
+    return;
+  }
+  if (choose.includes("催满后是否喊人")) {
+    config.healthMuteEscalation = !config.healthMuteEscalation;
+    await writeConfig(config);
+    ui.notify(
+      config.healthMuteEscalation
+        ? "🔕 已设为「只催不喊」：催满上限也不响铃，会一直催下去。"
+        : `🔔 已设为「催满 ${config.healthMaxNudges} 次后喊你一次」，然后暂停追问。`,
+      "info",
+    );
+    return;
+  }
+
+  const isFreq = choose.includes("检查频率");
+  const isIdle = choose.includes("空闲多久");
+  const isMax = choose.includes("催问上限");
+  const label = isFreq ? "检查频率（分钟，1-60）" : isIdle ? "空闲判定（分钟，1-180）" : "催问上限（次，1-20）";
+  const cur = isFreq ? config.healthCheckMinutes : isIdle ? config.healthIdleMinutes : config.healthMaxNudges;
+  const v = await ui.input(`${label}:`, String(cur));
+  if (v === undefined || v === null || !v.trim()) { ui.notify("已取消。", "info"); return; }
+  const n = parseInt(v.trim(), 10);
+  if (isNaN(n)) { ui.notify("❌ 请输入数字。", "warning"); return; }
+  if (isFreq) config.healthCheckMinutes = Math.max(1, Math.min(60, n));
+  else if (isIdle) config.healthIdleMinutes = Math.max(1, Math.min(180, n));
+  else config.healthMaxNudges = Math.max(1, Math.min(20, n));
+  await writeConfig(config);
+  if (config.cooking && config.healthCheck) startHealthTimer(ctx); // 频率变了：重挂定时器
+  ui.notify("✅ 已保存。", "info");
+}
+
 // 子命令注册表（handler 只做分发，具体逻辑见上面各函数）
 const commandHandlers: Record<string, (ctx: CookingCtx, fullArg: string) => Promise<void> | void> = {
   off: (ctx) => { turnOff(ctx, "command"); },
@@ -366,6 +502,7 @@ const commandHandlers: Record<string, (ctx: CookingCtx, fullArg: string) => Prom
   limits: async (ctx) => { await cmdLimits(ctx); },
   sound: async (ctx) => { await cmdSound(ctx); },
   volume: async (ctx) => { await cmdVolume(ctx); },
+  health: async (ctx, fullArg) => { await cmdHealth(ctx, fullArg); },
 };
 
 // ── 音频文件浏览（sound 命令用）──────────────────────────────────────────
@@ -550,6 +687,8 @@ function setAutonomyLevel(level: AutonomyLevel, reason: string, ctx: CookingCtx)
 function setCallingMode(mode: CallingMode, reason: string, ctx: CookingCtx): void {
   const prev = config.callingMode || "normal";
   config.callingMode = mode;
+  // 「别喊了」= 只催不升级：健康巡检催满上限也不响铃，一直催下去
+  config.healthMuteEscalation = mode === "silence";
   void writeConfig(config);
   if (mode !== prev) {
     ctx.ui.notify(`🔔 呼喊偏好已切换：${CALLING_MODE_LABEL[mode]}（依据：${reason}）`, "info");
@@ -637,9 +776,22 @@ function updateWidget(ctx: CookingCtx): void {
   if (!ctx?.ui) return;
   if (!config.tuiBanner) { ctx.ui.setWidget("i-am-cooking", []); return; }
   const n = pendingActionAlerts().length;
+  const subs = config.cooking && config.healthCheck ? countActiveSubagents(ctx) : 0;
+  const healthTag = config.cooking && config.healthCheck
+    ? health.phase === "done"
+      ? " · 🩺 已完成"
+      : health.phase === "waiting_user"
+        ? " · 🩺 在等你"
+        : health.phase === "stalled"
+          ? " · 🩺 无响应（已喊人）"
+          : health.nudges > 0
+            ? ` · 🩺 已催 ${health.nudges}/${config.healthMaxNudges}`
+            : ""
+    : "";
+  const subTag = subs > 0 ? ` · 🤖 子代理 ${subs} 个在跑` : "";
   const lines = config.cooking
     ? [
-        `🍳 离开中 · ⚠${n} 待处理 · /status 看全部`,
+        `🍳 离开中 · ⚠${n} 待处理${subTag}${healthTag} · /status 看全部`,
         ...(shoutingState ? ["  📢 正在广播中...（Ctrl+Alt+M 静音）"] : []),
       ]
     : [];
@@ -693,6 +845,8 @@ function scheduleRepeats(alert: Alert, ctx: CookingCtx): void {
 function clearRepeatTimers(): void {
   for (const t of repeatTimers) clearInterval(t);
   repeatTimers = [];
+  reportTimer = null;
+  healthTimer = null;
 }
 
 // ── 进度心跳（interval=定时汇报 / milestone=小阶段自查），两种模式共用一套启停 ──
@@ -731,6 +885,171 @@ function stopReportTimer(): void {
   if (reportTimer) { clearInterval(reportTimer); reportTimer = null; }
 }
 
+// ── 健康巡检（health watch）：定时探测 agent 是否真的在运行 ────────────────
+
+/**
+ * 当前会话 id（用于子代理过滤）：优先会话文件路径，否则用 session id。
+ * 与 pi-subagents 的记录方式一致（getSessionFile() ?? getSessionId()）。
+ */
+function currentSessionId(ctx: CookingCtx): string | undefined {
+  try {
+    const sm = (ctx as { sessionManager?: { getSessionFile?(): string | undefined; getSessionId?(): string } }).sessionManager;
+    return sm?.getSessionFile?.() ?? sm?.getSessionId?.();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 探测当前会话里还在跑的 async 子代理数量。
+ * 双路：① 事件计数（快、准）；② pi-subagents 的进程内 background-work 注册表（兜底，防 /reload 后丢事件）。
+ * 未安装 pi-subagents 则恒为 0，不报错。
+ */
+function countActiveSubagents(ctx: CookingCtx): number {
+  const fromEvents = activeSubagents.size;
+  const sessionId = currentSessionId(ctx);
+  if (!sessionId) return fromEvents;
+  try {
+    const reg = (globalThis as Record<PropertyKey, unknown>)[Symbol.for("pi-subagents.background-work.v1")] as
+      | { providers?: Map<string, { listActiveWork?: (c?: { sessionId: string; nowMs: number }) => unknown }> }
+      | undefined;
+    if (!reg?.providers || !(reg.providers instanceof Map)) return fromEvents;
+    let n = 0;
+    for (const provider of reg.providers.values()) {
+      if (typeof provider?.listActiveWork !== "function") continue;
+      try {
+        const items = provider.listActiveWork({ sessionId, nowMs: Date.now() });
+        if (!Array.isArray(items)) continue;
+        for (const item of items) {
+          const sid = (item as { sessionId?: unknown })?.sessionId;
+          if (typeof sid !== "string" || sid === sessionId) n++;
+        }
+      } catch { /* 单个 provider 异常不影响其他 */ }
+    }
+    return Math.max(fromEvents, n);
+  } catch {
+    return fromEvents;
+  }
+}
+
+/** 用户说了「别喊」类偏好时，巡检只催不升级（一直催）+ 持久化开关同步 */
+function healthMuteEscalation(): boolean {
+  return !!config.healthMuteEscalation;
+}
+
+/**
+ * 这些工具只是「表态」，不改变真实工作进度：结束时不刷新健康巡检的空闲窗口、不清催问计数。
+ * 否则 agent 每次被催就调一次 set_task_state / shout_for_user 就能把巡检计数洗掉，永远升不了级。
+ */
+const STATEMENT_ONLY_TOOLS = new Set(["set_task_state", "shout_for_user"]);
+
+/** 订阅 pi-subagents 的子代理生命周期事件（pi-subagents 未装时静默跳过） */
+function bindSubagentEvents(onStarted: (payload: unknown) => void, onComplete: (payload: unknown) => void): void {
+  try {
+    api.events.on("subagent:async-started", onStarted);
+    api.events.on("subagent:async-complete", onComplete);
+  } catch { /* pi-subagents 未安装：忽略 */ }
+}
+
+/** 读上一回合的最后一条 agent 文本与结束原因（巡检文案用） */
+function lastTurnSnapshot(ctx: CookingCtx): { stopReason?: string; text: string } {
+  try {
+    const entries = ctx.sessionManager?.getEntries?.() ?? [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i];
+      if (e.type !== "message") continue;
+      const m = e.message as { role?: string; content?: unknown; stopReason?: string };
+      if (m.role === "toolResult" || m.role === "bashExecution") continue;
+      if (m.role === "assistant") {
+        return { stopReason: m.stopReason ?? lastStopReason, text: extractText(m as { role: string; content: any }).trim() || lastAssistantText };
+      }
+    }
+  } catch { /* best effort */ }
+  return { stopReason: lastStopReason, text: lastAssistantText };
+}
+
+/** 一次巡检滴答（默认每 healthCheckMinutes 分钟） */
+function healthTick(ctx: CookingCtx): void {
+  if (!config.cooking || !config.healthCheck) return;
+
+  const agentBusy = agentActive || (typeof ctx.isIdle === "function" ? !ctx.isIdle() : false);
+  const decision = decideHealthTick(health, {
+    cooking: config.cooking,
+    enabled: config.healthCheck,
+    now: Date.now(),
+    agentBusy,
+    runningTools,
+    activeSubagents: countActiveSubagents(ctx),
+    pendingMessages: ctx.hasPendingMessages?.() ?? false,
+    blockingAlerts: pendingActionAlerts().length,
+    idleMinutes: config.healthIdleMinutes || 10,
+    maxNudges: config.healthMaxNudges || 5,
+    muteEscalation: healthMuteEscalation(),
+  });
+
+  if (decision.action === "skip") return;
+
+  if (decision.action === "waiting") {
+    // 有未处理的阻塞呼喊 = 它在等你，不是在卡死 → 静默，不再追问
+    applyHealthDecision(health, decision, Date.now());
+    updateWidget(ctx);
+    return;
+  }
+
+  if (decision.action === "escalate") {
+    applyHealthDecision(health, decision, Date.now());
+    const snap = lastTurnSnapshot(ctx);
+    ctx.ui.notify(`🚨 健康巡检：催了 ${config.healthMaxNudges || 5} 次都没动静，已升级呼喊用户。`, "warning");
+    queueAlert(
+      buildStallAlert({
+        nudges: config.healthMaxNudges || 5,
+        idleMinutes: config.healthIdleMinutes || 10,
+        lastText: snap.text,
+      }),
+      "normal",
+      "health-stall",
+      ctx,
+    );
+    updateWidget(ctx);
+    return;
+  }
+
+  // nudge：注入一条巡检消息，逼 agent 表态（done / waiting_user / 继续）
+  const idleFor = formatIdle(health.idleSince ? Date.now() - health.idleSince : 0);
+  applyHealthDecision(health, decision, Date.now());
+  const snap = lastTurnSnapshot(ctx);
+  ctx.ui.notify(
+    `🩺 健康巡检：agent 已空闲 ${idleFor}，第 ${decision.nudge} 次追问状态。`,
+    "info",
+  );
+  // 回合已结束（无流）→ sendUserMessage 会自动开新一轮，正是「叫醒它」的目的
+  void api.sendUserMessage(
+    buildHealthPrompt({
+      idleMinutes: config.healthIdleMinutes || 10,
+      nudge: decision.nudge,
+      maxNudges: config.healthMaxNudges || 5,
+      muteEscalation: healthMuteEscalation(),
+      lastStopReason: snap.stopReason,
+      lastText: snap.text,
+    }),
+    { deliverAs: "followUp" },
+  );
+  updateWidget(ctx);
+}
+
+/** 启动健康巡检（幂等；随离开模式启停） */
+function startHealthTimer(ctx: CookingCtx): void {
+  stopHealthTimer(ctx);
+  if (!config.healthCheck) return;
+  const minutes = Math.max(1, Math.min(60, config.healthCheckMinutes || 5));
+  healthTimer = setInterval(() => healthTick(ctx), minutes * 60_000);
+  repeatTimers.push(healthTimer);
+}
+
+function stopHealthTimer(_ctx?: CookingCtx): void {
+  if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+}
+
 type QueueResult = "queued" | "not-cooking" | "mode-off" | "limit" | "duplicate";
 
 function queueAlert(message: string, urgency: Urgency, category: string, ctx: CookingCtx, ttsText?: string): QueueResult {
@@ -744,6 +1063,7 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: Co
   // completion 防打扰：每次离开最多 maxCompletionNotices 次完成通知
   if (category === "completion") {
     stopReportTimer(); // 任务完成：定时汇报不再需要，到此为止（即使达到防打扰上限也要停表）
+    setPhase(health, "done", Date.now(), "agent 发出完成通知"); // 健康巡检同步静默（不用再问它完成没）
     const max = config.maxCompletionNotices ?? 3;
     if (completionNoticeCount >= max) return "limit";
     completionNoticeCount++;
@@ -788,7 +1108,13 @@ function resetCookingState(ctx: CookingCtx): void {
   config.since = undefined;
   config.alerts = [];
   config.callingMode = "normal"; // 偏好是会话级的，每次会话重置
+  config.healthMuteEscalation = false; // 健康巡检的「只催不喊」也是会话级的
   void writeConfig(config);
+  // 健康巡检状态也是会话级的：新会话从 working 开始
+  health = newHealthState(Date.now());
+  runningTools = 0;
+  activeSubagents.clear();
+  stopHealthTimer();
   ctx.ui.setStatus("i-am-cooking", "");
   ctx.ui.setWidget("i-am-cooking", []);
   void restoreVolume(); // 若上次离开拉高了音量，恢复原值
@@ -803,6 +1129,7 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
   config.cooking = true;
   config.since = Date.now();
   completionNoticeCount = 0; // 新的一轮离开，重置完成通知计数
+  health = newHealthState(Date.now()); // 新的一轮离开：巡检从 working 重新开始
   void writeConfig(config);
   ctx.ui.notify(`🍳 离开模式已开启。${config.shoutPhrase || "agent 需要你"}时我会大声喊你。`, "info");
   updateStatus(ctx, "idle");
@@ -851,6 +1178,9 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
     startReportTimer(ctx);
   }
 
+  // 健康巡检：定时探测 agent 是否真的在跑，意外停住就催它表态（催满上限才升级喊人）
+  startHealthTimer(ctx);
+
   const noteText = note ? `备注：${note}` : "";
   const level = config.autonomyLevel || "balanced";
   const progressHint =
@@ -867,6 +1197,8 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
     `调用前先准备好交接内容（刚好够用：决策给选项和推荐，凭据给获取方式，手动操作给步骤），准备好再喊，喊出的消息即最终版。\n` +
     `呼喊后：被卡住的那件事已交接，不再继续处理；但其他不依赖用户的工作照常推进（进度/完成类通知后亦然）。\n` +
     `任务全部完成或达到重要里程碑时，调用 shout_for_user（category="completion", urgency="info"）通知我。` +
+    `\n健康巡检：离开期间我会定时检查你是否还在运行；若发现你停住不动（无回合/无工具/无子代理）会给你发一条 [健康巡检]，` +
+    `那时先调 set_task_state 表态——任务已完成用 state="done"，在等我用 state="waiting_user"，没完成就继续推进。` +
     progressHint,
     // steer：agent 干活途中在下一次 LLM 调用前投递，让它尽快知道自己已进入离开模式（followUp 会压队列等到 settle）
     { deliverAs: "steer" },
@@ -877,6 +1209,7 @@ function turnOff(ctx: CookingCtx, source: "command" | "tool" = "command"): void 
   clearRepeatTimers();
   stopAudioAll(); // 关闭离开：立即停止正在播放的音频
   stopRemoteStop(); // 关闭远程停止端点 + 作废 token
+  stopHealthTimer(); // 关闭离开：健康巡检停表
   const pending = pendingAlerts();
   config.cooking = false;
   config.since = undefined;
@@ -926,6 +1259,13 @@ function showStatus(ctx: CookingCtx): void {
     `音量: ${config.boostVolume ? `离开自动拉高到 ${config.boostLevel}%` : "未启用"}`,
     `呼喊偏好: ${CALLING_MODE_LABEL[config.callingMode || "normal"]}`,
     `自主等级: ${AUTONOMY_LABEL[config.autonomyLevel || "balanced"]}`,
+    `🩺 ${formatHealthLine(health, Date.now(), {
+      enabled: config.healthCheck,
+      checkMinutes: config.healthCheckMinutes,
+      idleMinutes: config.healthIdleMinutes,
+      maxNudges: config.healthMaxNudges,
+      muteEscalation: config.healthMuteEscalation,
+    })}${config.cooking ? `（子代理 ${countActiveSubagents(ctx)} 个在跑）` : ""}`,
     `防打扰: 正常每 ${config.repeatIntervalMinutes} 分钟重喊 / 紧急每 ${config.urgentRepeatMinutes} 分钟重喊 / 完成通知上限 ${config.maxCompletionNotices} 次（/i-am-cooking limits 可调）`,
     `声音: 哔哔${config.sound ? `${config.beeps}声` : "关"}${config.soundPath ? ` + 自定义歌曲(${config.soundPath})` : ""} / TTS${config.tts ? "开" : "关"} / 总时长${config.soundSeconds ?? 60}秒（/i-am-cooking sound 可调）`,
     `配置: ${CONFIG_PATH}（首次使用请运行 /i-am-cooking setup 配置手机推送）`,
@@ -1207,6 +1547,7 @@ export default function (pi: ExtensionAPI) {
         { value: "limits", label: "limits", description: "查看/调整防打扰参数（交互式中文菜单）" },
         { value: "sound", label: "sound", description: "自定义呼喊铃声：歌曲路径/试听/总时长（交互式中文菜单）" },
         { value: "volume", label: "volume", description: "音量控制：查看/手动调整/离开自动拉高（交互式中文菜单）" },
+        { value: "health", label: "health", description: "健康巡检：开关/频率/空闲判定/催问上限/立刻巡检一次（防止 agent 中途意外停住）" },
       ];
       const filtered = subs.filter((s) => s.value.startsWith(prefix));
       return filtered.length > 0 ? filtered : null;
@@ -1322,6 +1663,55 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: `呼喊偏好已切换为：${CALLING_MODE_LABEL[params.mode as CallingMode]}（依据：${params.reason}）` }],
         details: { mode: params.mode, applied: true, reason: params.reason },
+      };
+    },
+  });
+
+  // 工具：agent 向健康巡检表态（完成 / 在等你 / 仍在推进）
+  pi.registerTool({
+    name: "set_task_state",
+    label: "Set Task State",
+    description:
+      "向健康巡检上报当前任务状态（离开模式下由系统定时追问；不在离开模式时调用无效）。\n" +
+      "state=done —— 任务已全部完成、可验收：巡检不再追问（直到用户开口继续，状态自动回到 working）。\n" +
+      "state=waiting_user —— 你在等用户（等我登录 / 决策 / 确认 / 手动操作）：巡检不再追问，等用户回来。\n" +
+      "state=working —— 仍在推进（默认值）：巡检按原节奏继续。\n" +
+      "**调用时机**：收到 [健康巡检] 消息后必须先调用本工具表态，再继续干活；" +
+      "任务真的全部完成时也要主动调用（别等系统问）。note 写一句话（交付了什么 / 在等什么 / 正在做什么）。",
+    promptSnippet: "Report task state to the health watcher (done / waiting_user / working)",
+    promptGuidelines: [
+      "Call set_task_state right after receiving a [健康巡检] message — before doing anything else.",
+      "Use done only when the task is fully complete and verifiable; use waiting_user when you are blocked on the user; use working while still progressing.",
+      "Also call it proactively when the task is fully done, without waiting for the health check.",
+    ],
+    parameters: Type.Object({
+      state: StringEnum(["working", "done", "waiting_user"] as const),
+      note: Type.Optional(Type.String({
+        description: "一句话说明：交付了什么 / 在等用户做什么 / 正在做什么",
+      })),
+      reason: Type.Optional(Type.String({ description: "依据（调试用）" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!config.cooking) {
+        return {
+          content: [{ type: "text", text: "未在离开模式，健康巡检不生效。" }],
+          details: { applied: false, state: params.state },
+        };
+      }
+      const now = Date.now();
+      const prev = health.phase;
+      setPhase(health, params.state as HealthPhase, now, params.note);
+      updateWidget(ctx);
+      const label =
+        params.state === "done"
+          ? "✅ 已标记完成，健康巡检不再追问（你在会话里继续后自动恢复追问）"
+          : params.state === "waiting_user"
+            ? "⏳ 已标记「在等你」，健康巡检不再追问"
+            : "🔧 已标记「仍在推进」，健康巡检继续";
+      if (prev !== params.state) ctx.ui.notify(`🩺 ${label}${params.note ? `：${params.note}` : ""}`, "info");
+      return {
+        content: [{ type: "text", text: label }],
+        details: { applied: true, state: params.state, previous: prev, note: params.note ?? null },
       };
     },
   });
@@ -1568,16 +1958,71 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, _ctx) => {
     if (!config.cooking) return;
     agentActive = true; // 回合开始：进度心跳恢复触发
+    touchActivity(health, Date.now()); // 有新动静：巡检空闲窗口重置（不动催问计数）
     const base = event.systemPrompt.endsWith("\n") ? event.systemPrompt : event.systemPrompt + "\n";
     return {
       systemPrompt: base + (await buildRulesPrompt(config.autonomyLevel || "balanced", config.progressReporting || "milestone")),
     };
   });
 
+  // 回合开始/结束：活动信号 + 记住结束原因与最后一句（健康巡检文案用）
+  pi.on("agent_start", () => { if (config.cooking) touchActivity(health, Date.now()); });
+  pi.on("agent_end", (event) => {
+    if (!config.cooking) return;
+    touchActivity(health, Date.now());
+    try {
+      const last = [...(event.messages ?? [])].reverse().find((m) => m.role === "assistant") as
+        | { role: string; content: any; stopReason?: string }
+        | undefined;
+      if (last) {
+        lastStopReason = last.stopReason;
+        const text = extractText(last).trim();
+        if (text) lastAssistantText = text;
+      }
+    } catch { /* best effort */ }
+  });
+
+  // 工具在飞 = 真的在干活（长 bash / 同步 subagent() 都算）
+  pi.on("tool_execution_start", () => {
+    if (!config.cooking) return;
+    runningTools++;
+    touchActivity(health, Date.now());
+  });
+  pi.on("tool_execution_end", (event) => {
+    if (!config.cooking) return;
+    runningTools = Math.max(0, runningTools - 1);
+    // 本插件自己的表态/呼喊工具不算「真实工作」：否则 agent 只需回一句呼喊
+    // 就把催问计数清零，巡检永远升不了级（无限空转）。
+    if (STATEMENT_ONLY_TOOLS.has(event.toolName)) return;
+    markRealWork(health, Date.now());
+  });
+
+  pi.on("turn_start", () => { if (config.cooking) touchActivity(health, Date.now()); });
+
+  // ── pi-subagents 子代理活动信号（event-bus，进程内）────────────────────
+  // 子代理在跑 = 父 agent 在干活 → 巡检不算它「停住」。事件驱动快且准，
+  // /reload 后丢失的历史 run 由 countActiveSubagents 的 registry 探测兜底。
+  const subStarted = (payload: unknown) => {
+    if (!config.cooking) return;
+    const id = (payload as { id?: unknown })?.id;
+    if (typeof id === "string" && id) activeSubagents.add(id);
+    touchActivity(health, Date.now());
+  };
+  const subComplete = (payload: unknown) => {
+    const id = (payload as { id?: unknown })?.id;
+    if (typeof id === "string" && id) activeSubagents.delete(id);
+    if (!config.cooking) return;
+    // 子代理结束 = 有产出：真实工作信号（父 agent 会接着处理结果）
+    markRealWork(health, Date.now());
+  };
+  bindSubagentEvents(subStarted, subComplete);
+
+
   // 回合收尾检测：定时汇报自动停表 + 自动呼喊安全网（agent 在等用户/报错）
   pi.on("agent_settled", async (_event, ctx) => {
     agentActive = false; // 回合结束：进度心跳暂停（新回合开始时恢复）
     if (!config.cooking) return;
+    touchActivity(health, Date.now()); // 回合结束也算有动静（刚说完话）
     try {
       const entries = ctx.sessionManager.getEntries();
       let lastAssistant: { text: string; stopReason?: string } | undefined;
@@ -1604,6 +2049,13 @@ export default function (pi: ExtensionAPI) {
       //  对两种进度模式都生效——即使正则漏判收尾，回合结束本身也会让心跳暂停，不会空转催促）
       if (config.progressReporting !== "none" && detectTaskFinale(text)) {
         stopReportTimer();
+        setPhase(health, "done", Date.now(), "回合总结表明任务已全部收尾"); // 健康巡检同步静默
+      }
+
+      // 它在等我回复（以 ？结尾的短问题）→ 健康巡检标记 waiting_user，不再追问
+      const lvl = config.autonomyLevel || "balanced";
+      if (lvl !== "autonomous" && text.length <= 600 && /[?？]\s*$/.test(text)) {
+        if (health.phase === "working") setPhase(health, "waiting_user", Date.now(), "回合以问号结尾，在等你回复");
       }
 
       if (!config.autoDetect) return;
@@ -1629,6 +2081,10 @@ export default function (pi: ExtensionAPI) {
     if (!config.cooking) return;
     if (event.source !== "interactive") return;
     if (event.text.trim().startsWith("/")) return; // 命令已由 command 处理
+
+    // 你在会话里继续 → 健康巡检回到 working：下次巡检还会问它是否完成
+    markUserInput(health, Date.now());
+    updateWidget(ctx);
 
     // ① 文字匹配：用户原话里带偏好关键词 → 立即切换（不依赖 agent）
     const mode = detectPreference(event.text);

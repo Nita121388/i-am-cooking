@@ -81,6 +81,13 @@ export interface Config {
   reportIntervalMinutes: number;   // 定时汇报间隔（分钟，默认 15）
   ttsTemplateMilestone: string;  // 小阶段完成时的 TTS 文案
   milestoneBeeps: number;        // 小阶段完成时的提示音次数（默认 1，轻声）
+
+  // health watch（健康巡检）：离开模式开着但 agent 可能意外停住时，定时探测并催问
+  healthCheck: boolean;          // 巡检总开关
+  healthCheckMinutes: number;    // 巡检滴答间隔（分钟，默认 5）
+  healthIdleMinutes: number;     // 空闲多久判定「没在运行」（分钟，默认 10）
+  healthMaxNudges: number;       // 同一段空闲最多催几次（默认 5），之后升级喊用户一次
+  healthMuteEscalation: boolean; // true = 只催不喊，一直催（用户说过别喊时自动置位）
 }
 
 export const DEFAULTS: Config = {
@@ -119,6 +126,11 @@ export const DEFAULTS: Config = {
   reportIntervalMinutes: 15,
   ttsTemplateMilestone: "小进展：{message}",
   milestoneBeeps: 1,
+  healthCheck: true,
+  healthCheckMinutes: 5,
+  healthIdleMinutes: 10,
+  healthMaxNudges: 5,
+  healthMuteEscalation: false,
 };
 
 /**

@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- **健康巡检（health watch）：定时探活，治 agent 中途意外停住**。离开模式开着时，可能因为报错 / 上下文超限 / 进程抖动 / 模型卡住而悄悄停住——既没完成也没喊人。新增定时滴答（默认每 5 分钟）检查 agent 是否真的在运行：回合/工具/**async 子代理**/待投递队列 四项全空，且空闲超过阈值（默认 10 分钟）才判定为「停住」，注入一条 `[健康巡检]` 消息逼 agent 三选一表态。
+  - `set_task_state(state="done")` → 巡检静默，不再追问（直到用户在会话里继续）
+  - `set_task_state(state="waiting_user")` → 在等你，不是卡死 → 静默
+  - 都没表态 → 从暂停处继续推进（防意外终止丢进度）
+  - 追问消息带上上一回合的 `stopReason` 与最后一句：`error` 中断会提示「先判断错误是否消失，不要原样重试」
+- **催满上限才喊人（默认 5 次）**：同一段空闲最多追问 5 次，仍无动静 → 升级为一次 `normal` 呼喊（响铃 + 手机 + 横幅）后暂停。用户说过「别喊了」（silence）→ 不升级，只催不喊、一直催下去（`healthMuteEscalation`）。
+- **状态随用户回流**：用户一开口（interactive input）状态立即回到 `working`，下次巡检仍会问它是否完成；`shout_for_user(completion)` / 回合总结命中收尾正则 / 回合以问号结尾（在等你的回复）都会自动同步状态，不依赖 agent 记得调工具。
+- 新工具 `set_task_state(working|done|waiting_user, note?, reason?)`；新命令 `/i-am-cooking health`（查看/开关/频率/空闲判定/催问上限/是否升级喊人/**立刻巡检一次**）；`/status` 与横幅新增 `🩺` 状态与 `🤖 子代理 N 个在跑`。
+- 新增 `lib/health.ts`（纯逻辑，24 个单测覆盖状态机、滴答判定、上限升级、文案）+ `tests/health.test.ts`；配置项 `healthCheck` / `healthCheckMinutes` / `healthIdleMinutes` / `healthMaxNudges` / `healthMuteEscalation`。
+
+### Fixed
+- 催问计数不会被 agent 自己的表态类工具（`set_task_state` / `shout_for_user`）洗掉——否则被催一次就清零，永远升不到上限（无限空转烧 token）。
+- 有未处理阻塞呼喊时，只有**真的空闲超阈值**才判 `waiting_user`；刚喊完还在干活不会被提前静默。
+
 ## [0.9.1] - 2026-08-22
 
 ### Fixed
