@@ -420,8 +420,8 @@ async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
   }
   if (sub === "now") {
     if (!config.cooking) { ctx.ui.notify("当前不在离开模式，巡检只在离开模式下工作（先 /i-am-cooking on）。", "warning"); return; }
-    // 手动立刻巡一次：忽略「空闲不够久」这道门，方便测试
-    health.idleSince = 0;
+    // 手动立刻巡一次：把空闲起点推到「刚好超过阈值」，方便测试且文案正常
+    forceIdleForCheck();
     ctx.ui.notify("🩺 手动触发一次巡检…", "info");
     healthTick(ctx);
     return;
@@ -454,7 +454,7 @@ async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
   }
   if (choose.includes("立刻巡检")) {
     if (!config.cooking) { ui.notify("当前不在离开模式，巡检只在离开模式下工作（先 /i-am-cooking on）。", "warning"); return; }
-    health.idleSince = 0;
+    forceIdleForCheck();
     ui.notify("🩺 手动触发一次巡检…", "info");
     healthTick(ctx);
     return;
@@ -966,6 +966,12 @@ function lastTurnSnapshot(ctx: CookingCtx): { stopReason?: string; text: string 
     }
   } catch { /* best effort */ }
   return { stopReason: lastStopReason, text: lastAssistantText };
+}
+
+/** 手动巡检用：把空闲起点推到「刚好超过阈值」，忽略「空闲不够久」这道门 */
+function forceIdleForCheck(): void {
+  const minutes = Math.max(1, config.healthIdleMinutes || 10);
+  health.idleSince = Date.now() - minutes * 60_000 - 1_000;
 }
 
 /** 一次巡检滴答（默认每 healthCheckMinutes 分钟） */
