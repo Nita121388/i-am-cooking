@@ -56,7 +56,7 @@ import { CONFIG_DIR, CONFIG_PATH, DEFAULT_RULES_PATH, RULES_PATH, SCRIPTS, TMP_D
 import type { Alert, AutonomyLevel, CallingMode, Config, Urgency } from "./lib/config.ts";
 import { DEFAULTS, readConfig, writeConfig } from "./lib/config.ts";
 import { hasActiveAudio, playSound, stopAllAudio } from "./lib/audio.ts";
-import { AUTONOMY_LABEL, CALLING_MODE_LABEL, detectAutonomyLevel, detectPreference, detectTaskFinale, isProgressCategory, shouldSuppress as shouldSuppressLib } from "./lib/prefs.ts";
+import { AUTONOMY_LABEL, CALLING_MODE_LABEL, detectAutonomyLevel, detectPreference, detectTaskFinale, isProgressCategory, shouldSuppress as shouldSuppressLib, userInputNotice } from "./lib/prefs.ts";
 import { pushPhone, pushWebhook, resolveValue } from "./lib/push.ts";
 import { startRemoteStopServer, type RemoteStopHandle } from "./lib/remote-stop.ts";
 import { boostVolume, getSystemVolume, restoreVolume, setSystemVolume, toggleMute } from "./lib/volume.ts";
@@ -2132,19 +2132,16 @@ export default function (pi: ExtensionAPI) {
 
     // ② 用户打字 = 人在场 + 已响应：停掉正在响的铃声，旧呼喊标记处理，横幅回基础状态
     //    agent 继续自主干活；之后的呼喊是新信号，照常显示/响铃
-    const hadUnacked = pendingAlerts().length > 0;
-    if (hadUnacked || shoutingState || hasActiveAudio()) {
+    const pendingCount = pendingAlerts().length; // 数量，不是布尔——插值进文案会变成 "true 条"
+    const hadAudio = shoutingState || hasActiveAudio();
+    if (pendingCount > 0 || hadAudio) {
       stopAudioAll(); // 人在场：立即安静
       for (const a of config.alerts) a.acked = true;
       void writeConfig(config);
       updateStatus(ctx, "idle");
       updateWidget(ctx);
-      ctx.ui.notify(
-        hadUnacked
-          ? `✍️ 收到你的信息，之前的 ${hadUnacked} 条呼喊已标记处理。agent 继续干活，有新的再喊你。`
-          : "🔕 已停止响铃。",
-        "info",
-      );
+      const notice = userInputNotice({ pendingCount, hadAudio });
+      if (notice) ctx.ui.notify(notice, "info"); // 0 条且没在响 → 不打扰
     }
 
     // ③ 关闭离开模式由 agent 语义理解调用 exit_cooking_mode，或用户手动 /off

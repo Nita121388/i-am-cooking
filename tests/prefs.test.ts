@@ -6,6 +6,7 @@ import {
   detectAutonomyLevel,
   detectTaskFinale,
   isProgressCategory,
+  userInputNotice,
   shouldSuppress,
 } from "../extensions/i-am-cooking/lib/prefs.ts";
 
@@ -94,4 +95,19 @@ test("detectTaskFinale 识别任务收尾（定时汇报自动停表用）", () 
   assert.equal(detectTaskFinale("还有任务没完成"), false);
   assert.equal(detectTaskFinale("任务完成了一半"), false);
   assert.equal(detectTaskFinale("完成 2/4 阶段"), false);
+});
+// ── 用户打字时的提示（曾把布尔值插进「N 条」文案，渲染成 "true 条"）──
+test("userInputNotice：0 条待处理且没在响 → 不打扰（返回 null）", () => {
+  assert.equal(userInputNotice({ pendingCount: 0, hadAudio: false }), null);
+});
+
+test("userInputNotice：有待处理呼喊 → 报真实数量，且说明 agent 继续干", () => {
+  const s = userInputNotice({ pendingCount: 3, hadAudio: false });
+  assert.ok(s?.includes("3 条呼喊"), `应含真实数量：${s}`);
+  assert.ok(s?.includes("继续干"));
+  assert.ok(!/true|false/.test(s ?? ""), "不得出现布尔值字样");
+});
+
+test("userInputNotice：没呼喊但在响 → 只报静音", () => {
+  assert.equal(userInputNotice({ pendingCount: 0, hadAudio: true }), "🔕 已停止响铃。");
 });

@@ -118,6 +118,24 @@ export function isProgressCategory(category: string): boolean {
  * 偏好拦截：根据 callingMode 判断是否抑制响铃（降级为仅 TUI 横幅）。
  * 返回 true = 不响铃/不推送，只留 widget + TUI notify。
  */
+/**
+ * 用户打字时该弹什么提示。无内容就闭嘴（返回 null）：
+ *   0 条待处理 + 没在响 → null，别拿「收到你的信息」刷屏
+ *   有未处理呼喊        → 告知已标记处理多少条，并说明 agent 会继续干
+ *   没呼喊但在响/广播中  → 只报静音
+ */
+export function userInputNotice(input: {
+  pendingCount: number; // 当前未 ack 的呼喊数（布尔值当数量插值会渲染成 "true 条"）
+  hadAudio: boolean;    // 当时是否在响或在广播
+}): string | null {
+  const { pendingCount, hadAudio } = input;
+  if (pendingCount > 0) {
+    return `✍️ 已收到你打字，之前的 ${pendingCount} 条呼喊标记处理。agent 继续干，有新的再喊你。`;
+  }
+  if (hadAudio) return "🔕 已停止响铃。";
+  return null;
+}
+
 export function shouldSuppress(mode: CallingMode, alert: Pick<Alert, "category" | "urgency">): boolean {
   if (mode === "silence") return true;                        // 全部静音
   if (mode === "completion_only") return alert.category !== "completion"; // 只有完成才响
