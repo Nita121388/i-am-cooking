@@ -2,9 +2,9 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { DEFAULTS, readConfig, writeConfig } from "../extensions/i-am-cooking/lib/config.ts";
+import { DEFAULTS, readConfig, resolveStateDir, writeConfig } from "../extensions/i-am-cooking/lib/config.ts";
 import type { Config } from "../extensions/i-am-cooking/lib/config.ts";
 
 const dirs: string[] = [];
@@ -48,4 +48,21 @@ test("alerts 缺失时兜底为空数组", async () => {
   await writeConfig({ ...DEFAULTS, alerts: undefined as never } as Config, p);
   const cfg = await readConfig(p);
   assert.deepEqual(cfg.alerts, []);
+});
+
+// ── 状态目录隔离：dev / release / 多实例各用一份 ──
+test("resolveStateDir：未设 I_AM_COOKING_HOME 时维持历史默认路径", () => {
+  const home = "/home/u";
+  assert.equal(resolveStateDir({}, home), join("/home/u", ".pi", "i-am-cooking"));
+  assert.equal(resolveStateDir({ I_AM_COOKING_HOME: "   " }, home), join(home, ".pi", "i-am-cooking"));
+});
+
+test("resolveStateDir：I_AM_COOKING_HOME 覆盖为独立目录", () => {
+  assert.equal(resolveStateDir({ I_AM_COOKING_HOME: "/tmp/iac-dev" }, "/home/u"), resolve("/tmp/iac-dev"));
+  // 相对路径也解析成绝对路径，不依赖 cwd 之外的偶合
+  assert.ok(resolveStateDir({ I_AM_COOKING_HOME: "iac-dev" }, "/home/u").endsWith("iac-dev"));
+});
+
+test("resolveStateDir：~ 展开到 home，不误用真实 homedir", () => {
+  assert.equal(resolveStateDir({ I_AM_COOKING_HOME: "~/.pi/iac-dev" }, "/home/u"), resolve("/home/u/.pi/iac-dev"));
 });

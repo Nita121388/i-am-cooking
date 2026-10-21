@@ -83,11 +83,28 @@
 - [ ] macOS: sound/TTS (`say`)/notification (`osascript`)/volume
 - [ ] Linux: sound/TTS (`espeak-ng`)/notification (`notify-send`)/volume (`pactl`)
 
+## 10. Dev / release isolation（本地隔离，可自动化）
+
+不碰日常配置、不加载已装版本的前提下验证本仓库代码：
+
+```bash
+# 用隔离状态目录 + 临时加载（-ne 关掉自动发现，避免已装 npm 版一起加载）
+I_AM_COOKING_HOME=/tmp/iac-dev \
+  pi -ne -e "$PWD/extensions/i-am-cooking/index.ts"
+```
+
+- [ ] `I_AM_COOKING_HOME` 未设时仍用 `~/.pi/i-am-cooking`（行为不变）
+- [ ] 设了之后只在目标目录生成 `config.json` / `rules.md`，日常目录 mtime 不变
+- [ ] 隔离实例的 `rules.md` 含最新出厂章节（旧实例不会自动更新 → 需 `reset-rules`）
+- [ ] 日常已装 `npm:i-am-cooking` 时，`-ne -e` 只加载一份（工具不重复、不双份响铃）
+- [ ] `npm test`（含 `tests/load.test.ts` 装载冒烟）与 `npm run typecheck` 全绿
+
 ---
 
 ## Release procedure
 
 ```bash
+# 0. devDeps 里的 @earendil-works/* 版本要跟运行时 pi 一致（typecheck 才有效）
 # 1. bump version in package.json + CHANGELOG.md
 # 2. run this checklist
 # 3. commit & tag

@@ -3,7 +3,7 @@
  * 全局 config 单例仍由入口 index.ts 持有（本模块只提供纯数据结构与文件操作）。
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -12,7 +12,20 @@ export const HOME = homedir();
 export const SCRIPTS = fileURLToPath(new URL("../scripts", import.meta.url));
 // 出厂默认规则文件（仓库内，进 git）：随插件版本更新，运行时首次创建用户文件时从它拷贝
 export const DEFAULT_RULES_PATH = fileURLToPath(new URL("../rules.default.md", import.meta.url));
-export const CONFIG_DIR = join(HOME, ".pi", "i-am-cooking");
+
+/**
+ * 状态目录解析（纯函数，可测试）。
+ * 默认 `~/.pi/i-am-cooking`（与历史行为完全一致）。
+ * 设 `I_AM_COOKING_HOME` 可指向独立目录 —— 本地开发/验证时用它把 config.json、
+ * rules.md、tmp、audio.lock 与日常在用的那份彻底隔开，避免互相踩。
+ */
+export function resolveStateDir(env: NodeJS.ProcessEnv = process.env, home: string = HOME): string {
+  const raw = env.I_AM_COOKING_HOME?.trim();
+  if (!raw) return join(home, ".pi", "i-am-cooking");
+  return resolve(raw.replace(/^~\//, `${home}/`));
+}
+
+export const CONFIG_DIR = resolveStateDir();
 export const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 export const RULES_PATH = join(CONFIG_DIR, "rules.md");
 export const TMP_DIR = join(CONFIG_DIR, "tmp");

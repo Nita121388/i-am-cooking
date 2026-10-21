@@ -74,6 +74,32 @@ pi install /path/to/your/local/checkout
 
 安装后 `/reload` 或重启 pi 生效。
 
+## 🔧 本地开发与验证
+
+插件有两类状态会跨安装方式共享：**状态目录**（`~/.pi/i-am-cooking/` 下的 `config.json`、`rules.md`、`tmp/`、`audio.lock`）和 **运行时配置**。本地调试时如果不做隔离，开发副本会和日常在用的那份互相覆盖——你临时调小的巡检阈值会污染日常配置，两份副本同时加载还会双份响铃、双份巡检。
+
+**做法：环境变量隔离状态目录 + `-e` 临时加载**
+
+```bash
+I_AM_COOKING_HOME=~/.pi/iac-dev \
+  pi -ne -e /path/to/i-am-cooking/extensions/i-am-cooking/index.ts
+```
+
+- `I_AM_COOKING_HOME`：把 `config.json` / `rules.md` / `tmp/` / `audio.lock` 指向独立目录（默认仍是 `~/.pi/i-am-cooking`，不设则行为与历史完全一致）。
+- `-e`：临时加载本次进程，**不写 settings**，退出即消失；配合 `-ne`（关掉自动发现）确保不会把已安装的 npm 版一起加载进来。
+- 想连 settings / session / 包目录也整套分开，再加 `PI_CODING_AGENT_DIR=<目录>`。
+
+**每次改动跑一遍：**
+
+```bash
+npm test        # 单测：lib/ 纯逻辑 + 装载冒烟（mock ExtensionAPI 真跑入口）
+npm run typecheck
+```
+
+`npm install` 会把 `@earendil-works/*` 按**运行时 pi 的版本**固定到 `devDependencies`，所以 typecheck 能对上真实 API。换 pi 版本后需要同步更新这四个版本号。
+
+> ⚠️ **规则文件只播种一次**：`rules.default.md` 只在 `~/.pi/i-am-cooking/rules.md` **不存在时**才会拷贝。改完出厂默认想在本机看到效果，需要 `/i-am-cooking reset-rules`，否则你会以为改了没生效。
+
 ## 🚀 快速开始
 
 ```bash

@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **状态随用户回流**：用户一开口（interactive input）状态立即回到 `working`，下次巡检仍会问它是否完成；`shout_for_user(completion)` / 回合总结命中收尾正则 / 回合以问号结尾（在等你的回复）都会自动同步状态，不依赖 agent 记得调工具。
 - 新工具 `set_task_state(working|done|waiting_user, note?, reason?)`；新命令 `/i-am-cooking health`（查看/开关/频率/空闲判定/催问上限/是否升级喊人/**立刻巡检一次**）；`/status` 与横幅新增 `🩺` 状态与 `🤖 子代理 N 个在跑`。
 - 新增 `lib/health.ts`（纯逻辑，24 个单测覆盖状态机、滴答判定、上限升级、文案）+ `tests/health.test.ts`；配置项 `healthCheck` / `healthCheckMinutes` / `healthIdleMinutes` / `healthMaxNudges` / `healthMuteEscalation`。
+- **开发/发布隔离：`I_AM_COOKING_HOME` 环境变量**。不设时仍是 `~/.pi/i-am-cooking`，行为完全不变；设了就把 `config.json` / `rules.md` / `tmp/` / `audio.lock` 指向独立目录。本地调试用 `I_AM_COOKING_HOME=~/.pi/iac-dev pi -ne -e <本仓库>/extensions/i-am-cooking/index.ts`，与日常在用的那份彻底隔开（否则临时调的阈值会污染日常配置，两份副本同时加载还会双份响铃、双份巡检）。`resolveStateDir()` 为纯函数，带 3 个单测。
+- **装载冒烟测试** `tests/load.test.ts`：用 mock `ExtensionAPI` 真跑扩展入口，断言可装载、8 个工具与命令/快捷键都注册、关键事件都订阅、无重复注册。补上「单测只覆盖 lib/、入口装载没人管」的空白。
+- `devDependencies` 固定 `@earendil-works/*` 到与运行时 pi 一致的版本（当前 `0.83.0`）。此前 `peerDependencies: "*"` 会被 npm 解析成任意旧版（实测拿到 `0.74.2`，没有 `agent_settled` 事件），导致 typecheck 对错版本的 API 报警、真实错误反而被掩盖。
+- README 新增「本地开发与验证」章节（隔离做法、每次改动跑什么、规则文件只播种一次的坑）。
 
 ### Fixed
 - 催问计数不会被 agent 自己的表态类工具（`set_task_state` / `shout_for_user`）洗掉——否则被催一次就清零，永远升不到上限（无限空转烧 token）。
