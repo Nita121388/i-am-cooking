@@ -375,6 +375,35 @@ test("R2 幂等：同一回合不重复扫描（同一 settle 不重复判定）
   assert.equal(second, 1, "同一回合重复 settle 不该重复处理");
 });
 
+test("R2 独立收尾判官失败 → 降级为正则结论，不卡死也不误判完成", async () => {
+  // healthEndJudge=cli 但命令不存在：必须优雅降级（end-judge 只测了纯解析，这里测接线）
+  const ctx = await enterCooking({
+    healthEndJudge: "cli",
+    healthEndJudgeCmd: "/nonexistent/judge-binary '{prompt}'",
+    healthEndJudgeTimeoutSeconds: 1,
+    progressReporting: "none",
+  });
+  entries = [
+    { type: "message", message: { role: "user", content: "干活" } },
+    {
+      type: "message",
+      message: { role: "assistant", content: [{ type: "text", text: "这一轮改完了三个文件，接下来继续跑测试。" }], stopReason: "stop" },
+    },
+  ];
+  // 不抛异常、不挂住（命令不存在 → exit 127 → 降级 unknown）
+  await fire("agent_settled", { type: "agent_settled" }, ctx);
+  await flush(undefined, 300);
+  const cfg = await readConfig();
+  assert.equal(cfg.alerts.length, 0, "判官失败不该产生呼喊");
+  // 降级为「没判定出 done」→ 巡检继续按 working 处理（稍后才催），不会被错标完成
+  notifies.length = 0;
+  advance(60 * 60_000);
+  assert.ok(
+    notifies.some((n) => n.message.includes("追问状态")),
+    "降级后仍应按 working 继续巡检（不能被误判为已完成）",
+  );
+});
+
 test("R6 放手等级：回合以「？」结尾不自动喊人", async () => {
   const ctx = await enterCooking({ autonomyLevel: "autonomous", autoDetect: true });
   entries = [
@@ -415,5 +444,7 @@ test("关闭离开模式后：超时不再 abort，退避重试也作废", async
 
 test("cleanup", async () => {
   restoreGlobals();
-  await rm(STATE_DIR, { recursive: true, force: true });
+  // 还有队列里的 config 写入在跑：给它们一点时间，并允许重试（否则偶发 ENOENT/ENOTEMPTY）
+  await new Promise((r) => realSetTimeout(r, 50));
+  await rm(STATE_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });

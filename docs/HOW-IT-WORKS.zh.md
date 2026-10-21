@@ -256,6 +256,10 @@ G 面板说的盲区在 `runningTools` 这条上不成立——那里不是「�
 
 修法：`agent_settled` 里回合结束的同时补一次 `setPhase(done)`。改动小，但要先补 `reportTimer` 的测试——现在这块零覆盖。
 
+> 已修（v0.10.0）：`agent_settled` 收尾判定命中（正则或可选独立判官）就 `stopReportTimer()` + `setPhase(done)`；
+> 用「条目数 + 结束原因 + 最后一句」做同回合幂等签名，不会重复扫描。独立判官默认 `off`，
+> 开启后任何失败（命令不存在 / 超时 / 输出无法解析）都降级为正则结论。
+
 ### TODO-3 两个定时器重叠部分的优化
 
 按改动从小到大排三步。
@@ -278,6 +282,9 @@ G 面板说的盲区在 `runningTools` 这条上不成立——那里不是「�
 ```
 
 注意：统一口径会改变行为。进度汇报在长工具调用时不再插话。这是期望的，已在 CHANGELOG 写明。
+
+> 已修（v0.10.0）：`activitySnapshot(ctx)` 是唯一口径，两条线都从它取数；
+> `repeatTimers` 改名 `sessionTimers`；两处 `hasPendingMessages()` 收进 snapshot。
 
 ## L 异常状态认定表
 

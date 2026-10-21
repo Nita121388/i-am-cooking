@@ -54,7 +54,6 @@ import { renderTts as renderTtsImpl } from "./lib/tts.ts";
 import { buildStallAlert, buildHealthPrompt, decideHealthTick, applyHealthDecision, formatHealthLine, formatIdle, markRealWork, markUserInput, newHealthState, setPhase, touchActivity, shouldSkipReportTick } from "./lib/health.ts";
 import type { ActivitySnapshot, HealthPhase, HealthState } from "./lib/health.ts";
 import { newToolWatch, startToolWatch, endToolWatch, runningToolCount, clearToolWatch, overdueTools, buildToolTimeoutSteer, formatRunningTools } from "./lib/tool-watch.ts";
-import type { ToolWatch } from "./lib/tool-watch.ts";
 import { classifyTurnError, isRetryable, shouldCompactFirst, backoffMs, shouldEscalate, buildRetrySteer, describeErrorKind } from "./lib/errors.ts";
 import type { TurnErrorKind } from "./lib/errors.ts";
 import { buildEndJudgePrompt, parseEndJudgeVerdict, shouldUseEndJudge, renderEndJudgeCommand } from "./lib/end-judge.ts";
@@ -142,7 +141,6 @@ let retryTimerRef: ReturnType<typeof setTimeout> | null = null;
 /** 收尾判定幂等：用「同一回合」的签名去重——agent_settled 可能因内部重试多次触发，
  *  但只有条目数量与最后一句都一样的才是同一个回合。新一轮工作会改变条目数 → 重新进入判定。 */
 let lastSettleSignature = "";
-/** 最近一次事件里的 ctx（定时器回调里拿不到事件 ctx，超时 abort / 巡检需要它） */
 /** 本进程的 Agent 身份（父会话 / 子 Agent）。
  *  子 Agent 不能直接呼喊：它可能跑在用户没打开的会话里（如 Zen 镜像），
  *  喊了也回不去。它的呼喊请求交给父会话，由父 Agent 转达。 */
