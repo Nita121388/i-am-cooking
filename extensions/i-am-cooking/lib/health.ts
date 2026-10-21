@@ -18,7 +18,42 @@ export type HealthPhase =
   | "working" // 认为它还在干活（默认）
   | "done" // agent 自报已完成 → 巡检静默
   | "waiting_user" // agent 在等用户（决策/凭据/审批）→ 巡检静默
-  | "stalled"; // 催了 N 次都没动静，已升级喊人 → 巡检静默
+  | "stalled" // 催了 N 次都没动静，已升级喊人 → 巡检静默
+  | "exhausted"; // 用户说过别喊 → 催到上限后停止追问（不升级、不喊人）
+
+// ── 「忙」的统一判定（TODO-3）────────────────────────────────────────────
+// reportTimer 与 healthTick 曾经各判各的（一个只看 agentActive，一个还看工具/子代理/队列），
+// 结果同一时刻 A 判不忙、B 判忙。现在两条线都从这里取数。
+
+export interface ActivitySnapshot {
+  /** 回合进行中（agentActive || !ctx.isIdle()） */
+  agentBusy: boolean;
+  /** 正在执行中的工具数（长 bash / 同步 subagent 都算） */
+  runningTools: number;
+  /** 当前会话里还在跑的 async 子代理数 */
+  activeSubagents: number;
+  /** 有消息压在投递队列里 */
+  pendingMessages: boolean;
+}
+
+/** 忙 = 回合在跑 或 有工具/子代理在干活。队列不算「忙」，它只是「别插话」。 */
+export function isBusy(s: ActivitySnapshot): boolean {
+  return s.agentBusy || s.runningTools > 0 || s.activeSubagents > 0;
+}
+
+/**
+ * 进度心跳这次该不该插话。
+ * 与 healthTick 的区别只是方向：心跳要「回合在跑」才有进度可报，巡检要「没在跑」才催。
+ * 但对「什么叫忙」的判断完全一致 —— 这就是 TODO-3 要消掉的漂移。
+ *
+ * 长工具调用中不插话：steer 会压在队列里等这次工具结束才投递，堆积成重复催促。
+ */
+export function shouldSkipReportTick(s: ActivitySnapshot): boolean {
+  if (!s.agentBusy) return true; // 回合已结束 → 无进度可报
+  if (s.runningTools > 0) return true; // 卡在长工具里 → 插话只会堆积
+  if (s.pendingMessages) return true; // 队列里已有话没投递 → 别再压一条
+  return false;
+}
 
 export interface HealthState {
   phase: HealthPhase;
@@ -116,8 +151,10 @@ export interface HealthTickProbe {
   idleMinutes: number;
   /** 同一段空闲最多催几次 */
   maxNudges: number;
-  /** 用户明确说了别喊 → 只催不升级，永不静默 */
+  /** 用户明确说了别喊 → 只催不升级，催到这个次数才停止（0 = 不限制） */
   muteEscalation: boolean;
+  /** muteEscalation 下的催问上限（默认 30） */
+  silenceMaxNudges?: number;
 }
 
 export type HealthTickDecision =
@@ -127,7 +164,9 @@ export type HealthTickDecision =
   /** 注入一次巡检询问，nudge 是本次序号（从 1 开始） */
   | { action: "nudge"; nudge: number }
   /** 催到上限仍没动静 → 升级喊人一次，之后静默 */
-  | { action: "escalate" };
+  | { action: "escalate" }
+  /** 静默模式催到上限 → 尊重「别喊了」，停止追问但不喊人 */
+  | { action: "exhausted" };
 
 /** 判定本次滴答该做什么（纯函数，不改状态） */
 export function decideHealthTick(state: HealthState, probe: HealthTickProbe): HealthTickDecision {
@@ -144,8 +183,13 @@ export function decideHealthTick(state: HealthState, probe: HealthTickProbe): He
   }
   // 已经空闲且还有未处理的阻塞呼喊 = 它在等你（不是在卡死）→ 静默
   if (probe.blockingAlerts > 0) return { action: "waiting" };
-  // 用户说了"别喊了"这类：不升级，一直催（但要真的空闲才会催到）
-  if (probe.muteEscalation) return { action: "nudge", nudge: state.nudges + 1 };
+  // 用户说了"别喊了"这类：不升级。但仍要有上限（默认 30 次），
+  // 否则一个真死掉的会话会被无限追问下去，白烧 token。
+  if (probe.muteEscalation) {
+    const cap = probe.silenceMaxNudges ?? 30;
+    if (cap > 0 && state.nudges >= cap) return { action: "exhausted" };
+    return { action: "nudge", nudge: state.nudges + 1 };
+  }
   if (state.nudges >= Math.max(1, probe.maxNudges)) return { action: "escalate" };
   return { action: "nudge", nudge: state.nudges + 1 };
 }
@@ -165,6 +209,12 @@ export function applyHealthDecision(state: HealthState, decision: HealthTickDeci
   if (decision.action === "escalate") {
     state.phase = "stalled";
     state.escalatedAt = now;
+    return;
+  }
+  if (decision.action === "exhausted") {
+    // 注意：这里**不喊人**，只是停止追问。用户说了别喊，就真的不喊。
+    state.phase = "exhausted";
+    state.escalatedAt = undefined;
   }
 }
 
@@ -186,6 +236,7 @@ const PHASE_LABEL: Record<HealthPhase, string> = {
   done: "已完成（不再追问）",
   waiting_user: "在等你（不再追问）",
   stalled: "无响应（已喊人，暂停追问）",
+  exhausted: "已按你要求停止追问（不喊人）",
 };
 
 /** 一行摘要（状态栏 / status 用） */

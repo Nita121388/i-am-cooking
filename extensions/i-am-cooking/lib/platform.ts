@@ -10,6 +10,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
+export { execFile };
 export const execFileAsync = promisify(execFile);
 
 /** 跨平台执行命令；失败只记日志不抛错（该类操作均为 best effort） */

@@ -7,10 +7,12 @@ import {
   buildStallAlert,
   decideHealthTick,
   formatIdle,
+  isBusy,
   markRealWork,
   markUserInput,
   newHealthState,
   setPhase,
+  shouldSkipReportTick,
   touchActivity,
 } from "../extensions/i-am-cooking/lib/health.ts";
 import type { HealthState, HealthTickProbe } from "../extensions/i-am-cooking/lib/health.ts";
@@ -154,11 +156,81 @@ test("催问累计到上限（默认 5 次）→ escalate", () => {
   assert.deepEqual(decideHealthTick(maxed, probe()), { action: "escalate" });
 });
 
-test("用户说了别喊（muteEscalation）→ 一直催，永不 escalate", () => {
-  const s = idleState(12, 99);
+test("用户说了别喊（muteEscalation）→ 只催不升级，到 30 次上限后停止追问", () => {
+  // 催到上限之前：一直 nudge，永不 escalate
+  const s = idleState(12, 29);
   const d = decideHealthTick(s, probe({ muteEscalation: true }));
-  assert.equal(d.action, "nudge");
-  assert.deepEqual(d, { action: "nudge", nudge: 100 });
+  assert.deepEqual(d, { action: "nudge", nudge: 30 });
+
+  // 正好到上限：不升级喊人，而是 exhausted（尊重「别喊了」）
+  const maxed = idleState(12, 30);
+  assert.deepEqual(decideHealthTick(maxed, probe({ muteEscalation: true })), { action: "exhausted" });
+
+  // 上限可配：不传 silenceMaxNudges 时默认 30
+  const capped = idleState(12, 5);
+  assert.equal(
+    decideHealthTick(capped, probe({ muteEscalation: true, silenceMaxNudges: 5 })).action,
+    "exhausted",
+  );
+  // 0 = 不限制（退回旧行为，用于测试/调试）
+  assert.deepEqual(
+    decideHealthTick(idleState(12, 999), probe({ muteEscalation: true, silenceMaxNudges: 0 })),
+    { action: "nudge", nudge: 1000 },
+  );
+});
+
+test("exhausted 之后不再追问：phase 不是 working 就直接 skip", () => {
+  const s = idleState(12, 30);
+  applyHealthDecision(s, { action: "exhausted" }, 3_000 * MIN);
+  assert.equal(s.phase, "exhausted");
+  assert.equal(s.escalatedAt, undefined, "不喊人，不该有升级时间戳");
+  // 第 31 次及以后：返回 skip（phase 闸门），行为有明确断言
+  assert.deepEqual(decideHealthTick(s, probe({ muteEscalation: true })), { action: "skip", reason: "phase" });
+});
+
+test("静默模式 exhausted 后用户开口 → 回 working、重新计数、继续催", () => {
+  const s = idleState(60, 30);
+  applyHealthDecision(s, { action: "exhausted" }, 1_100 * MIN);
+  markUserInput(s, 2_000 * MIN);
+  assert.equal(s.phase, "working");
+  assert.equal(s.nudges, 0);
+  assert.deepEqual(decideHealthTick(s, probe({ now: 2_011 * MIN, muteEscalation: true })), {
+    action: "nudge",
+    nudge: 1,
+  });
+});
+
+// ── R3：统一的「忙」判定（reportTimer 与 healthTick 共用一份数）────────
+
+test("isBusy：回合/工具/子代理任一在跑就算忙，队列不算忙", () => {
+  assert.equal(isBusy({ agentBusy: false, runningTools: 0, activeSubagents: 0, pendingMessages: false }), false);
+  assert.equal(isBusy({ agentBusy: true, runningTools: 0, activeSubagents: 0, pendingMessages: false }), true);
+  assert.equal(isBusy({ agentBusy: false, runningTools: 1, activeSubagents: 0, pendingMessages: false }), true);
+  assert.equal(isBusy({ agentBusy: false, runningTools: 0, activeSubagents: 2, pendingMessages: false }), true);
+  assert.equal(
+    isBusy({ agentBusy: false, runningTools: 0, activeSubagents: 0, pendingMessages: true }),
+    false,
+    "队列里压着话不叫忙，它只是别插话",
+  );
+});
+
+test("shouldSkipReportTick：休息/长工具/队列有货都跳过，只有工作回合的空隙才发", () => {
+  const base = { agentBusy: true, runningTools: 0, activeSubagents: 0, pendingMessages: false };
+  assert.equal(shouldSkipReportTick(base), false, "工作回合 + 无长工具 + 队列干净 → 该发");
+  assert.equal(shouldSkipReportTick({ ...base, agentBusy: false }), true, "回合已结束 → 无进度可报");
+  assert.equal(shouldSkipReportTick({ ...base, runningTools: 1 }), true, "卡在长工具里 → 不插话（否则堆积）");
+  assert.equal(shouldSkipReportTick({ ...base, pendingMessages: true }), true, "队列有货 → 不再压一条");
+});
+
+test("同一状态快照下 reportTimer 与 healthTick 对「忙」结论一致（消掉两套口径）", () => {
+  const snap = { agentBusy: false, runningTools: 1, activeSubagents: 0, pendingMessages: false };
+  // reportTimer 说「别插话」（因为 busy/长工具）→ 跳过
+  assert.equal(shouldSkipReportTick(snap), true);
+  // healthTick 也认为 busy → 跳过
+  assert.deepEqual(
+    decideHealthTick(idleState(60), probe({ runningTools: snap.runningTools, agentBusy: snap.agentBusy })),
+    { action: "skip", reason: "busy" },
+  );
 });
 
 // ── 判定落回状态 ───────────────────────────────────────────────────────

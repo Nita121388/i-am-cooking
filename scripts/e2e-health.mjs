@@ -22,9 +22,15 @@ const MODE = (process.argv.find((a) => a.startsWith("--mode="))?.split("=")[1]) 
 const CHECK_MINUTES = 1; // 滴答间隔
 const IDLE_MINUTES = 1; // 空闲多久算「没在运行」
 // basic: 首催就够；escalation: 要催满 5 次再升级（约 6 分钟）；silence: 催过 5 次仍不升级
+// tooltimeout: 验证 TODO-1 —— 长工具超阈值后被 abort 且注入了纠偏提示（不需要跑满 10 分钟，
+//              预置 toolTimeoutMinutes=1 + 一个 sleep 300 的 bash 调用即可）
 // 实测节奏：每轮「回合收尾 → 空闲满 1 分钟 → 下一次滴答」约 70-80 秒，
 // 5 轮 ≈ 11 分钟；silence 要看到第 6 次 ≈ 13 分钟。给足余量。
-const TIMEOUT_MS = MODE === "basic" ? 150_000 : MODE === "escalation" ? 900_000 : 1_000_000;
+const TIMEOUT_MS =
+  MODE === "basic" ? 150_000
+  : MODE === "tooltimeout" ? 300_000
+  : MODE === "escalation" ? 900_000
+  : 1_000_000;
 
 const lines = [];
 const seen = {
@@ -35,6 +41,8 @@ const seen = {
   widgetNudged: null,
   escalation: null,
   stallAlert: null,
+  toolTimeoutNotify: null,
+  toolTimeoutSteer: null,
   errors: [],
 };
 
@@ -52,6 +60,8 @@ function onLine(raw) {
       if (m.includes("健康巡检") && m.includes("追问状态")) seen.tickNotify.push(m);
       if (m.includes("催了") && m.includes("已升级呼喊")) seen.escalation = m;
       if (m.includes("离开模式已开启") || m.includes("⏱")) seen.cookingOn = true;
+      // TODO-1：工具超时中断的 TUI 提示（「工具 X 已跑 N 分钟，超过阈值」）
+      if (m.includes("超过阈值") && m.includes("中断本轮")) seen.toolTimeoutNotify = m;
     }
     if (j.method === "setWidget" && j.widgetKey === "i-am-cooking") {
       const text = (j.widgetLines ?? []).join("\n");
@@ -66,6 +76,10 @@ function onLine(raw) {
   const text = JSON.stringify(j);
   if (/\[健康巡检 #\d+\]/.test(text)) {
     seen.nudgeMessage ??= text.slice(0, 400);
+  }
+  // TODO-1 纠偏提示以 user message 形式注入（sendUserMessage + followUp）
+  if (/工具超时中断/.test(text)) {
+    seen.toolTimeoutSteer ??= text.slice(0, 600);
   }
 }
 
@@ -87,6 +101,9 @@ async function main() {
       tuiBanner: true,
       setupDone: true,
       progressReporting: "none",
+      // TODO-1：超时阈值收到 1 分钟，e2e 里不用真等 10 分钟
+      toolTimeoutMinutes: MODE === "tooltimeout" ? 1 : 10,
+      toolTimeoutMaxAborts: 3,
       // 注意：callingMode / healthMuteEscalation 是会话级状态，session_start 时会被
       // resetCookingState 洗回 normal。所以 silence 不能靠预置 config 造，必须启动后用真实
       // 原话触发（见下方 MODE === "silence" 分支）。
@@ -123,7 +140,10 @@ async function main() {
 
   // 等扩展装载完，再开离开模式
   await new Promise((r) => setTimeout(r, 6000));
-  const onMessage = MODE === "silence" ? "/i-am-cooking-dev on 别喊了，安静点" : "/i-am-cooking-dev on";
+  const onMessage =
+    MODE === "silence" ? "/i-am-cooking-dev on 别喊了，安静点"
+    : MODE === "tooltimeout" ? "/i-am-cooking-dev on 只做一件事：执行 bash 命令 sleep 300，然后回复我"
+    : "/i-am-cooking-dev on";
   child.stdin.write(JSON.stringify({ type: "prompt", message: onMessage }) + String.fromCharCode(10));
   console.log(`${tick()} 已发送 ${onMessage}，等待滴答（每 ${CHECK_MINUTES} 分钟 / 空闲 ${IDLE_MINUTES} 分钟）…`);
 
@@ -151,6 +171,7 @@ async function main() {
   const done = () => {
     if (MODE === "escalation") return !!seen.escalation;
     if (MODE === "silence") return seen.tickNotify.length >= 6;
+    if (MODE === "tooltimeout") return !!seen.toolTimeoutNotify && !!seen.toolTimeoutSteer;
     return !!seen.nudgeMessage;
   };
   let lastReport = 0;
@@ -183,9 +204,21 @@ async function main() {
   const check = (ok, label, detail) => (ok ? pass : fail).push(detail ? `${label} — ${detail}` : label);
 
   check(seen.devBanner, "DEV 构建身份标识出现");
-  check(seen.tickNotify.length > 0, "巡检真的按间隔触发", seen.tickNotify[0] ?? "未收到「第 N 次追问状态」提示");
-  check(!!seen.nudgeMessage, "[健康巡检] 消息真的注入会话", seen.nudgeMessage ?? "超时未注入");
-  check(!!seen.widgetNudged, "横幅出现 🩺 已催 N/M", seen.widgetNudged ?? "未观察到");
+  if (MODE === "tooltimeout") {
+    // TODO-1 专项：真进程里验证「超时 → abort → 纠偏提示注入」
+    check(!!seen.toolTimeoutNotify, "工具超阈值→中断本轮提示出现", seen.toolTimeoutNotify ?? "未收到（时长不够或未触发工具）");
+    check(!!seen.toolTimeoutSteer, "纠偏提示真的注入会话", seen.toolTimeoutSteer ?? "未观察到 [健康巡检 · 工具超时中断]");
+    if (seen.toolTimeoutSteer) {
+      const t = seen.toolTimeoutSteer;
+      check(/不要原样重试/.test(t), "纠偏提示说了不要原样重试");
+      check(/async 子代理/.test(t), "纠偏提示说了交给 async 子代理");
+      check(/终止条件/.test(t), "纠偏提示说了自查终止条件");
+    }
+  } else {
+    check(seen.tickNotify.length > 0, "巡检真的按间隔触发", seen.tickNotify[0] ?? "未收到「第 N 次追问状态」提示");
+    check(!!seen.nudgeMessage, "[健康巡检] 消息真的注入会话", seen.nudgeMessage ?? "超时未注入");
+    check(!!seen.widgetNudged, "横幅出现 🩺 已催 N/M", seen.widgetNudged ?? "未观察到");
+  }
   check(seen.errors.length === 0, "无扩展装载错误", seen.errors.join(" | "));
 
   if (MODE === "escalation") {

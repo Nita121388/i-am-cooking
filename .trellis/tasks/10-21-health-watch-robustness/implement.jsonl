@@ -1,2 +1,5 @@
 {"file": "docs/HOW-IT-WORKS.zh.md", "reason": "健康巡检现状、3 个 TODO 与 L 表批注，本任务需求来源"}
 {"file": "docs/TESTING.md", "reason": "本仓库测试组织方式与覆盖边界"}
+{"file": "extensions/i-am-cooking/lib/health.ts", "reason": "R1-R6 改动的核心文件：滴答判定与状态机"}
+{"file": "extensions/i-am-cooking/lib/config.ts", "reason": "新增配置项（toolTimeout / errorRetry / silenceMaxNudges / endJudge）"}
+{"file": "extensions/i-am-cooking/index.ts", "reason": "事件接线：工具计时、异常分类、收尾判定、定时器改口径"}

@@ -139,7 +139,22 @@ export interface Config {
   healthCheckMinutes: number;    // 巡检滴答间隔（分钟，默认 5）
   healthIdleMinutes: number;     // 空闲多久判定「没在运行」（分钟，默认 10）
   healthMaxNudges: number;       // 同一段空闲最多催几次（默认 5），之后升级喊用户一次
-  healthMuteEscalation: boolean; // true = 只催不喊，一直催（用户说过别喊时自动置位）
+  healthMuteEscalation: boolean; // true = 只催不喊（用户说过别喊时自动置位）
+  healthMaxNudgesSilence: number; // 只催不喊时的催问上限（默认 30），到了就停止追问但不喊人
+
+  // TODO-1 长脚本超时拦截：单次工具执行超过阈值 → abort 整轮 + 注入纠偏提示
+  toolTimeoutMinutes: number;    // 单次工具执行阈值（分钟，默认 10，0 = 关闭）
+  toolTimeoutMaxAborts: number;  // 同一会话最多自动中断几次（默认 3，0 = 不限制）
+
+  // L 表 429/上下文超限：异常分类后的退避重试（不按 urgent 喊人）
+  errorRetryMaxAttempts: number;   // 可重试异常最多重试几次（默认 3，0 = 不重试、直接喊）
+  errorRetryBaseMinutes: number;   // 首次退避（分钟，默认 1），逐次翻倍
+  errorRetryMaxMinutes: number;    // 退避上限（分钟，默认 10）
+
+  // TODO-2 收尾独立判定（正则漏判时起一个独立会话问一句）
+  healthEndJudge: "off" | "cli"; // 默认 off：本机没装 opencode 时不白花调用
+  healthEndJudgeCmd: string;      // 命令模板，`{prompt}` 会被替换为提示词（已做 shell 转义）
+  healthEndJudgeTimeoutSeconds: number; // 判官超时（默认 20 秒），超时降级为正则结论
 }
 
 export const DEFAULTS: Config = {
@@ -183,6 +198,15 @@ export const DEFAULTS: Config = {
   healthIdleMinutes: 10,
   healthMaxNudges: 5,
   healthMuteEscalation: false,
+  healthMaxNudgesSilence: 30,
+  toolTimeoutMinutes: 10,
+  toolTimeoutMaxAborts: 3,
+  errorRetryMaxAttempts: 3,
+  errorRetryBaseMinutes: 1,
+  errorRetryMaxMinutes: 10,
+  healthEndJudge: "off",
+  healthEndJudgeCmd: "opencode run --model opencode/grok-code-fast-1 '{prompt}'",
+  healthEndJudgeTimeoutSeconds: 20,
 };
 
 /**

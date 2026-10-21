@@ -50,8 +50,13 @@ import { randomUUID } from "node:crypto";
 // 纯逻辑模块（可测试）
 import { suggestTopic } from "./lib/topic.ts";
 import { renderTts as renderTtsImpl } from "./lib/tts.ts";
-import { buildStallAlert, buildHealthPrompt, decideHealthTick, applyHealthDecision, formatHealthLine, formatIdle, markRealWork, markUserInput, newHealthState, setPhase, touchActivity } from "./lib/health.ts";
-import type { HealthPhase, HealthState } from "./lib/health.ts";
+import { buildStallAlert, buildHealthPrompt, decideHealthTick, applyHealthDecision, formatHealthLine, formatIdle, markRealWork, markUserInput, newHealthState, setPhase, touchActivity, isBusy, shouldSkipReportTick } from "./lib/health.ts";
+import type { ActivitySnapshot, HealthPhase, HealthState } from "./lib/health.ts";
+import { newToolWatch, startToolWatch, endToolWatch, runningToolCount, clearToolWatch, overdueTools, buildToolTimeoutSteer, formatRunningTools } from "./lib/tool-watch.ts";
+import type { ToolWatch } from "./lib/tool-watch.ts";
+import { classifyTurnError, isRetryable, shouldCompactFirst, backoffMs, shouldEscalate, buildRetrySteer, describeErrorKind } from "./lib/errors.ts";
+import type { TurnErrorKind } from "./lib/errors.ts";
+import { buildEndJudgePrompt, parseEndJudgeVerdict, shouldUseEndJudge, renderEndJudgeCommand } from "./lib/end-judge.ts";
 import { CONFIG_DIR, CONFIG_PATH, DEFAULT_RULES_PATH, RULES_PATH, SCRIPTS, TMP_DIR, DEV_MODE, COMMAND_NAME, describeBuild } from "./lib/config.ts";
 import type { Alert, AutonomyLevel, CallingMode, Config, Urgency } from "./lib/config.ts";
 import { DEFAULTS, readConfig, writeConfig } from "./lib/config.ts";
@@ -60,7 +65,7 @@ import { AUTONOMY_LABEL, CALLING_MODE_LABEL, detectAutonomyLevel, detectPreferen
 import { pushPhone, pushWebhook, resolveValue } from "./lib/push.ts";
 import { startRemoteStopServer, type RemoteStopHandle } from "./lib/remote-stop.ts";
 import { boostVolume, getSystemVolume, restoreVolume, setSystemVolume, toggleMute } from "./lib/volume.ts";
-import { runCommand, runPowerShellScript } from "./lib/platform.ts";
+import { runCommand, runPowerShellScript, execFile } from "./lib/platform.ts";
 import { buildRulesPrompt, ensureRulesFile, fileExists, GUARD_RAIL, loadDefaultRules, loadRules } from "./lib/rules.ts";
 
 // 全局状态（单例，由入口持有）：
@@ -89,6 +94,12 @@ type CookingCtx = {
   hasPendingMessages?: () => boolean;
   /** 代理是否空闲（未在流式输出）——健康巡检守卫用 */
   isIdle?: () => boolean;
+  /** 中断当前回合（工具超时拦截用） */
+  abort?: () => void;
+  /** 触发上下文压缩（上下文超限的退避重试用） */
+  compact?: () => void;
+  /** 当前上下文占用（判断是不是接近超限） */
+  getContextUsage?: () => { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
   /** 只读会话管理器（健康巡检读上一回合结束原因 / 会话 id 用） */
   sessionManager?: {
     getEntries?: () => readonly any[];
@@ -99,7 +110,9 @@ type CookingCtx = {
 
 // ── state ────────────────────────────────────────────────────────────────
 let api: ExtensionAPI; // set by factory; needed by turnOn/turnOff
-let repeatTimers: ReturnType<typeof setInterval>[] = [];
+/** 会话级定时器（进度心跳 / 健康巡检 / 响铃重复 / 退避重试）。
+ *  原先叫 repeatTimers，但它早就不是「响铃重复」专用——改名避免误读。 */
+let sessionTimers: ReturnType<typeof setInterval>[] = [];
 // 当前是否正在响铃播放（状态栏/横幅指示用；仅反映本实例，多 Agent 间互不影响）
 let shoutingState = false;
 
@@ -109,8 +122,23 @@ let shoutingState = false;
 // 催到上限还没动静才升级喊用户。用户一开口就回到 working，下次继续问。
 let health: HealthState = newHealthState(Date.now());
 let healthTimer: ReturnType<typeof setInterval> | null = null;
-/** 正在执行中的工具数（tool_execution_start++ / end--）：长 bash、同步 subagent() 都算在跑 */
-let runningTools = 0;
+/** 正在执行中的工具（key = toolCallId）：记录起始时间，超时才能真正识别出来。
+ *  此前只有一个裸计数器 runningTools，脚本永不结束时 end 永不到来，
+ *  巡检把「还有工具在跑」读作「它正在干活」→ 永远跳过，一次都不催。 */
+let runningTools = newToolWatch();
+/** 已因超时中断过的 toolCallId（保证一个长脚本只 abort 一次） */
+const abortedToolCalls = new Set<string>();
+/** 本会话已因工具超时中断几次（到配置上限后不再自动中断，防无限 abort 循环） */
+let toolAbortCount = 0;
+/** 退避重试：本段连续可重试异常的次数（真实工作恢复时清零） */
+let retryAttempt = 0;
+/** 退避重试定时器（单独持有，便于取消） */
+let retryTimerRef: ReturnType<typeof setTimeout> | null = null;
+/** 收尾判定幂等：用「同一回合」的签名去重——agent_settled 可能因内部重试多次触发，
+ *  但只有条目数量与最后一句都一样的才是同一个回合。新一轮工作会改变条目数 → 重新进入判定。 */
+let lastSettleSignature = "";
+/** 最近一次事件里的 ctx（定时器回调里拿不到事件 ctx，超时 abort / 巡检需要它） */
+let lastCtx: CookingCtx | undefined;
 /** 当前会话里还在跑的 async 子代理 id（事件驱动；registry 探测兜底） */
 const activeSubagents = new Set<string>();
 /** 上一回合结束原因（health 巡检文案用：判断是不是「意外终止」） */
@@ -393,7 +421,7 @@ async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
     `🩺 健康巡检\n` +
     `  开关: ${config.healthCheck ? "开" : "关"}\n` +
     `  频率: 每 ${config.healthCheckMinutes} 分钟查一次（空闲 ${config.healthIdleMinutes} 分钟才算「没在运行」）\n` +
-    `  催问上限: ${config.healthMuteEscalation ? "用户说了别喊 → 一直催、不升级喊人" : `${config.healthMaxNudges} 次，之后喊你一次`}\n` +
+    `  催问上限: ${config.healthMuteEscalation ? `用户说了别喊 → 只催不升级，催到 ${config.healthMaxNudgesSilence ?? 30} 次后停止追问（不喊人）` : `${config.healthMaxNudges} 次，之后喊你一次`}\n` +
     `  状态: ${formatHealthLine(health, now, {
       enabled: config.healthCheck,
       checkMinutes: config.healthCheckMinutes,
@@ -438,7 +466,8 @@ async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
     `检查频率（当前每 ${config.healthCheckMinutes} 分钟）`,
     `空闲多久算没在运行（当前 ${config.healthIdleMinutes} 分钟）`,
     `催问上限（当前 ${config.healthMaxNudges} 次，之后喊你）`,
-    `催满后是否喊人（当前 ${config.healthMuteEscalation ? "不喊，一直催" : "喊你一次"}）`,
+    `催满后是否喊人（当前 ${config.healthMuteEscalation ? `不喊，催到 ${config.healthMaxNudgesSilence ?? 30} 次后停止` : "喊你一次"}）`,
+    `长脚本超时中断（当前 ${config.toolTimeoutMinutes > 0 ? `单次工具超 ${config.toolTimeoutMinutes} 分钟就中断并纠偏（上限 ${config.toolTimeoutMaxAborts} 次）` : "已关闭"}）`,
   ], { footer: summary });
   if (!choose) { ui.notify("已退出。", "info"); return; }
 
@@ -464,7 +493,7 @@ async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
     await writeConfig(config);
     ui.notify(
       config.healthMuteEscalation
-        ? "🔕 已设为「只催不喊」：催满上限也不响铃，会一直催下去。"
+        ? `🔕 已设为「只催不喊」：催满上限也不响铃；催到 ${config.healthMaxNudgesSilence ?? 30} 次后自动停止追问。`
         : `🔔 已设为「催满 ${config.healthMaxNudges} 次后喊你一次」，然后暂停追问。`,
       "info",
     );
@@ -687,7 +716,7 @@ function setAutonomyLevel(level: AutonomyLevel, reason: string, ctx: CookingCtx)
 function setCallingMode(mode: CallingMode, reason: string, ctx: CookingCtx): void {
   const prev = config.callingMode || "normal";
   config.callingMode = mode;
-  // 「别喊了」= 只催不升级：健康巡检催满上限也不响铃，一直催下去
+  // 「别喊了」= 只催不升级：健康巡检催满上限也不响铃（但有总上限，不会无限追问）
   config.healthMuteEscalation = mode === "silence";
   void writeConfig(config);
   if (mode !== prev) {
@@ -787,14 +816,18 @@ function updateWidget(ctx: CookingCtx): void {
         ? " · 🩺 在等你"
         : health.phase === "stalled"
           ? " · 🩺 无响应（已喊人）"
-          : health.nudges > 0
-            ? ` · 🩺 已催 ${health.nudges}/${config.healthMaxNudges}`
-            : ""
+          : health.phase === "exhausted"
+            ? " · 🩺 已停止追问"
+            : health.nudges > 0
+              ? ` · 🩺 已催 ${health.nudges}/${config.healthMaxNudges}`
+              : ""
     : "";
+  const tools = config.cooking ? runningToolsLabel(Date.now()) : "";
   const subTag = subs > 0 ? ` · 🤖 子代理 ${subs} 个在跑` : "";
+  const toolTag = tools ? ` · 🔧 ${tools}` : "";
   const lines = config.cooking
     ? [
-        `🍳 离开中${BUILD_TAG ? ` [${BUILD_TAG}]` : ""} · ⚠${n} 待处理${subTag}${healthTag} · /status 看全部`,
+        `🍳 离开中${BUILD_TAG ? ` [${BUILD_TAG}]` : ""} · ⚠${n} 待处理${subTag}${toolTag}${healthTag} · /status 看全部`,
         ...(shoutingState ? ["  📢 正在广播中...（Ctrl+Alt+M 静音）"] : []),
       ]
     : [];
@@ -832,7 +865,7 @@ function scheduleRepeats(alert: Alert, ctx: CookingCtx): void {
         clearInterval(timer);
       }
     }, iv);
-    repeatTimers.push(timer);
+    sessionTimers.push(timer);
   } else if (alert.urgency === "normal") {
     const timer = setTimeout(() => {
       if (!config.cooking) return;
@@ -841,15 +874,36 @@ function scheduleRepeats(alert: Alert, ctx: CookingCtx): void {
       void writeConfig(config);
       void fireAlert(alert, ctx);
     }, Math.max(1, config.repeatIntervalMinutes) * 60_000);
-    repeatTimers.push(timer as unknown as ReturnType<typeof setInterval>);
+    sessionTimers.push(timer as unknown as ReturnType<typeof setInterval>);
   }
 }
 
+/** 清除会话级定时器（含退避重试） */
 function clearRepeatTimers(): void {
-  for (const t of repeatTimers) clearInterval(t);
-  repeatTimers = [];
+  for (const t of sessionTimers) clearInterval(t);
+  sessionTimers = [];
+  if (retryTimerRef) { clearTimeout(retryTimerRef); retryTimerRef = null; }
   reportTimer = null;
   healthTimer = null;
+}
+
+/**
+ * 唯一的「忙」判定入口（TODO-3）。
+ * reportTimer 与 healthTick 都从这里取数，消除「同一时刻 A 判不忙、B 判忙」。
+ * 原来两处 `ctx.hasPendingMessages?.()` 的重复守卫也收在这里。
+ */
+function activitySnapshot(ctx: CookingCtx): ActivitySnapshot {
+  return {
+    agentBusy: agentActive || (typeof ctx.isIdle === "function" ? !ctx.isIdle() : false),
+    runningTools: runningToolCount(runningTools),
+    activeSubagents: countActiveSubagents(ctx),
+    pendingMessages: ctx.hasPendingMessages?.() ?? false,
+  };
+}
+
+/** 并发一个长 bash / 同步 subagent() 时，状态栏要能看见它 */
+function runningToolsLabel(now: number): string {
+  return formatRunningTools(runningTools, now);
 }
 
 // ── 进度心跳（interval=定时汇报 / milestone=小阶段自查），两种模式共用一套启停 ──
@@ -866,10 +920,9 @@ function startReportTimer(ctx: CookingCtx): void {
   const minutes = Math.max(1, Math.min(120, config.reportIntervalMinutes || 15));
   reportTimer = setInterval(() => {
     if (!config.cooking) return;
-    // 回合已结束（等用户 / 已收尾）→ 无进度可报，跳过；下次回合开始自动恢复
-    if (!agentActive) return;
-    // 上一条汇报（或其他消息）还压在待投递队列里（如 agent 卡在超长工具调用中）→ 跳过本次，避免堆积重复催促
-    if (ctx.hasPendingMessages?.()) return;
+    // 「忙」的统一口径：回合结束 / 卡在长工具里 / 队列里已有话没投递 → 都不插话
+    // （长工具调用中插话只会堆积成重复催促，这是本次行为变化，见 CHANGELOG）
+    if (shouldSkipReportTick(activitySnapshot(ctx))) return;
     const msg = config.progressReporting === "milestone"
       ? `[milestone check] 一句话自查：当前是否有值得让用户知道的小阶段？\n` +
         `有 → 调用 shout_for_user（category="milestone", urgency="info"）只推手机；没有 → 忽略本条，不要回复提醒本身。\n` +
@@ -881,7 +934,7 @@ function startReportTimer(ctx: CookingCtx): void {
     // steer：agent 干活途中在下一次 LLM 调用前投递，不等整个回合结束（followUp 会压队列等到 settle）
     void api.sendUserMessage(msg, { deliverAs: "steer" });
   }, minutes * 60_000);
-  repeatTimers.push(reportTimer); // 并入重复计时器，随 off/会话结束一起清理
+  sessionTimers.push(reportTimer); // 并入重复计时器，随 off/会话结束一起清理
 }
 
 function stopReportTimer(): void {
@@ -935,7 +988,7 @@ function countActiveSubagents(ctx: CookingCtx): number {
   }
 }
 
-/** 用户说了「别喊」类偏好时，巡检只催不升级（一直催）+ 持久化开关同步 */
+/** 用户说了「别喊」类偏好时，巡检只催不升级（到上限后停止追问） */
 function healthMuteEscalation(): boolean {
   return !!config.healthMuteEscalation;
 }
@@ -977,23 +1030,216 @@ function forceIdleForCheck(): void {
   health.idleSince = Date.now() - minutes * 60_000 - 1_000;
 }
 
-/** 一次巡检滴答（默认每 healthCheckMinutes 分钟） */
-function healthTick(ctx: CookingCtx): void {
-  if (!config.cooking || !config.healthCheck) return;
+// ── TODO-1 长脚本超时拦截：abort + 纠偏提示 ────────────────────────────────
 
-  const agentBusy = agentActive || (typeof ctx.isIdle === "function" ? !ctx.isIdle() : false);
+/**
+ * 检查在飞工具是否超时。超时就 abort 整轮 + 注入纠偏提示。
+ *
+ * 为什么必须在 healthTick 的 `config.healthCheck` 闸门之前调：
+ * 长脚本永不死时 `tool_execution_end` 永不到来，巡检把「有工具在跑」读作「它正在干活」→
+ * 永远跳过。这里一旦超时就把那笔从表里摘掉，巡检的「忙」判定立刻恢复正常。
+ */
+function checkToolTimeouts(ctx: CookingCtx): void {
+  const limitMinutes = config.toolTimeoutMinutes ?? 10;
+  if (!(limitMinutes > 0)) return;
+  const now = Date.now();
+  const limitMs = limitMinutes * 60_000;
+  const overdue = overdueTools(runningTools, now, limitMs, abortedToolCalls);
+  if (overdue.length === 0) return;
+
+  const maxAborts = config.toolTimeoutMaxAborts ?? 3;
+  for (const tool of overdue) {
+    const elapsed = now - tool.startedAt;
+    // 先标记已处理并摘表：两人同时超时也只处理一次，且巡检计数立刻归零
+    abortedToolCalls.add(tool.toolCallId);
+    endToolWatch(runningTools, tool.toolCallId);
+
+    if (maxAborts > 0 && toolAbortCount >= maxAborts) {
+      ctx.ui.notify(
+        `⚠️ 工具 ${tool.toolName} 已跑 ${formatIdle(elapsed)}，但本会话自动中断次数已用完` +
+        `（${maxAborts} 次），只记日志不再中断。`,
+        "warning",
+      );
+      continue;
+    }
+
+    toolAbortCount++;
+    ctx.ui.notify(
+      `⏱️ 工具 ${tool.toolName} 已跑 ${formatIdle(elapsed)}，超过阈值 ${limitMinutes} 分钟` +
+      `→ 中断本轮并注入纠偏提示（第 ${toolAbortCount}/${maxAborts || "∞"} 次）。`,
+      "warning",
+    );
+    // 不推手机、不升级呼喊：放手等级下既定取舍，只记日志 + TUI 提示
+    try {
+      ctx.abort?.();
+    } catch (err) {
+      console.error("[i-am-cooking] abort failed:", err);
+    }
+    // 用 followUp：abort 后本回合即将结束，steer 可能随回合一起被丢掉；
+    // followUp 在回合结束后投递，若已空闲则直接开新回合 —— 两条路都能送到。
+    void api.sendUserMessage(
+      buildToolTimeoutSteer({
+        toolName: tool.toolName,
+        elapsedMs: elapsed,
+        limitMs,
+        abortCount: toolAbortCount,
+        maxAborts,
+      }),
+      { deliverAs: "followUp" },
+    );
+  }
+  updateWidget(ctx);
+}
+
+// ── L 表：异常分类后的退避重试（429 / 上下文超限不再直接喊人）──────────────
+
+/** 取消正在排队的退避重试（用户回来 / 新会话 / 开关离开模式时用） */
+function cancelRetry(): void {
+  if (retryTimerRef) {
+    clearTimeout(retryTimerRef);
+    retryTimerRef = null;
+  }
+  retryAttempt = 0;
+}
+
+/**
+ * 排一次退避重试。返回 true = 已排（调用方不要再喊人）；false = 应该升级喊人。
+ *
+ * 行为：
+ *   429 限流 / 5xx / 网络抖动 → 退避重试，不喊
+ *   上下文超限 → 先 compact 再退避重试，不喊
+ *   永久失败（语法/路径/参数）与未分类 → 返回 false，保持现状直接喊
+ */
+function scheduleErrorRetry(ctx: CookingCtx, kind: TurnErrorKind, text: string): boolean {
+  const maxAttempts = config.errorRetryMaxAttempts ?? 3;
+  if (!isRetryable(kind)) return false;
+  if (shouldEscalate(kind, retryAttempt, maxAttempts)) return false;
+
+  const compacted = shouldCompactFirst(kind);
+  if (compacted) {
+    try {
+      ctx.compact?.();
+    } catch (err) {
+      console.error("[i-am-cooking] compact failed:", err);
+    }
+  }
+
+  const baseMs = Math.max(1, config.errorRetryBaseMinutes || 1) * 60_000;
+  const capMs = Math.max(baseMs, (config.errorRetryMaxMinutes || 10) * 60_000);
+  const waitMs = backoffMs(retryAttempt + 1, baseMs, capMs);
+  retryAttempt++;
+  const attemptNo = retryAttempt;
+  const snap = lastTurnSnapshot(ctx);
+
+  ctx.ui.notify(
+    `🔁 ${describeErrorKind(kind)}：不喊人，${Math.round(waitMs / 60_000)} 分钟后自动重试` +
+    `（第 ${attemptNo}/${maxAttempts} 次）。`,
+    "info",
+  );
+
+  if (retryTimerRef) clearTimeout(retryTimerRef);
+  retryTimerRef = setTimeout(() => {
+    retryTimerRef = null;
+    if (!config.cooking) return;
+    void api.sendUserMessage(
+      buildRetrySteer({
+        kind,
+        attempt: attemptNo,
+        maxAttempts,
+        retryInMs: waitMs,
+        compacted,
+        lastText: snap.text || text,
+      }),
+      { deliverAs: "followUp" },
+    );
+  }, waitMs);
+  sessionTimers.push(retryTimerRef as unknown as ReturnType<typeof setInterval>);
+  return true;
+}
+
+// ── TODO-2 收尾独立判定（正则漏判时起一个独立会话问一句）────────────────
+
+/**
+ * 跑一次判官命令并拿回 stdout。**失败一律抛**（调用方降级为正则结论）。
+ * 判官命令是用户在配置里自己写的模板，不是硬编码路径 —— 本机没装就用 off 模式。
+ */
+async function runJudgeCommand(cmd: string, timeoutMs: number): Promise<string> {
+  const proc = execFile("/bin/sh", ["-c", cmd], { timeout: timeoutMs, windowsHide: true, maxBuffer: 256 * 1024 });
+  return new Promise<string>((resolve, reject) => {
+    let out = "";
+    proc.stdout?.on("data", (d: Buffer) => {
+      out += d.toString("utf8");
+    });
+    proc.once("error", reject);
+    proc.once("close", (code) => {
+      if (code !== 0) return reject(new Error(`end judge exit ${code}`));
+      resolve(out);
+    });
+  });
+}
+
+/** 用独立命令判官判断回合是不是真结束了。**任何失败都返回 unknown**（降级为正则结论） */
+async function judgeTurnEnd(
+  ctx: CookingCtx,
+  text: string,
+  trailingWork: boolean,
+  regexSaidDone: boolean,
+): Promise<"done" | "not-done" | "unknown"> {
+  if (
+    !shouldUseEndJudge({
+      mode: (config.healthEndJudge as "off" | "cli") ?? "off",
+      command: config.healthEndJudgeCmd || "",
+      regexSaidDone,
+      text,
+      trailingWork,
+    })
+  ) {
+    return "unknown";
+  }
+  const cmd = renderEndJudgeCommand(config.healthEndJudgeCmd || "", buildEndJudgePrompt(text));
+  if (!cmd) return "unknown";
+  const timeoutMs = Math.max(3, config.healthEndJudgeTimeoutSeconds || 20) * 1000;
+  try {
+    const out = await runJudgeCommand(cmd, timeoutMs);
+    const verdict = parseEndJudgeVerdict(out);
+    ctx.ui.notify(
+      `🧑‍\u200d⚖️ 收尾判定（独立会话）：${verdict === "done" ? "已结束" : verdict === "not-done" ? "还没结束" : "看不出来（降级为默认）"}`,
+      "info",
+    );
+    return verdict;
+  } catch (err) {
+    // 命令不存在 / 非 0 退出 / 超时 / 输出无法解析 → 绝不阻塞，降级回正则
+    console.error("[i-am-cooking] end judge failed (degraded to regex):", err);
+    return "unknown";
+  }
+}
+
+/**
+ * 一次巡检滴答（默认每 healthCheckMinutes 分钟）。
+ * 顺序很重要：**工具超时检查在 healthCheck 闸门之前** ——
+ * 巡检总开关关掉时，长脚本死锁仍然要能救（它由 toolTimeoutMinutes 独立控制）。
+ */
+function healthTick(ctx: CookingCtx): void {
+  if (!config.cooking) return;
+
+  checkToolTimeouts(ctx);
+
+  if (!config.healthCheck) return;
+
+  const activity = activitySnapshot(ctx);
   const decision = decideHealthTick(health, {
     cooking: config.cooking,
     enabled: config.healthCheck,
     now: Date.now(),
-    agentBusy,
-    runningTools,
-    activeSubagents: countActiveSubagents(ctx),
-    pendingMessages: ctx.hasPendingMessages?.() ?? false,
+    agentBusy: activity.agentBusy,
+    runningTools: activity.runningTools,
+    activeSubagents: activity.activeSubagents,
+    pendingMessages: activity.pendingMessages,
     blockingAlerts: pendingActionAlerts().length,
     idleMinutes: config.healthIdleMinutes || 10,
     maxNudges: config.healthMaxNudges || 5,
     muteEscalation: healthMuteEscalation(),
+    silenceMaxNudges: config.healthMaxNudgesSilence ?? 30,
   });
 
   if (decision.action === "skip") return;
@@ -1005,15 +1251,27 @@ function healthTick(ctx: CookingCtx): void {
     return;
   }
 
+  if (decision.action === "exhausted") {
+    // 用户说过别喊 → 催到上限就停，**不喊人**。
+    applyHealthDecision(health, decision, Date.now());
+    ctx.ui.notify(
+      `🩺 健康巡检：静默模式下已催问 ${config.healthMaxNudgesSilence ?? 30} 次仍无动静，` +
+      `按你「别喊了」的要求停止追问（不升级响铃）。\n你在会话里说一句话即可重新开始巡检。`,
+      "info",
+    );
+    updateWidget(ctx);
+    return;
+  }
+
   if (decision.action === "escalate") {
     applyHealthDecision(health, decision, Date.now());
-    const snap = lastTurnSnapshot(ctx);
+    const turn = lastTurnSnapshot(ctx);
     ctx.ui.notify(`🚨 健康巡检：催了 ${config.healthMaxNudges || 5} 次都没动静，已升级呼喊用户。`, "warning");
     queueAlert(
       buildStallAlert({
         nudges: config.healthMaxNudges || 5,
         idleMinutes: config.healthIdleMinutes || 10,
-        lastText: snap.text,
+        lastText: turn.text,
       }),
       "normal",
       "health-stall",
@@ -1026,7 +1284,7 @@ function healthTick(ctx: CookingCtx): void {
   // nudge：注入一条巡检消息，逼 agent 表态（done / waiting_user / 继续）
   const idleFor = formatIdle(health.idleSince ? Date.now() - health.idleSince : 0);
   applyHealthDecision(health, decision, Date.now());
-  const snap = lastTurnSnapshot(ctx);
+  const turn = lastTurnSnapshot(ctx);
   ctx.ui.notify(
     `🩺 健康巡检：agent 已空闲 ${idleFor}，第 ${decision.nudge} 次追问状态。`,
     "info",
@@ -1038,21 +1296,23 @@ function healthTick(ctx: CookingCtx): void {
       nudge: decision.nudge,
       maxNudges: config.healthMaxNudges || 5,
       muteEscalation: healthMuteEscalation(),
-      lastStopReason: snap.stopReason,
-      lastText: snap.text,
+      lastStopReason: turn.stopReason,
+      lastText: turn.text,
     }),
     { deliverAs: "followUp" },
   );
   updateWidget(ctx);
 }
 
-/** 启动健康巡检（幂等；随离开模式启停） */
+/** 启动健康巡检（幂等；随离开模式启停）。
+ *  巡检总开关关掉时也要起表 —— 工具超时死锁救不回它，巡检关不掉。 */
 function startHealthTimer(ctx: CookingCtx): void {
   stopHealthTimer(ctx);
-  if (!config.healthCheck) return;
+  const toolTimeoutOn = (config.toolTimeoutMinutes ?? 10) > 0;
+  if (!config.healthCheck && !toolTimeoutOn) return;
   const minutes = Math.max(1, Math.min(60, config.healthCheckMinutes || 5));
   healthTimer = setInterval(() => healthTick(ctx), minutes * 60_000);
-  repeatTimers.push(healthTimer);
+  sessionTimers.push(healthTimer);
 }
 
 function stopHealthTimer(_ctx?: CookingCtx): void {
@@ -1119,9 +1379,14 @@ function resetCookingState(ctx: CookingCtx): void {
   config.callingMode = "normal"; // 偏好是会话级的，每次会话重置
   config.healthMuteEscalation = false; // 健康巡检的「只催不喊」也是会话级的
   void writeConfig(config);
+  cancelRetry(); // 未执行的退避重试随关闭作废
   // 健康巡检状态也是会话级的：新会话从 working 开始
   health = newHealthState(Date.now());
-  runningTools = 0;
+  clearToolWatch(runningTools);
+  abortedToolCalls.clear();
+  toolAbortCount = 0;
+  cancelRetry();
+  lastSettleSignature = "";
   activeSubagents.clear();
   stopHealthTimer();
   ctx.ui.setStatus("i-am-cooking", "");
@@ -2014,19 +2279,25 @@ export default function (pi: ExtensionAPI) {
     } catch { /* best effort */ }
   });
 
-  // 工具在飞 = 真的在干活（长 bash / 同步 subagent() 都算）
-  pi.on("tool_execution_start", () => {
+  // 工具在飞 = 真的在干活（长 bash / 同步 subagent() 都算）。
+  // 记 toolCallId + 起始时间：脚本永不结束时 end 永不到来，靠计时才能识别超时（TODO-1）。
+  pi.on("tool_execution_start", (event, ctx) => {
     if (!config.cooking) return;
-    runningTools++;
+    startToolWatch(runningTools, event.toolCallId, event.toolName, Date.now());
+    lastCtx = ctx; // 超时 abort 要用一个新鲜的 ctx
     touchActivity(health, Date.now());
+    updateWidget(ctx);
   });
-  pi.on("tool_execution_end", (event) => {
+  pi.on("tool_execution_end", (event, ctx) => {
     if (!config.cooking) return;
-    runningTools = Math.max(0, runningTools - 1);
+    endToolWatch(runningTools, event.toolCallId);
+    abortedToolCalls.delete(event.toolCallId); // 已正常结束，不再占着「已中断」名额
     // 本插件自己的表态/呼喊工具不算「真实工作」：否则 agent 只需回一句呼喊
     // 就把催问计数清零，巡检永远升不了级（无限空转）。
     if (STATEMENT_ONLY_TOOLS.has(event.toolName)) return;
+    retryAttempt = 0; // 真实工具跑成功了：连续可重试异常计数清零
     markRealWork(health, Date.now());
+    updateWidget(ctx);
   });
 
   pi.on("turn_start", () => { if (config.cooking) touchActivity(health, Date.now()); });
@@ -2054,10 +2325,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     agentActive = false; // 回合结束：进度心跳暂停（新回合开始时恢复）
     if (!config.cooking) return;
+    lastCtx = ctx;
     touchActivity(health, Date.now()); // 回合结束也算有动静（刚说完话）
     try {
       const entries = ctx.sessionManager.getEntries();
-      let lastAssistant: { text: string; stopReason?: string } | undefined;
+      let lastAssistant: { text: string; stopReason?: string; errorMessage?: string; rawStopReason?: string } | undefined;
       let trailingWork = false;
 
       for (let i = entries.length - 1; i >= 0; i--) {
@@ -2067,7 +2339,14 @@ export default function (pi: ExtensionAPI) {
         if (m.role === "toolResult" || m.role === "bashExecution") { trailingWork = true; break; }
         if (m.role === "assistant") {
           const text = extractText(m).trim();
-          if (text) lastAssistant = { text, stopReason: m.stopReason };
+          if (text) {
+            lastAssistant = {
+              text,
+              stopReason: m.stopReason,
+              errorMessage: (m as { errorMessage?: string }).errorMessage,
+              rawStopReason: (m as { rawStopReason?: string }).rawStopReason,
+            };
+          }
           break;
         }
         if (m.role === "user") break; // 用户消息在最后 → 不是 agent 在等
@@ -2075,28 +2354,57 @@ export default function (pi: ExtensionAPI) {
 
       if (!lastAssistant || trailingWork) return;
       const text = lastAssistant.text;
+      // TODO-2 幂等：同一回合不重复扫描（agent_settled 可能因内部重试多次触发）。
+      // 签名 = 条目数 + 结束原因 + 最后一句摘要：同一回合重放签名相同；新一轮条目数变了就重新判定。
+      const signature = `${entries.length}|${lastAssistant.stopReason ?? ""}|${text.slice(0, 120)}`;
+      if (signature === lastSettleSignature) return;
+      lastSettleSignature = signature;
+      const isError = lastAssistant.stopReason === "error";
 
-      // 进度心跳自动停表：agent 最后一句表明任务已全部收尾 → 不再要求进度汇报
-      // （不依赖 agent 主动调 completion；保守匹配避免把"已完成：X"式进度措辞误判为收尾。
-      //  对两种进度模式都生效——即使正则漏判收尾，回合结束本身也会让心跳暂停，不会空转催促）
-      if (config.progressReporting !== "none" && detectTaskFinale(text)) {
-        stopReportTimer();
-        setPhase(health, "done", Date.now(), "回合总结表明任务已全部收尾"); // 健康巡检同步静默
+      // ── 收尾判定（TODO-2）：正则 → 可选独立会话复核 ──────────────────
+      // 不管进度汇报开着没，都要同步 health.phase：否则巡检会对已收工的 agent 继续催。
+      const regexSaidDone = detectTaskFinale(text);
+      let finale = regexSaidDone;
+      if (!finale && !isError) {
+        const verdict = await judgeTurnEnd(ctx, text, trailingWork, regexSaidDone);
+        if (verdict === "done") finale = true;
+      }
+      if (finale) {
+        stopReportTimer(); // 进度心跳不再需要
+        setPhase(health, "done", Date.now(), "回合总结表明任务已全部收尾");
       }
 
       // 它在等我回复（以 ？结尾的短问题）→ 健康巡检标记 waiting_user，不再追问
       const lvl = config.autonomyLevel || "balanced";
-      if (lvl !== "autonomous" && text.length <= 600 && /[?？]\s*$/.test(text)) {
+      if (!finale && lvl !== "autonomous" && text.length <= 600 && /[?？]\s*$/.test(text)) {
         if (health.phase === "working") setPhase(health, "waiting_user", Date.now(), "回合以问号结尾，在等你回复");
       }
 
       if (!config.autoDetect) return;
 
-      // 回合报错 → 需要用户看一眼（任何等级都喊）
-      if (lastAssistant.stopReason === "error") {
-        queueAlert(`Agent 回合报错，可能需要你处理：${text.slice(0, 300)}`, "urgent", "auto-error", ctx);
+      // ── 回合报错：先分类，再决定喊不喊（L 表 429 / 上下文超限）──────────
+      if (isError) {
+        const ctxPercent = (() => {
+          try { return ctx.getContextUsage?.()?.percent ?? null; } catch { return null; }
+        })();
+        const kind = classifyTurnError({
+          errorMessage: lastAssistant.errorMessage,
+          rawStopReason: lastAssistant.rawStopReason,
+          contextPercent: ctxPercent,
+        });
+        // 429 / 5xx / 上下文超限 → 退避重试，不按 urgent 喊人；到上限才升级
+        if (scheduleErrorRetry(ctx, kind, text)) return;
+        const why = describeErrorKind(kind);
+        queueAlert(
+          `Agent 回合报错（${why}），可能需要你处理：${text.slice(0, 300)}`,
+          "urgent",
+          "auto-error",
+          ctx,
+        );
         return;
       }
+      // 非报错回合结束：连续可重试异常计数归零
+      retryAttempt = 0;
       // 以"？"结尾的短问题 → 在等你回复（autonomous 放手等级不自动喊：用户已说能不喊就不喊）
       const level = config.autonomyLevel || "balanced";
       if (level === "autonomous") return;
