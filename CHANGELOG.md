@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **装载冒烟测试** `tests/load.test.ts`：用 mock `ExtensionAPI` 真跑扩展入口，断言可装载、8 个工具与命令/快捷键都注册、关键事件都订阅、无重复注册。补上「单测只覆盖 lib/、入口装载没人管」的空白。
 - `devDependencies` 固定 `@earendil-works/*` 到与运行时 pi 一致的版本（当前 `0.83.0`）。此前 `peerDependencies: "*"` 会被 npm 解析成任意旧版（实测拿到 `0.74.2`，没有 `agent_settled` 事件），导致 typecheck 对错版本的 API 报警、真实错误反而被掩盖。
 - README 新增「本地开发与验证」章节（隔离做法、每次改动跑什么、规则文件只播种一次的坑）。
+- **构建身份：`I_AM_COOKING_DEV=1` 即开发版**。命令注册为 `/i-am-cooking-dev`（`/i-am-cooking` 保留为别名，每次调用都提醒这是 DEV）；状态栏与横幅带 `[DEV]`；`status` 首行显示 `🧪 构建: DEV（非发布版）` vs `🍳 构建: 发布版`；开发版**每次启动**都报一次版本 / 源码路径 / 状态目录，发布版仍是首次使用才提示。起因是实测发现 pi 对工具名做硬性冲突检查——同一会话里发布版与开发版不能共存，后加载的那份整个失效且只留一行启动错误，非常容易误判「我在用发布版」。
+- **`npm run dev` / `scripts/dev.sh` 一键起开发实例**：自动设 `I_AM_COOKING_DEV=1` + `I_AM_COOKING_HOME=~/.pi/iac-dev` + `pi -ne -e <本仓库入口>`，与日常那份彻底隔开，两个进程可同开对比。
 
 ### Fixed
 - 催问计数不会被 agent 自己的表态类工具（`set_task_state` / `shout_for_user`）洗掉——否则被催一次就清零，永远升不到上限（无限空转烧 token）。

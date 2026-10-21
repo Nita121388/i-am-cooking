@@ -78,21 +78,52 @@ pi install /path/to/your/local/checkout
 
 插件有两类状态会跨安装方式共享：**状态目录**（`~/.pi/i-am-cooking/` 下的 `config.json`、`rules.md`、`tmp/`、`audio.lock`）和 **运行时配置**。本地调试时如果不做隔离，开发副本会和日常在用的那份互相覆盖——你临时调小的巡检阈值会污染日常配置，两份副本同时加载还会双份响铃、双份巡检。
 
-**做法：环境变量隔离状态目录 + `-e` 临时加载**
+### 一键切换：`npm run dev`
 
 ```bash
-I_AM_COOKING_HOME=~/.pi/iac-dev \
-  pi -ne -e /path/to/i-am-cooking/extensions/i-am-cooking/index.ts
+npm run dev            # 开发版：本仓库代码 + 独立状态目录 + DEV 标记
+pi                     # 发布版：全局已装的 npm:i-am-cooking
 ```
 
-- `I_AM_COOKING_HOME`：把 `config.json` / `rules.md` / `tmp/` / `audio.lock` 指向独立目录（默认仍是 `~/.pi/i-am-cooking`，不设则行为与历史完全一致）。
-- `-e`：临时加载本次进程，**不写 settings**，退出即消失；配合 `-ne`（关掉自动发现）确保不会把已安装的 npm 版一起加载进来。
-- 想连 settings / session / 包目录也整套分开，再加 `PI_CODING_AGENT_DIR=<目录>`。
+两者是**两个独立进程**，可以各开一个终端同时跑（互不干扰）。
 
-**每次改动跑一遍：**
+`scripts/dev.sh` 做的事就三件：
+
+| 开关 | 作用 |
+|---|---|
+| `I_AM_COOKING_DEV=1` | 命令注册为 **`/i-am-cooking-dev`**；`/i-am-cooking` 保留为别名，每次调用都会提醒你在 DEV 上；状态栏/横幅/`status` 头部显示 `DEV` |
+| `I_AM_COOKING_HOME=~/.pi/iac-dev` | `config.json` / `rules.md` / `tmp/` / `audio.lock` 与日常那份彻底隔开 |
+| `pi -ne -e <本仓库入口>` | 只加载本仓库代码，不写 settings，退出即消失 |
+
+### 为什么要按「进程」切，而不是按命令名切
+
+pi 对**工具名**做硬性冲突检查。同一会话里同时存在发布版和开发版时：
+
+```
+Error: Failed to load extension "...npm/node_modules/i-am-cooking/...":
+Tool "shout_for_user" conflicts with E:\...\index.ts
+```
+
+后加载的那份会**整个加载失败，8 个工具全部消失**，而且只留一行启动错误，极易漏看。所以「两份和平共处」在这个架构下不存在，只能二选一——这也是为什么需要 `-ne`（关掉全局包发现）而不是装两遍。
+
+### 怎么一眼确认当前是哪个版本
+
+| 位置 | 发布版 | 开发版 |
+|---|---|---|
+| 启动提示 | 首次使用才提示配置推送 | **每次启动**都报：版本 / 源码路径 / 状态目录 |
+| 命令名 | `/i-am-cooking` | `/i-am-cooking-dev`（`/i-am-cooking` 会警告是别名） |
+| 状态栏 | `🍳 离开中 · ⚠0 待处理` | `🍳 离开中 [DEV] · ⚠0 待处理` |
+| `/i-am-cooking[-dev] status` 首行 | `🍳 构建: 发布版` | `🧪 构建: DEV（非发布版）` |
+
+### 其它可选开关
+
+- 想连 settings / session / 包目录也整套分开：再加 `PI_CODING_AGENT_DIR=<目录>`（注意：`auth.json` 不跟着走，需要自己拷一份或重新登录）。
+- 只想临时试一次、又不想记路径：`I_AM_COOKING_DEV=1 pi -ne -e <仓库>/extensions/i-am-cooking/index.ts`。
+
+### 每次改动跑一遍
 
 ```bash
-npm test        # 单测：lib/ 纯逻辑 + 装载冒烟（mock ExtensionAPI 真跑入口）
+npm test        # 单测：lib/ 纯逻辑 + 装载冒烟 + 构建身份切换
 npm run typecheck
 ```
 

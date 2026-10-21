@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { DEFAULTS, readConfig, resolveStateDir, writeConfig } from "../extensions/i-am-cooking/lib/config.ts";
+import { DEFAULTS, isDevMode, readConfig, resolveStateDir, writeConfig } from "../extensions/i-am-cooking/lib/config.ts";
 import type { Config } from "../extensions/i-am-cooking/lib/config.ts";
 
 const dirs: string[] = [];
@@ -65,4 +65,13 @@ test("resolveStateDir：I_AM_COOKING_HOME 覆盖为独立目录", () => {
 
 test("resolveStateDir：~ 展开到 home，不误用真实 homedir", () => {
   assert.equal(resolveStateDir({ I_AM_COOKING_HOME: "~/.pi/iac-dev" }, "/home/u"), resolve("/home/u/.pi/iac-dev"));
+});
+// ── 构建身份：dev / release 必须能一眼分开 ──
+test("isDevMode：只有明确的真值才进 DEV", () => {
+  for (const v of ["1", "true", "TRUE", "yes", "on", " 1 "]) {
+    assert.equal(isDevMode({ I_AM_COOKING_DEV: v }), true, `"${v}" 应判定为 DEV`);
+  }
+  for (const v of [undefined, "", "  ", "0", "false", "no", "off", "dev"]) {
+    assert.equal(isDevMode({ I_AM_COOKING_DEV: v }), false, `"${v}" 不应判定为 DEV`);
+  }
 });

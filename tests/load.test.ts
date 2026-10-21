@@ -77,3 +77,49 @@ test("工具名不重复注册", () => {
   const names = calls.map((c) => `${c.kind}:${c.name}`);
   assert.equal(new Set(names).size, names.length, "存在重复注册");
 });
+
+// ── 构建身份：命令名随 I_AM_COOKING_DEV 切换 ──
+// DEV_MODE / COMMAND_NAME 是模块级常量（导入时读 env），所以只能在子进程里验证。
+import { execFileSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { dirname, join } from "node:path";
+
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const CONFIG_URL = pathToFileURL(join(REPO_ROOT, "extensions/i-am-cooking/lib/config.ts")).href;
+const PROBE = [
+  "const m = await import(" + JSON.stringify(CONFIG_URL) + ");",
+  "process.stdout.write(JSON.stringify({",
+  "  dev: m.DEV_MODE,",
+  "  cmd: m.COMMAND_NAME,",
+  "  cfg: m.CONFIG_DIR,",
+  "  tag: await m.describeBuild(),",
+  "}));",
+].join("\n");
+
+function probeBuild(env: Record<string, string>) {
+  const out = execFileSync(process.execPath, ["--input-type=module", "-e", PROBE], {
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+  });
+  return JSON.parse(out) as { dev: boolean; cmd: string; cfg: string; tag: string };
+}
+
+test("未设 DEV：命令名是 i-am-cooking，构建描述为 release", () => {
+  const r = probeBuild({ I_AM_COOKING_DEV: "" });
+  assert.equal(r.dev, false);
+  assert.equal(r.cmd, "i-am-cooking");
+  assert.match(r.tag, /^release v/);
+});
+
+test("设了 DEV：命令名切到 i-am-cooking-dev，构建描述为 DEV", () => {
+  const r = probeBuild({ I_AM_COOKING_DEV: "1" });
+  assert.equal(r.dev, true);
+  assert.equal(r.cmd, "i-am-cooking-dev");
+  assert.match(r.tag, /^DEV v/);
+});
+
+test("DEV 与状态目录是两个独立开关，可单独生效", () => {
+  const r = probeBuild({ I_AM_COOKING_DEV: "1", I_AM_COOKING_HOME: "/tmp/iac-probe-x" });
+  assert.equal(r.dev, true);
+  assert.ok(r.cfg.endsWith("iac-probe-x"), "状态目录应跟随 I_AM_COOKING_HOME，实际 " + r.cfg);
+});

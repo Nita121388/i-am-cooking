@@ -97,7 +97,11 @@ I_AM_COOKING_HOME=/tmp/iac-dev \
 - [ ] 设了之后只在目标目录生成 `config.json` / `rules.md`，日常目录 mtime 不变
 - [ ] 隔离实例的 `rules.md` 含最新出厂章节（旧实例不会自动更新 → 需 `reset-rules`）
 - [ ] 日常已装 `npm:i-am-cooking` 时，`-ne -e` 只加载一份（工具不重复、不双份响铃）
-- [ ] `npm test`（含 `tests/load.test.ts` 装载冒烟）与 `npm run typecheck` 全绿
+- [ ] `npm run dev` 起开发实例：启动提示带「DEV 构建 / 源码路径 / 状态目录」，命令是 `/i-am-cooking-dev`
+- [ ] 开发实例状态栏显示 `🍳 离开中 [DEV]`；`/i-am-cooking-dev status` 首行为 `🧪 构建: DEV`
+- [ ] 打 `/i-am-cooking`（别名）会提示「你用的是 DEV 构建」
+- [ ] 发布版实例（直接 `pi`）无任何 DEV 字样，命令仍是 `/i-am-cooking`
+- [ ] `npm test`（含 `tests/load.test.ts` 装载冒烟 + 构建身份切换）与 `npm run typecheck` 全绿
 
 ---
 

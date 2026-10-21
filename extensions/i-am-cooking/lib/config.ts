@@ -26,6 +26,45 @@ export function resolveStateDir(env: NodeJS.ProcessEnv = process.env, home: stri
 }
 
 export const CONFIG_DIR = resolveStateDir();
+
+/**
+ * 构建身份：区分「本地开发版」与「发布版」。
+ * 设 `I_AM_COOKING_DEV=1` 即进入开发版：
+ *   - 命令注册为 `/i-am-cooking-dev`（并保留 `/i-am-cooking` 别名，避免误导文案）
+ *   - 状态栏/横幅/`status` 头部都带 `DEV` 标记
+ *   - 加载提示总是打印（不只首次），带版本与源码路径
+ * 它不影响任何功能逻辑，只影响「你能不能一眼看出在跑哪份代码」。
+ */
+export function isDevMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env.I_AM_COOKING_DEV?.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+/** 构建来源（源码目录）：开发时是仓库，安装后是包根 */
+export const BUILD_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
+
+export const DEV_MODE = isDevMode();
+export const COMMAND_NAME = DEV_MODE ? "i-am-cooking-dev" : "i-am-cooking";
+/** 命令行前缀（用于日志/提示；以 "" 开头宁可让调用方自己拼） */
+export const COMMAND_TAG = `/${COMMAND_NAME}`;
+
+/** 读取包版本号（开发态/安装态都能定位：均为 ../../package.json） */
+async function readPkgVersion(): Promise<string> {
+  try {
+    const raw = await readFile(join(BUILD_ROOT, "package.json"), "utf8");
+    return (JSON.parse(raw) as { version?: string }).version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+let cachedVersion: string | null = null;
+/** 构建身份的完整描述（给启动提示 / status 用） */
+export async function describeBuild(): Promise<string> {
+  cachedVersion ??= await readPkgVersion();
+  const tag = DEV_MODE ? "DEV" : "release";
+  return `${tag} v${cachedVersion} · 源码 ${BUILD_ROOT} · 状态 ${CONFIG_DIR}`;
+}
 export const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 export const RULES_PATH = join(CONFIG_DIR, "rules.md");
 export const TMP_DIR = join(CONFIG_DIR, "tmp");

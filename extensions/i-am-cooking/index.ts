@@ -52,7 +52,7 @@ import { suggestTopic } from "./lib/topic.ts";
 import { renderTts as renderTtsImpl } from "./lib/tts.ts";
 import { buildStallAlert, buildHealthPrompt, decideHealthTick, applyHealthDecision, formatHealthLine, formatIdle, markRealWork, markUserInput, newHealthState, setPhase, touchActivity } from "./lib/health.ts";
 import type { HealthPhase, HealthState } from "./lib/health.ts";
-import { CONFIG_DIR, CONFIG_PATH, DEFAULT_RULES_PATH, RULES_PATH, SCRIPTS, TMP_DIR } from "./lib/config.ts";
+import { CONFIG_DIR, CONFIG_PATH, DEFAULT_RULES_PATH, RULES_PATH, SCRIPTS, TMP_DIR, DEV_MODE, COMMAND_NAME, describeBuild } from "./lib/config.ts";
 import type { Alert, AutonomyLevel, CallingMode, Config, Urgency } from "./lib/config.ts";
 import { DEFAULTS, readConfig, writeConfig } from "./lib/config.ts";
 import { hasActiveAudio, playSound, stopAllAudio } from "./lib/audio.ts";
@@ -760,15 +760,18 @@ async function fireAlert(alert: Alert, ctx: CookingCtx, opts: { forceSound?: boo
   return await pushAlert(alert);
 }
 
+/** 构建标记：开发版在状态栏/横幅上永远带 DEV，避免把 dev 当发布版用 */
+const BUILD_TAG = DEV_MODE ? "DEV" : "";
+
 /** 更新状态栏：idle=🍳 离开中（带待处理计数）/ shouting=📢 正在广播中（带停止提示） */
 function updateStatus(ctx: CookingCtx, phase: "idle" | "shouting"): void {
   if (!ctx?.ui) return;
-  if (!config.cooking) { ctx.ui.setStatus("i-am-cooking", ""); return; }
+  if (!config.cooking) { ctx.ui.setStatus("i-am-cooking", DEV_MODE ? "🧪 DEV 待机" : ""); return; }
   if (phase === "shouting") {
-    const text = "📢 正在广播中...（Ctrl+Alt+M 静音）";
+    const text = `📢 正在广播中${BUILD_TAG ? ` [${BUILD_TAG}]` : ""}...（Ctrl+Alt+M 静音）`;
     ctx.ui.setStatus("i-am-cooking", ctx.ui.theme?.fg ? ctx.ui.theme.fg("warning", text) : text);
   } else {
-    ctx.ui.setStatus("i-am-cooking", `🍳 离开中 · ⚠${pendingActionAlerts().length} 待处理`);
+    ctx.ui.setStatus("i-am-cooking", `🍳 离开中${BUILD_TAG ? ` [${BUILD_TAG}]` : ""} · ⚠${pendingActionAlerts().length} 待处理`);
   }
 }
 
@@ -791,7 +794,7 @@ function updateWidget(ctx: CookingCtx): void {
   const subTag = subs > 0 ? ` · 🤖 子代理 ${subs} 个在跑` : "";
   const lines = config.cooking
     ? [
-        `🍳 离开中 · ⚠${n} 待处理${subTag}${healthTag} · /status 看全部`,
+        `🍳 离开中${BUILD_TAG ? ` [${BUILD_TAG}]` : ""} · ⚠${n} 待处理${subTag}${healthTag} · /status 看全部`,
         ...(shoutingState ? ["  📢 正在广播中...（Ctrl+Alt+M 静音）"] : []),
       ]
     : [];
@@ -1255,6 +1258,7 @@ function showStatus(ctx: CookingCtx): void {
       ? `ntfy topic=${config.ntfyTopic || "(未填)"} token=${maskToken(config.ntfyToken)}`
       : `webhook ${config.webhookUrl || "(未填)"} token=${maskToken(config.webhookToken)}`;
   const lines = [
+    DEV_MODE ? `🧪 构建: DEV（非发布版）· /${COMMAND_NAME}` : `🍳 构建: 发布版 v(见下方路径)`,
     `模式: ${config.cooking ? "🍳 离开中（I am cooking）" : "人类在岗"}`,
     ...(config.since ? [`开启时间: ${new Date(config.since).toLocaleTimeString("zh-CN")}`] : []),
     `待处理呼喊: ${pending.length}`,
@@ -1535,9 +1539,9 @@ function extractText(msg: { role: string; content: any }): string {
 export default function (pi: ExtensionAPI) {
   api = pi;
   // ── commands ──
-  pi.registerCommand("i-am-cooking", {
-    description: "I am cooking: 离开模式。用法: on [备注] / off / status / setup / test",
-    // 输入 /i-am-cooking 后按 Tab/空格 弹出子命令菜单
+  const commandSpec = {
+    description: `${DEV_MODE ? "[DEV] " : ""}I am cooking: 离开模式。用法: on [备注] / off / status / setup / test`,
+    // 输入命令后按 Tab/空格 弹出子命令菜单
     getArgumentCompletions: (prefix: string) => {
       const subs: { value: string; label: string; description?: string }[] = [
         { value: "on", label: "on", description: "开启离开模式（可加备注，如: on 继续做登录模块）" },
@@ -1558,7 +1562,7 @@ export default function (pi: ExtensionAPI) {
       const filtered = subs.filter((s) => s.value.startsWith(prefix));
       return filtered.length > 0 ? filtered : null;
     },
-    handler: async (args, ctx) => {
+    handler: async (args: string, ctx: CookingCtx) => {
       const arg = (args ?? "").trim();
       const first = arg.split(/\s+/)[0]?.toLowerCase() ?? "";
       const cmd = commandHandlers[first];
@@ -1567,7 +1571,21 @@ export default function (pi: ExtensionAPI) {
       const note = first === "on" ? arg.slice(2).trim() : arg;
       await turnOn(ctx, note, true); // 手动开启：询问是否开启小阶段提醒
     },
-  });
+  };
+
+  pi.registerCommand(COMMAND_NAME, commandSpec);
+
+  // 开发版：额外保留 /i-am-cooking 别名（顺手打旧名字也能用），但每次提醒这是 DEV 构建
+  if (DEV_MODE) {
+    pi.registerCommand("i-am-cooking", {
+      ...commandSpec,
+      description: `[DEV 别名，正式命令是 /${COMMAND_NAME}] ${commandSpec.description}`,
+      handler: async (args: string, ctx: CookingCtx) => {
+        ctx.ui.notify(`🧪 你用的是 DEV 构建（不是发布版）。正式命令：/${COMMAND_NAME}`, "warning");
+        await commandSpec.handler(args, ctx);
+      },
+    });
+  }
 
   // 快捷键：停止本次播放（默认 Ctrl+Alt+M；可在 keybindings.json 自定义）
   pi.registerShortcut(Key.ctrlAlt("m"), {
@@ -1942,7 +1960,15 @@ export default function (pi: ExtensionAPI) {
     await ensureRulesFile(); // 首次启动用内置默认创建规则文件，已存在则不动
     // 离开状态不跨会话存活：任何会话启动都从"在岗"开始（需要时用户或 Agent 再 on）
     resetCookingState(ctx);
-    if (!config.setupDone) {
+    if (DEV_MODE) {
+      // 开发版每次启动都报一次身份：命令名、版本、源码路径、状态目录
+      ctx.ui.notify(
+        `🧪 DEV 构建已加载（不是发布版）\n` +
+          `  命令: /${COMMAND_NAME}（/i-am-cooking 为别名，会提醒）\n` +
+          `  ${await describeBuild()}`,
+        "warning",
+      );
+    } else if (!config.setupDone) {
       // 初次使用：提醒配置手机推送
       ctx.ui.notify(
         "🍳 I am cooking 插件已加载。首次使用建议运行 /i-am-cooking setup 配置手机推送（人在厨房也能收到呼喊）。",
