@@ -108,24 +108,47 @@ I_AM_COOKING_HOME=/tmp/iac-dev \
 ## 11. Health watch E2E（自动化，替代 §8b 的人工条目）
 
 `scripts/e2e-health.mjs` 用 RPC 模式起一个真实 pi 进程，验证「定时器滴答 → 注入
-`[健康巡检]` → 横幅显示 `🩺 已催 N/M`」这条只有真跑才能覆盖的链路。
+`[健康巡检]` → 横幅显示 `🩺 已催 N/M`」这条只有真跑才能覆盖的链路。三个模式：
 
-```bash
-node scripts/e2e-health.mjs      # 约 2 分钟，无需 LLM 凭据
+| 模式 | 命令 | 验证内容 | 耗时 | 结果 |
+|---|---|---|---|---|
+| basic | `npm run e2e:health` | 滴答触发、注入 `[健康巡检 #N]`、横幅 `🩺 已催 1/5` | ~2.5min | ✅ 5/5 |
+| escalation | `node scripts/e2e-health.mjs --mode=escalation` | 催满 5 次 → 升级呼喊一次 → 之后静默 | ~12min | ✅ 7/7 |
+| silence | `node scripts/e2e-health.mjs --mode=silence` | 静默偏好下催过上限仍继续催、**绝不升级** | ~13min | ⏳ |
+
+实测证据（escalation 模式）：
+
+```
+🩺 健康巡检：agent 已空闲 2 分钟，第 1 次追问状态。
+🍳 离开中 [DEV] · ⚠0 待处理 · 🩺 已催 5/5 · /status 看全部
+🚨 健康巡检：催了 5 次都没动静，已升级呼喊用户。
+升级后仍有 0 条追问
 ```
 
+通用断言（basic / escalation / silence 三种模式都会查）：
+
 - [x] DEV 构建身份标识出现（启动提示带版本 / 源码路径 / 状态目录）
-- [x] 巡检真的按间隔触发（`healthCheckMinutes=1` + `healthIdleMinutes=1` → 观察到「第 1 次追问状态」）
-- [x] `[健康巡检 #N]` 消息真的注入会话（注意：rules 文本里也含「健康巡检」，断言必须用 `#N` 前缀，否则误匹配）
-- [x] 横幅出现 `🍳 离开中 [DEV] · ⚠0 待处理 · 🩺 已催 1/5`
+- [x] 巡检真的按间隔触发（`healthCheckMinutes=1` + `healthIdleMinutes=1`）
+- [x] `[健康巡检 #N]` 消息真的注入会话
+- [x] 横幅出现 `🍳 离开中 [DEV] · ⚠0 待处理 · 🩺 已催 N/M`
 - [x] 无扩展装载错误（尤其两份同时加载时的工具名冲突）
 
-仍需人工（TUI 才看得见，或需要模型配合）：
+### 三个踩坑记录（改脚本时别再踩）
+
+1. **rules 文本本身含「健康巡检」四个字** → 断言必须匹配 `[健康巡检 #N]` 前缀，
+   否则 `on` 时注入的规则文本会被误判成巡检消息，脚本提前退出（第一版就栽在这）。
+2. **偏好是会话级的**：`resetCookingState`（`session_start`）会把 `callingMode` /
+   `healthMuteEscalation` 洗回 `normal`。预置 config.json 造不出静默模式，
+   必须在启动后用真实原话触发。
+3. **`input` 事件只认 `source === "interactive"`**：RPC 发的消息不算「人在场打字」，
+   不会触发偏好识别（这是对的，否则 agent 提示词里的「别喊了」字样会误伤用户）。
+   触发路径只有 `on` 的备注：`/i-am-cooking-dev on 别喊了，安静点`。
+   另外别分两条发 `on`——第一条会起一轮回合，第二条会被挡在队列后面。
+
+### 仍需人工（TUI 才看得见，或需要模型配合）
 
 - [ ] `set_task_state(done)` → 横幅 `🩺 已完成`，后续巡检静默
 - [ ] 用户开口 → 状态回 `working`，下次空闲再催
-- [ ] 催满 5 次 → 一次 `normal` 呼喊，然后静默
-- [ ] `silence` 偏好下一直催、不升级响铃
 - [ ] 有 async 子代理在跑 → 巡检跳过
 - [ ] 未处理阻塞呼喊 + 长空闲 → 判 `waiting_user`，不催
 

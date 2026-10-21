@@ -17,10 +17,14 @@ import { tmpdir } from "node:os";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const EXT = join(REPO, "extensions", "i-am-cooking", "index.ts");
-const HOME_DIR = join(tmpdir(), "iac-e2e");
+const HOME_DIR = process.env.I_AM_COOKING_HOME ?? join(tmpdir(), "iac-e2e");
+const MODE = (process.argv.find((a) => a.startsWith("--mode="))?.split("=")[1]) ?? "basic";
 const CHECK_MINUTES = 1; // 滴答间隔
 const IDLE_MINUTES = 1; // 空闲多久算「没在运行」
-const TIMEOUT_MS = 150_000;
+// basic: 首催就够；escalation: 要催满 5 次再升级（约 6 分钟）；silence: 催过 5 次仍不升级
+// 实测节奏：每轮「回合收尾 → 空闲满 1 分钟 → 下一次滴答」约 70-80 秒，
+// 5 轮 ≈ 11 分钟；silence 要看到第 6 次 ≈ 13 分钟。给足余量。
+const TIMEOUT_MS = MODE === "basic" ? 150_000 : MODE === "escalation" ? 900_000 : 1_000_000;
 
 const lines = [];
 const seen = {
@@ -29,6 +33,8 @@ const seen = {
   tickNotify: [],
   nudgeMessage: null,
   widgetNudged: null,
+  escalation: null,
+  stallAlert: null,
   errors: [],
 };
 
@@ -44,6 +50,7 @@ function onLine(raw) {
       const m = j.message ?? "";
       if (m.includes("DEV 构建已加载")) seen.devBanner = true;
       if (m.includes("健康巡检") && m.includes("追问状态")) seen.tickNotify.push(m);
+      if (m.includes("催了") && m.includes("已升级呼喊")) seen.escalation = m;
       if (m.includes("离开模式已开启") || m.includes("⏱")) seen.cookingOn = true;
     }
     if (j.method === "setWidget" && j.widgetKey === "i-am-cooking") {
@@ -80,6 +87,9 @@ async function main() {
       tuiBanner: true,
       setupDone: true,
       progressReporting: "none",
+      // 注意：callingMode / healthMuteEscalation 是会话级状态，session_start 时会被
+      // resetCookingState 洗回 normal。所以 silence 不能靠预置 config 造，必须启动后用真实
+      // 原话触发（见下方 MODE === "silence" 分支）。
     }, null, 2),
     "utf8",
   );
@@ -113,16 +123,60 @@ async function main() {
 
   // 等扩展装载完，再开离开模式
   await new Promise((r) => setTimeout(r, 6000));
-  child.stdin.write(JSON.stringify({ type: "prompt", message: "/i-am-cooking-dev on" }) + "\n");
-  console.log(`${tick()} 已发送 /i-am-cooking-dev on，等待滴答（每 ${CHECK_MINUTES} 分钟 / 空闲 ${IDLE_MINUTES} 分钟）…`);
+  const onMessage = MODE === "silence" ? "/i-am-cooking-dev on 别喊了，安静点" : "/i-am-cooking-dev on";
+  child.stdin.write(JSON.stringify({ type: "prompt", message: onMessage }) + String.fromCharCode(10));
+  console.log(`${tick()} 已发送 ${onMessage}，等待滴答（每 ${CHECK_MINUTES} 分钟 / 空闲 ${IDLE_MINUTES} 分钟）…`);
+
+  // on 会注入一条 steer 起一轮回合。本机无 LLM 凭据时它会反复重试，而 turn_start 会刷新
+  // 健康巡检的 idle 计时 → 巡检永远不认为 agent「停住」→ 一条催都发不出（silence 模式
+  // 实测卡了 11 分钟 0 催）。用 RPC 的 abort 断掉回合，让 agent 稳定下来。
+  await new Promise((r) => setTimeout(r, 15000));
+  child.stdin.write(JSON.stringify({ type: "abort" }) + String.fromCharCode(10));
+  console.log(`${tick()} 已发送 abort，断开 on 触发的回合`);
+
+  if (MODE === "silence") {
+    // 偏好必须由用户原话触发（input 事件只认 interactive source，RPC 输入不算「人在场打字」，
+    // 挡掉是对的），所以走 on 备注这条路径：detectPreference(note)。
+    // 别分两条发 on：turnOn 是幂等的（config.cooking 已 true 就 early-return），第二条会被挡掉。
+    await new Promise((r) => setTimeout(r, 5000));
+    const { readFile: rf } = await import("node:fs/promises");
+    const cfgNow = JSON.parse(await rf(join(HOME_DIR, "config.json"), "utf8"));
+    console.log(`${tick()} 静默偏好 → callingMode=${cfgNow.callingMode} muteEscalation=${cfgNow.healthMuteEscalation}`);
+    if (cfgNow.callingMode !== "silence" || !cfgNow.healthMuteEscalation) {
+      console.log("  ⚠️ 静默偏好没生效，本轮 silence 断言无效");
+    }
+  }
 
   const deadline = Date.now() + TIMEOUT_MS;
-  while (Date.now() < deadline && !seen.nudgeMessage) {
+  const done = () => {
+    if (MODE === "escalation") return !!seen.escalation;
+    if (MODE === "silence") return seen.tickNotify.length >= 6;
+    return !!seen.nudgeMessage;
+  };
+  let lastReport = 0;
+  let nudgesSeen = seen.tickNotify.length;
+  while (Date.now() < deadline && !done()) {
     await new Promise((r) => setTimeout(r, 1000));
-    if (seen.widgetNudged && seen.nudgeMessage) break;
+    // 巡检注入的 [健康巡检] 本身会起一轮回合。本机无 LLM 凭据时它会反复重试，而
+    // turn_start 会刷新 idle 计时 → 下一条催永远发不出（实测卡在「已催 1 次」900 秒）。
+    // 每出一条新催就 abort 一次，断掉回合，让 agent 回到空闲，下一条催才发得出。
+    if (seen.tickNotify.length > nudgesSeen) {
+      nudgesSeen = seen.tickNotify.length;
+      await new Promise((r) => setTimeout(r, 8000));
+      child.stdin.write(JSON.stringify({ type: "abort" }) + String.fromCharCode(10));
+      console.log(`${tick()} 第 ${nudgesSeen} 次催已出，abort 断掉它起的回合`);
+    }
+    if (Date.now() - lastReport > 30_000) {
+      lastReport = Date.now();
+      console.log(`${tick()} 已催 ${seen.tickNotify.length} 次${seen.escalation ? "，已升级" : ""}…`);
+    }
   }
 
   try { child.kill(); } catch {}
+  if (process.argv.includes("--keep")) {
+    const { writeFile: wf } = await import("node:fs/promises");
+    await wf(join(HOME_DIR, "events.jsonl"), lines.join(String.fromCharCode(10)), "utf8");
+  }
 
   const pass = [];
   const fail = [];
@@ -133,6 +187,18 @@ async function main() {
   check(!!seen.nudgeMessage, "[健康巡检] 消息真的注入会话", seen.nudgeMessage ?? "超时未注入");
   check(!!seen.widgetNudged, "横幅出现 🩺 已催 N/M", seen.widgetNudged ?? "未观察到");
   check(seen.errors.length === 0, "无扩展装载错误", seen.errors.join(" | "));
+
+  if (MODE === "escalation") {
+    check(seen.tickNotify.length >= 5, "催满 5 次", `实际 ${seen.tickNotify.length} 次`);
+    check(!!seen.escalation, "催满后升级呼喊用户一次", seen.escalation ?? "未观察到升级提示");
+    const after = seen.escalation ? lines.slice(lines.findIndex((l) => l.includes("已升级呼喊")) + 1) : [];
+    const moreNudges = after.filter((l) => /\[健康巡检 #\d+\]/.test(l)).length;
+    check(moreNudges === 0, "升级后不再追问（静默止损）", `升级后仍有 ${moreNudges} 条追问`);
+  }
+  if (MODE === "silence") {
+    check(seen.tickNotify.length >= 6, "silence 下催过上限仍继续催", `实际 ${seen.tickNotify.length} 次`);
+    check(!seen.escalation, "silence 下绝不升级为响铃呼喊", seen.escalation ? "出现了升级呼喊" : "");
+  }
 
   console.log("\n=== 通过 ===");
   for (const p of pass) console.log("  ✅ " + p);
