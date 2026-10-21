@@ -21,6 +21,7 @@
  *   /i-am-cooking sound        — 自定义呼喊铃声（歌曲/试听/总时长，交互式中文）
  *   /i-am-cooking volume       — 音量控制（查看/手动调整/离开自动拉高，交互式中文）
  *   /i-am-cooking health        — 健康巡检（开关/频率/空闲判定/催问上限/立刻巡检一次）
+ *   /i-am-cooking agent [名字]  — 查看/设置本会话的呼喊标签（多 Agent 时分辨是谁在喊你）
  *
  * 工具 (LLM 调用):
  *   shout_for_user            — 卡住且只有用户能解决时调用
@@ -43,7 +44,7 @@ import type { ExtensionAPI, ExtensionUIContext, ExtensionUIDialogOptions } from 
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Key } from "@earendil-works/pi-tui"; // 快捷键（停止本次播放）
-import { mkdir, readFile, writeFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, appendFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -57,6 +58,10 @@ import type { ToolWatch } from "./lib/tool-watch.ts";
 import { classifyTurnError, isRetryable, shouldCompactFirst, backoffMs, shouldEscalate, buildRetrySteer, describeErrorKind } from "./lib/errors.ts";
 import type { TurnErrorKind } from "./lib/errors.ts";
 import { buildEndJudgePrompt, parseEndJudgeVerdict, shouldUseEndJudge, renderEndJudgeCommand } from "./lib/end-judge.ts";
+import { agentTag, mustRelayViaParent, resolveAgentIdentity, sanitizeLabel, tagMessage, ttsAgentPrefix } from "./lib/identity.ts";
+import type { AgentIdentity } from "./lib/identity.ts";
+import { buildRelayAckText, buildRelayPrompt, dedupeRelayRequests, parseRelayRequests, relayFilePath, serializeRelayRequest } from "./lib/relay.ts";
+import type { RelayRequest } from "./lib/relay.ts";
 import { CONFIG_DIR, CONFIG_PATH, DEFAULT_RULES_PATH, RULES_PATH, SCRIPTS, TMP_DIR, DEV_MODE, COMMAND_NAME, describeBuild } from "./lib/config.ts";
 import type { Alert, AutonomyLevel, CallingMode, Config, Urgency } from "./lib/config.ts";
 import { DEFAULTS, readConfig, writeConfig } from "./lib/config.ts";
@@ -138,7 +143,14 @@ let retryTimerRef: ReturnType<typeof setTimeout> | null = null;
  *  但只有条目数量与最后一句都一样的才是同一个回合。新一轮工作会改变条目数 → 重新进入判定。 */
 let lastSettleSignature = "";
 /** 最近一次事件里的 ctx（定时器回调里拿不到事件 ctx，超时 abort / 巡检需要它） */
+/** 本进程的 Agent 身份（父会话 / 子 Agent）。
+ *  子 Agent 不能直接呼喊：它可能跑在用户没打开的会话里（如 Zen 镜像），
+ *  喊了也回不去。它的呼喊请求交给父会话，由父 Agent 转达。 */
+let agentIdentity: AgentIdentity = resolveAgentIdentity({ env: process.env });
+/** 最近一次事件里的 ctx（定时器回调里拿不到事件 ctx，超时 abort / 巡检需要它） */
 let lastCtx: CookingCtx | undefined;
+/** 已读过的转达请求 id（防止父会话把同一条转达两遍） */
+const seenRelayIds = new Set<string>();
 /** 当前会话里还在跑的 async 子代理 id（事件驱动；registry 探测兜底） */
 const activeSubagents = new Set<string>();
 /** 上一回合结束原因（health 巡检文案用：判断是不是「意外终止」） */
@@ -153,6 +165,189 @@ function pendingAlerts(): Alert[] {
 /** 需要用户处理的行动项（完成/进度等纯告知类不计入“待处理”） */
 function pendingActionAlerts(): Alert[] {
   return config.alerts.filter((a) => !a.acked && !isProgressCategory(a.category) && a.category !== "completion");
+}
+
+// ── Agent 身份 & 呼喊标签 ────────────────────────────────
+// 问题：同时开很多个 Agent，每条呼喊长得一模一样，看不出是谁在喊你。
+// 做法：每条呼喊都带上本会话的标签（优先级：配置 ai alias > 会话名 > 会话 id 短码）。
+
+/** 启动/新会话时刷新身份（会话名可能在这时才可用） */
+function refreshAgentIdentity(ctx?: CookingCtx): AgentIdentity {
+  let sessionName: string | undefined;
+  let sessionId: string | undefined;
+  try {
+    sessionName = api?.getSessionName?.();
+    sessionId = ctx?.sessionManager?.getSessionFile?.() ?? ctx?.sessionManager?.getSessionId?.();
+  } catch { /* best effort */ }
+  const resolved = resolveAgentIdentity({
+    env: process.env,
+    sessionName: sanitizeLabel(config.agentAlias) || sessionName,
+    sessionId,
+  });
+  agentIdentity = resolved;
+  return resolved;
+}
+
+/** 当前呼喊标签（横幅 / TTS / 手机 / status 用） */
+function currentAgentTag(): string {
+  return agentTag(agentIdentity);
+}
+
+// ── 多 Agent 的离开状态（每会话独立）───────────────────────────
+// config.json 是同一台机器上所有 pi 会话共享的。之前只要任何会话启动，
+// resetCookingState 就把 cooking / alerts / 偏好全清掉 —— 另一个正在离开中的 Agent
+// 就被静默“清理”了。现在把「谁在离开中」存成 map，并按 Agent 键清自己的。
+
+/** 本 Agent 的状态键（优先会话 id：同名会话不会互相覆盖） */
+function myAgentKey(): string {
+  return agentIdentity.sessionId || `label:${agentIdentity.label}`;
+}
+
+/** 本会话是否在离开模式（旧配置没有 cookingAgents 时退回全局开关） */
+function isMyCooking(): boolean {
+  const map = config.cookingAgents;
+  if (!map) return !!config.cooking;
+  const key = myAgentKey();
+  if (map[key]) return true;
+  // 标签匹配也算：会话 id 变了（/resume 后重建）但同一个 Agent 重新 on 过
+  return Object.values(map).some((v) => v.label === agentIdentity.label);
+}
+
+/** 改本会话的离开状态，并同步全局布尔（供子 Agent / 旧代码判断“是否至少有一个在离开”） */
+function setMyCooking(on: boolean): void {
+  const key = myAgentKey();
+  const map: Record<string, { since: number; label: string }> = { ...(config.cookingAgents ?? {}) };
+  if (on) {
+    map[key] = { since: Date.now(), label: agentIdentity.label };
+    config.since = Date.now();
+  } else {
+    // 把同一个 Agent 的旧键（会话 id 换过）一并清掉
+    for (const [k, v] of Object.entries(map)) {
+      if (v.label === agentIdentity.label) delete map[k];
+    }
+    delete map[key];
+    config.since = undefined;
+  }
+  config.cookingAgents = map;
+  config.cooking = Object.keys(map).length > 0;
+}
+
+/** 还有别的 Agent 在离开中吗（新会话启动时别把它们的偏好清掉） */
+function otherAgentsCooking(): boolean {
+  const map = config.cookingAgents ?? {};
+  const mine = agentIdentity.label;
+  return Object.values(map).some((v) => v.label !== mine);
+}
+
+// ── 子 Agent 呼喊转达（子 Agent 不许直接喊）────────────────
+
+function relayDir(): string {
+  return join(TMP_DIR, "relay");
+}
+
+/** 子 Agent 路径：把呼喊请求追写到以父会话 id 命名的文件 */
+async function writeRelayRequest(req: RelayRequest): Promise<{ ok: boolean; reason?: string }> {
+  const parentId = agentIdentity.parentSessionId;
+  if (!parentId) {
+    return { ok: false, reason: "找不到父会话 id（PI_SUBAGENT_PARENT_SESSION 为空）——可能父进程不是 pi-subagents 起的" };
+  }
+  try {
+    await mkdir(relayDir(), { recursive: true });
+    await appendFile(relayFilePath(relayDir(), parentId), `${serializeRelayRequest(req)}\n`, "utf8");
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: `写入转达文件失败：${(e as Error).message}` };
+  }
+}
+
+/**
+ * 父 Agent 路径：取走交给自己的子 Agent 呼喊请求（读完即清空，避免重复转达）。
+ * 文件不存在 / 内容空 / 全坏行 → 返回空数组，不报错。
+ */
+async function drainRelayRequests(): Promise<RelayRequest[]> {
+  if (agentIdentity.kind !== "parent") return []; // 子 Agent 不取转达
+  const sessionId = agentIdentity.sessionId;
+  if (!sessionId) return [];
+  const path = relayFilePath(relayDir(), sessionId);
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return []; // 文件不存在 = 没人在交请求，正常
+  }
+  try {
+    await writeFile(path, "", "utf8"); // 先清空再解析：新请求不会丢，旧请求不会重放
+  } catch { /* best effort */ }
+  const parsed = dedupeRelayRequests(parseRelayRequests(raw));
+  const fresh = parsed.filter((r) => !seenRelayIds.has(r.id));
+  for (const r of fresh) seenRelayIds.add(r.id);
+  // 防止长会话无限长大（只留最近 500 个 id）
+  if (seenRelayIds.size > 500) {
+    const keep = [...seenRelayIds].slice(-500);
+    seenRelayIds.clear();
+    for (const id of keep) seenRelayIds.add(id);
+  }
+  return fresh;
+}
+
+/**
+ * 把子 Agent 的请求投递给父 Agent 自己（作为一条成员消息）。
+ * 注意：这条消息**不直接响铃**——由父 Agent 判断后自己调 shout_for_user，
+ * 这样父 Agent 有上下文，能决定要不要此刻打扰用户。
+ */
+async function deliverRelayToSelf(ctx: CookingCtx, reqs: RelayRequest[]): Promise<void> {
+  if (reqs.length === 0) return;
+  const label = agentIdentity.label;
+  ctx.ui.notify(
+    `📨 收到 ${reqs.length} 条子 Agent 呼喊转达（由你决定是否喊用户）`,
+    "info",
+  );
+  void api.sendUserMessage(buildRelayPrompt(reqs, label), { deliverAs: "followUp" });
+}
+
+/** 取一次转达队列并投给自己（收尾 / 巡检 / 子代理完成时调） */
+async function pumpRelayQueue(ctx: CookingCtx): Promise<void> {
+  try {
+    const reqs = await drainRelayRequests();
+    await deliverRelayToSelf(ctx, reqs);
+  } catch (e) {
+    console.error("[i-am-cooking] relay pump failed:", e);
+  }
+}
+
+/**
+ * 子 Agent 的 shout_for_user 统一入口：写成转达请求，返回给模型的说明。
+ * 拆出来是因为工具路径和 queueAlert 路径都要用同一套逻辑。
+ */
+async function relayAndAck(
+  message: string,
+  urgency: "info" | "normal" | "urgent",
+  category: string,
+  ttsText?: string,
+): Promise<{ content: { type: "text"; text: string }[]; details: Record<string, unknown> }> {
+  const written = await writeRelayRequest({
+    id: randomUUID(),
+    ts: Date.now(),
+    from: agentIdentity.label,
+    fromSessionId: agentIdentity.sessionId,
+    fromAgent: agentIdentity.agentName,
+    message,
+    urgency,
+    category,
+    ttsText,
+  });
+  return {
+    content: [{
+      type: "text",
+      text: buildRelayAckText({
+        from: agentIdentity.label,
+        queued: written.ok,
+        parentSessionId: agentIdentity.parentSessionId,
+        reason: written.reason,
+      }),
+    }],
+    details: { fired: false, relayed: written.ok, relayReason: written.reason ?? null },
+  };
 }
 
 
@@ -431,15 +626,15 @@ async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
     })}\n` +
     `  空闲时长: ${idleFor}\n` +
     `  ${nudgeLine}\n` +
-    `  正在运行的子代理: ${config.cooking ? countActiveSubagents(ctx) : "—"}\n` +
+    `  正在运行的子代理: ${isMyCooking() ? countActiveSubagents(ctx) : "—"}\n` +
     (health.note ? `  最后表态: ${health.note}\n` : "") +
-    `  模式: ${config.cooking ? "离开中（巡检生效）" : "在岗（巡检只在离开模式下工作）"}`;
+    `  模式: ${isMyCooking() ? "离开中（巡检生效）" : "在岗（巡检只在离开模式下工作）"}`;
 
   // 非交互：支持 health on / off / now / 直接看
   if (sub === "on" || sub === "off") {
     config.healthCheck = sub === "on";
     await writeConfig(config);
-    if (config.cooking) {
+    if (isMyCooking()) {
       if (config.healthCheck) startHealthTimer(ctx);
       else stopHealthTimer();
     }
@@ -447,7 +642,7 @@ async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
     return;
   }
   if (sub === "now") {
-    if (!config.cooking) { ctx.ui.notify("当前不在离开模式，巡检只在离开模式下工作（先 /i-am-cooking on）。", "warning"); return; }
+    if (!isMyCooking()) { ctx.ui.notify("当前不在离开模式，巡检只在离开模式下工作（先 /i-am-cooking on）。", "warning"); return; }
     // 手动立刻巡一次：把空闲起点推到「刚好超过阈值」，方便测试且文案正常
     forceIdleForCheck();
     ctx.ui.notify("🩺 手动触发一次巡检…", "info");
@@ -474,7 +669,7 @@ async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
   if (choose.includes("开关巡检")) {
     config.healthCheck = !config.healthCheck;
     await writeConfig(config);
-    if (config.cooking) {
+    if (isMyCooking()) {
       if (config.healthCheck) startHealthTimer(ctx);
       else stopHealthTimer();
     }
@@ -482,7 +677,7 @@ async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
     return;
   }
   if (choose.includes("立刻巡检")) {
-    if (!config.cooking) { ui.notify("当前不在离开模式，巡检只在离开模式下工作（先 /i-am-cooking on）。", "warning"); return; }
+    if (!isMyCooking()) { ui.notify("当前不在离开模式，巡检只在离开模式下工作（先 /i-am-cooking on）。", "warning"); return; }
     forceIdleForCheck();
     ui.notify("🩺 手动触发一次巡检…", "info");
     healthTick(ctx);
@@ -513,8 +708,43 @@ async function cmdHealth(ctx: CookingCtx, fullArg: string): Promise<void> {
   else if (isIdle) config.healthIdleMinutes = Math.max(1, Math.min(180, n));
   else config.healthMaxNudges = Math.max(1, Math.min(20, n));
   await writeConfig(config);
-  if (config.cooking && config.healthCheck) startHealthTimer(ctx); // 频率变了：重挂定时器
+  if (isMyCooking() && config.healthCheck) startHealthTimer(ctx); // 频率变了：重挂定时器
   ui.notify("✅ 已保存。", "info");
+}
+
+// ── Agent 标签子命令 ─────────────────────────────────────────────────
+// 多 Agent 共存时，呼喊必须能看出是谁在喊。标签默认自动推断（会话名 → 主会话），
+// 也可以显式指定一个短名字（同一台机器上同名会混，建议各会话取不同的）。
+async function cmdAgent(ctx: CookingCtx, fullArg: string): Promise<void> {
+  const name = fullArg.trim().split(/\s+/).slice(1).join(" ").trim();
+  const id = refreshAgentIdentity(ctx);
+  if (!name) {
+    ctx.ui.notify(
+      `🏷️ 本会话的呼喊标签：${currentAgentTag()}\n` +
+      `  · 类型: ${id.kind === "subagent" ? "子 Agent（不能直接喊用户，会转达父 Agent）" : "父会话"}\n` +
+      (id.agentName ? `  · agent 名: ${id.agentName}\n` : "") +
+      (id.sessionId ? `  · 会话: ${id.sessionId}\n` : "") +
+      (id.parentSessionId ? `  · 父会话: ${id.parentSessionId}\n` : "") +
+      `\n设置自定义名：/${COMMAND_NAME} agent <短名>（例如 /${COMMAND_NAME} agent 主会话）\n` +
+      `清除自定义名：/${COMMAND_NAME} agent reset`,
+      "info",
+    );
+    return;
+  }
+  if (name === "reset" || name === "clear") {
+    config.agentAlias = "";
+  } else {
+    config.agentAlias = sanitizeLabel(name, 20);
+  }
+  await writeConfig(config);
+  refreshAgentIdentity(ctx);
+  updateWidget(ctx);
+  ctx.ui.notify(
+    config.agentAlias
+      ? `🏷️ 呼喊标签已设为 ${currentAgentTag()}（以后每条呼喊前面都会带它）`
+      : `🏷️ 已清除自定义标签，回到自动推断：${currentAgentTag()}`,
+    "info",
+  );
 }
 
 // 子命令注册表（handler 只做分发，具体逻辑见上面各函数）
@@ -532,6 +762,7 @@ const commandHandlers: Record<string, (ctx: CookingCtx, fullArg: string) => Prom
   sound: async (ctx) => { await cmdSound(ctx); },
   volume: async (ctx) => { await cmdVolume(ctx); },
   health: async (ctx, fullArg) => { await cmdHealth(ctx, fullArg); },
+  agent: async (ctx, fullArg) => { await cmdAgent(ctx, fullArg); },
 };
 
 // ── 音频文件浏览（sound 命令用）──────────────────────────────────────────
@@ -795,12 +1026,12 @@ const BUILD_TAG = DEV_MODE ? "DEV" : "";
 /** 更新状态栏：idle=🍳 离开中（带待处理计数）/ shouting=📢 正在广播中（带停止提示） */
 function updateStatus(ctx: CookingCtx, phase: "idle" | "shouting"): void {
   if (!ctx?.ui) return;
-  if (!config.cooking) { ctx.ui.setStatus("i-am-cooking", DEV_MODE ? "🧪 DEV 待机" : ""); return; }
+  if (!isMyCooking()) { ctx.ui.setStatus("i-am-cooking", DEV_MODE ? "🧪 DEV 待机" : ""); return; }
   if (phase === "shouting") {
     const text = `📢 正在广播中${BUILD_TAG ? ` [${BUILD_TAG}]` : ""}...（Ctrl+Alt+M 静音）`;
     ctx.ui.setStatus("i-am-cooking", ctx.ui.theme?.fg ? ctx.ui.theme.fg("warning", text) : text);
   } else {
-    ctx.ui.setStatus("i-am-cooking", `🍳 离开中${BUILD_TAG ? ` [${BUILD_TAG}]` : ""} · ⚠${pendingActionAlerts().length} 待处理`);
+    ctx.ui.setStatus("i-am-cooking", `🍳 ${agentIdentity.label}${BUILD_TAG ? ` [${BUILD_TAG}]` : ""} · ⚠${pendingActionAlerts().length} 待处理`);
   }
 }
 
@@ -808,8 +1039,8 @@ function updateWidget(ctx: CookingCtx): void {
   if (!ctx?.ui) return;
   if (!config.tuiBanner) { ctx.ui.setWidget("i-am-cooking", []); return; }
   const n = pendingActionAlerts().length;
-  const subs = config.cooking && config.healthCheck ? countActiveSubagents(ctx) : 0;
-  const healthTag = config.cooking && config.healthCheck
+  const subs = isMyCooking() && config.healthCheck ? countActiveSubagents(ctx) : 0;
+  const healthTag = isMyCooking() && config.healthCheck
     ? health.phase === "done"
       ? " · 🩺 已完成"
       : health.phase === "waiting_user"
@@ -822,10 +1053,10 @@ function updateWidget(ctx: CookingCtx): void {
               ? ` · 🩺 已催 ${health.nudges}/${config.healthMaxNudges}`
               : ""
     : "";
-  const tools = config.cooking ? runningToolsLabel(Date.now()) : "";
+  const tools = isMyCooking() ? runningToolsLabel(Date.now()) : "";
   const subTag = subs > 0 ? ` · 🤖 子代理 ${subs} 个在跑` : "";
   const toolTag = tools ? ` · 🔧 ${tools}` : "";
-  const lines = config.cooking
+  const lines = isMyCooking()
     ? [
         `🍳 离开中${BUILD_TAG ? ` [${BUILD_TAG}]` : ""} · ⚠${n} 待处理${subTag}${toolTag}${healthTag} · /status 看全部`,
         ...(shoutingState ? ["  📢 正在广播中...（Ctrl+Alt+M 静音）"] : []),
@@ -856,7 +1087,7 @@ function scheduleRepeats(alert: Alert, ctx: CookingCtx): void {
   if (alert.urgency === "urgent") {
     const iv = Math.max(1, config.urgentRepeatMinutes) * 60_000;
     const timer = setInterval(() => {
-      if (!config.cooking) return;
+      if (!isMyCooking()) return;
       if (alert.acked) { clearInterval(timer); return; } // 已被用户响应，停止重复喊
       alert.repeatCount++;
       void writeConfig(config);
@@ -868,7 +1099,7 @@ function scheduleRepeats(alert: Alert, ctx: CookingCtx): void {
     sessionTimers.push(timer);
   } else if (alert.urgency === "normal") {
     const timer = setTimeout(() => {
-      if (!config.cooking) return;
+      if (!isMyCooking()) return;
       if (alert.acked) return; // 已被用户响应，不再重喊
       alert.repeatCount++;
       void writeConfig(config);
@@ -916,10 +1147,11 @@ let agentActive = false;
  *  - interval 模式：三问定时汇报（category="progress"）
  *  - milestone 模式：单行自查，有无值得报的小阶段（category="milestone"） */
 function startReportTimer(ctx: CookingCtx): void {
+  if (mustRelayViaParent(agentIdentity)) return; // 子 Agent 不跑进度心跳
   stopReportTimer();
   const minutes = Math.max(1, Math.min(120, config.reportIntervalMinutes || 15));
   reportTimer = setInterval(() => {
-    if (!config.cooking) return;
+    if (!isMyCooking()) return;
     // 「忙」的统一口径：回合结束 / 卡在长工具里 / 队列里已有话没投递 → 都不插话
     // （长工具调用中插话只会堆积成重复催促，这是本次行为变化，见 CHANGELOG）
     if (shouldSkipReportTick(activitySnapshot(ctx))) return;
@@ -1140,7 +1372,7 @@ function scheduleErrorRetry(ctx: CookingCtx, kind: TurnErrorKind, text: string):
   if (retryTimerRef) clearTimeout(retryTimerRef);
   retryTimerRef = setTimeout(() => {
     retryTimerRef = null;
-    if (!config.cooking) return;
+    if (!isMyCooking()) return;
     void api.sendUserMessage(
       buildRetrySteer({
         kind,
@@ -1220,15 +1452,18 @@ async function judgeTurnEnd(
  * 巡检总开关关掉时，长脚本死锁仍然要能救（它由 toolTimeoutMinutes 独立控制）。
  */
 function healthTick(ctx: CookingCtx): void {
-  if (!config.cooking) return;
+  if (!isMyCooking()) return;
 
   checkToolTimeouts(ctx);
+
+  // 子 Agent 的呼喊请求：父会话在巡检时取走并投给自己（由父 Agent 自己决定喊不喊）
+  void pumpRelayQueue(ctx);
 
   if (!config.healthCheck) return;
 
   const activity = activitySnapshot(ctx);
   const decision = decideHealthTick(health, {
-    cooking: config.cooking,
+    cooking: isMyCooking(),
     enabled: config.healthCheck,
     now: Date.now(),
     agentBusy: activity.agentBusy,
@@ -1307,6 +1542,7 @@ function healthTick(ctx: CookingCtx): void {
 /** 启动健康巡检（幂等；随离开模式启停）。
  *  巡检总开关关掉时也要起表 —— 工具超时死锁救不回它，巡检关不掉。 */
 function startHealthTimer(ctx: CookingCtx): void {
+  if (mustRelayViaParent(agentIdentity)) return; // 子 Agent 不跑巡检（父会话管）
   stopHealthTimer(ctx);
   const toolTimeoutOn = (config.toolTimeoutMinutes ?? 10) > 0;
   if (!config.healthCheck && !toolTimeoutOn) return;
@@ -1319,10 +1555,29 @@ function stopHealthTimer(_ctx?: CookingCtx): void {
   if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
 }
 
-type QueueResult = "queued" | "not-cooking" | "mode-off" | "limit" | "duplicate";
+type QueueResult = "queued" | "not-cooking" | "mode-off" | "limit" | "duplicate" | "subagent";
 
 function queueAlert(message: string, urgency: Urgency, category: string, ctx: CookingCtx, ttsText?: string): QueueResult {
-  if (!config.cooking) return "not-cooking";
+  if (!isMyCooking()) return "not-cooking";
+  // 子 Agent 进程绝不允许自己响铃/弹窗/推送：用户可能根本没开它那个会话。
+  // 所有自行触发的呼喊（自动问号、报错、巡检升级）也一样透传。
+  if (mustRelayViaParent(agentIdentity)) {
+    void writeRelayRequest({
+      id: randomUUID(),
+      ts: Date.now(),
+      from: agentIdentity.label,
+      fromSessionId: agentIdentity.sessionId,
+      fromAgent: agentIdentity.agentName,
+      message,
+      urgency,
+      category,
+      ttsText,
+    });
+    return "subagent";
+  }
+
+  // 多 Agent：每条呼喊都带「谁在喊」标签，否则一堆 Agent 同时开着根本分不清
+  const tagged = tagMessage(agentIdentity, message);
 
   // milestone（小阶段完成）仅在 progressReporting = milestone 模式提醒；interval/none 忽略
   if (category === "milestone") {
@@ -1341,7 +1596,7 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: Co
   // 进度类（progress/milestone）不参与去重：即使内容相同，每次进度都要推手机
   if (!isProgressCategory(category)) {
     const dup = config.alerts.find(
-      (a) => !a.acked && a.message === message && Date.now() - a.time < 10 * 60_000,
+      (a) => !a.acked && a.message === tagged && Date.now() - a.time < 10 * 60_000,
     );
     if (dup) return "duplicate";
   }
@@ -1349,12 +1604,14 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: Co
   const alert: Alert = {
     id: randomUUID(),
     time: Date.now(),
-    message,
+    message: tagged,
     urgency,
     category,
     repeatCount: 0,
     acked: false,
-    ttsText,
+    agent: agentIdentity.label,
+    agentKey: myAgentKey(), // 会话启动时按这个键只清自己的呼喊，不清别的 Agent 的
+    ttsText: ttsText ? `${ttsAgentPrefix(agentIdentity)}${ttsText}` : undefined,
   };
   config.alerts.push(alert);
   void writeConfig(config);
@@ -1371,13 +1628,19 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: Co
 function resetCookingState(ctx: CookingCtx): void {
   clearRepeatTimers();
   stopAudioAll(); // 用户回来/新会话：立即停止正在播放的音频
-  const hadCooking = config.cooking;
-  const hadPending = pendingAlerts().length;
-  config.cooking = false;
-  config.since = undefined;
-  config.alerts = [];
-  config.callingMode = "normal"; // 偏好是会话级的，每次会话重置
-  config.healthMuteEscalation = false; // 健康巡检的「只催不喊」也是会话级的
+  const hadCooking = isMyCooking();
+  const hadPending = pendingAlerts().filter((a) => a.agentKey === myAgentKey()).length;
+  const othersAway = otherAgentsCooking();
+  // 只清本 Agent 的离开状态与呼喊：别的 Agent 可能还在离开中，不能替它收工
+  setMyCooking(false);
+  const myKey = myAgentKey();
+  config.alerts = othersAway
+    ? config.alerts.filter((a) => a.agentKey !== myKey && a.agentKey !== undefined)
+    : []; // 没有别的 Agent 在离开 → 全部归档（旧数据没 agentKey 也一起清）
+  if (!othersAway) {
+    config.callingMode = "normal"; // 偏好是会话级的，每次会话重置
+    config.healthMuteEscalation = false; // 健康巡检的「只催不喊」也是会话级的
+  }
   void writeConfig(config);
   cancelRetry(); // 未执行的退避重试随关闭作废
   // 健康巡检状态也是会话级的：新会话从 working 开始
@@ -1398,10 +1661,17 @@ function resetCookingState(ctx: CookingCtx): void {
 }
 
 async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Promise<void> {
+  // 子 Agent 不能管理离开模式：config.json 是会话共享的，它一开一关就把父会话的状态涤了
+  if (mustRelayViaParent(agentIdentity)) {
+    ctx.ui.notify(
+      `🤖 本会话是子 Agent「${agentIdentity.label}」，不能开关离开模式（那是父会话的事）。`,
+      "warning",
+    );
+    return;
+  }
   // 幂等：已在离开模式则不再重复开启（供 Agent 工具复用，避免重复发指令/拉音量）
-  if (config.cooking) return;
-  config.cooking = true;
-  config.since = Date.now();
+  if (isMyCooking()) return;
+  setMyCooking(true);
   completionNoticeCount = 0; // 新的一轮离开，重置完成通知计数
   health = newHealthState(Date.now()); // 新的一轮离开：巡检从 working 重新开始
   void writeConfig(config);
@@ -1480,14 +1750,19 @@ async function turnOn(ctx: CookingCtx, note: string, askMilestone = false): Prom
 }
 
 function turnOff(ctx: CookingCtx, source: "command" | "tool" = "command"): void {
+  if (mustRelayViaParent(agentIdentity)) {
+    // 子 Agent 不许关闭父会话的离开模式
+    ctx.ui.notify(`🤖 本会话是子 Agent「${agentIdentity.label}」，不能关闭离开模式。`, "warning");
+    return;
+  }
   clearRepeatTimers();
   stopAudioAll(); // 关闭离开：立即停止正在播放的音频
   stopRemoteStop(); // 关闭远程停止端点 + 作废 token
   stopHealthTimer(); // 关闭离开：健康巡检停表
   const pending = pendingAlerts();
-  config.cooking = false;
-  config.since = undefined;
-  config.alerts = [];
+  setMyCooking(false);
+  // 只清自己的呼喊：别的 Agent 可能还在离开中
+  config.alerts = config.alerts.filter((a) => a.agentKey !== myAgentKey() && a.agentKey !== undefined);
   config.callingMode = "normal"; // 偏好是会话级的，下次离开重新判断
   void writeConfig(config);
   ctx.ui.setStatus("i-am-cooking", "");
@@ -1524,11 +1799,12 @@ function showStatus(ctx: CookingCtx): void {
       : `webhook ${config.webhookUrl || "(未填)"} token=${maskToken(config.webhookToken)}`;
   const lines = [
     DEV_MODE ? `🧪 构建: DEV（非发布版）· /${COMMAND_NAME}` : `🍳 构建: 发布版 v(见下方路径)`,
-    `模式: ${config.cooking ? "🍳 离开中（I am cooking）" : "人类在岗"}`,
+    `模式: ${isMyCooking() ? "🍳 离开中（I am cooking）" : "人类在岗"}`,
+    `本会话标签: ${currentAgentTag()}${agentIdentity.kind === "subagent" ? "（子 Agent → 呼喊转达父 Agent）" : ""}`,
     ...(config.since ? [`开启时间: ${new Date(config.since).toLocaleTimeString("zh-CN")}`] : []),
     `待处理呼喊: ${pending.length}`,
     ...pending.map(
-      (a, i) => `  ${i + 1}. [${a.urgency}] ${a.message}（${new Date(a.time).toLocaleTimeString("zh-CN")}，已喊 ${a.repeatCount} 次）`,
+      (a, i) => `  ${i + 1}. [${a.urgency}] ${a.agent ? `[${a.agent}] ` : ""}${a.message}（${new Date(a.time).toLocaleTimeString("zh-CN")}，已喊 ${a.repeatCount} 次）`,
     ),
     `通道: 声音${config.sound ? "✓" : "✗"} TTS${config.tts ? "✓" : "✗"} Toast${config.toast ? "✓" : "✗"} 手机推送(${phoneState})`,
     `音量: ${config.boostVolume ? `离开自动拉高到 ${config.boostLevel}%` : "未启用"}`,
@@ -1540,7 +1816,7 @@ function showStatus(ctx: CookingCtx): void {
       idleMinutes: config.healthIdleMinutes,
       maxNudges: config.healthMaxNudges,
       muteEscalation: config.healthMuteEscalation,
-    })}${config.cooking ? `（子代理 ${countActiveSubagents(ctx)} 个在跑）` : ""}`,
+    })}${isMyCooking() ? `（子代理 ${countActiveSubagents(ctx)} 个在跑）` : ""}`,
     `防打扰: 正常每 ${config.repeatIntervalMinutes} 分钟重喊 / 紧急每 ${config.urgentRepeatMinutes} 分钟重喊 / 完成通知上限 ${config.maxCompletionNotices} 次（/i-am-cooking limits 可调）`,
     `声音: 哔哔${config.sound ? `${config.beeps}声` : "关"}${config.soundPath ? ` + 自定义歌曲(${config.soundPath})` : ""} / TTS${config.tts ? "开" : "关"} / 总时长${config.soundSeconds ?? 60}秒（/i-am-cooking sound 可调）`,
     `配置: ${CONFIG_PATH}（首次使用请运行 /i-am-cooking setup 配置手机推送）`,
@@ -1856,7 +2132,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerShortcut(Key.ctrlAlt("m"), {
     description: "i-am-cooking: 停止本次呼喊播放（仅本次，下次照常）",
     handler: async (ctx) => {
-      if (!config.cooking) {
+      if (!isMyCooking()) {
         ctx.ui.notify("当前不在离开模式，无播放可停止。", "info");
         return;
       }
@@ -1897,13 +2173,23 @@ export default function (pi: ExtensionAPI) {
       })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!config.cooking) {
+      if (!isMyCooking()) {
         return {
           content: [{ type: "text", text: "Cooking 模式未开启——用户就在电脑前，直接在对话里问即可，未发送呼喊。" }],
           details: { fired: false },
         };
       }
       const cat = params.category ?? "other";
+
+      // ── 子 Agent 一律不许直接呼喊用户 ────────────────────────────
+      // queueAlert 已统一拦（自动呼喊、巡检升级也走同一条路）；这里只需要解释清楚
+      // 发生了什么、别让它重复提交。
+      refreshAgentIdentity(ctx);
+      if (mustRelayViaParent(agentIdentity)) {
+        const relayed = await relayAndAck(params.message, params.urgency, cat, params.ttsText);
+        return relayed;
+      }
+
       const result = queueAlert(params.message, params.urgency, cat, ctx, params.ttsText);
       const statusLine = isProgressCategory(cat)
         ? "进度类只推手机（不响铃不弹窗）。"
@@ -1942,7 +2228,7 @@ export default function (pi: ExtensionAPI) {
       reason: Type.String({ description: "依据的用户原话或推理，例如：\"用户说：完成后喊我\"" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!config.cooking) {
+      if (!isMyCooking()) {
         return {
           content: [{ type: "text", text: "未在离开模式，偏好不生效。" }],
           details: { mode: params.mode, applied: false },
@@ -1981,7 +2267,7 @@ export default function (pi: ExtensionAPI) {
       reason: Type.Optional(Type.String({ description: "依据（调试用）" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!config.cooking) {
+      if (!isMyCooking()) {
         return {
           content: [{ type: "text", text: "未在离开模式，健康巡检不生效。" }],
           details: { applied: false, state: params.state },
@@ -2052,7 +2338,7 @@ export default function (pi: ExtensionAPI) {
       })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (config.cooking) {
+      if (isMyCooking()) {
         return {
           content: [{ type: "text", text: "已在离开模式中，无需重复开启。" }],
           details: { entered: false, alreadyCooking: true },
@@ -2205,7 +2491,7 @@ export default function (pi: ExtensionAPI) {
       reason: Type.String({ description: "依据的用户原话或推理，例如：\"用户说：我不离开了，保持在线\"" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!config.cooking) {
+      if (!isMyCooking()) {
         return {
           content: [{ type: "text", text: "当前不在离开模式，无需关闭。" }],
           details: { closed: false, alreadyOff: true },
@@ -2223,6 +2509,18 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     config = await readConfig();
     await ensureRulesFile(); // 首次启动用内置默认创建规则文件，已存在则不动
+    // 身份必须先刷新：后面要根据父子关系决定要不要改共享状态
+    const me = refreshAgentIdentity(ctx);
+    if (me.kind === "subagent") {
+      // ❗子 Agent 绝不能 resetCookingState：config.json 是所有会话共享的，
+      // 子进程一把火就把父会话的「离开中」状态、待处理呼喊、偏好全涤掉了。
+      ctx.ui.notify(
+        `🤖 本会话是子 Agent「${me.label}」：不直接呼喊用户，也不管理离开模式。` +
+        `需要用户时调用 shout_for_user，会自动转达给父 Agent。`,
+        "info",
+      );
+      return;
+    }
     // 离开状态不跨会话存活：任何会话启动都从"在岗"开始（需要时用户或 Agent 再 on）
     resetCookingState(ctx);
     if (DEV_MODE) {
@@ -2253,7 +2551,7 @@ export default function (pi: ExtensionAPI) {
   // 离开模式时，每回合注入自主推进规则（buildRulesPrompt 开头有 \n\n--- 强分隔符；
   // 这里额外保证 base prompt 末尾有 \n，双重保险避免粘连）
   pi.on("before_agent_start", async (event, _ctx) => {
-    if (!config.cooking) return;
+    if (!isMyCooking()) return;
     agentActive = true; // 回合开始：进度心跳恢复触发
     touchActivity(health, Date.now()); // 有新动静：巡检空闲窗口重置（不动催问计数）
     const base = event.systemPrompt.endsWith("\n") ? event.systemPrompt : event.systemPrompt + "\n";
@@ -2263,9 +2561,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   // 回合开始/结束：活动信号 + 记住结束原因与最后一句（健康巡检文案用）
-  pi.on("agent_start", () => { if (config.cooking) touchActivity(health, Date.now()); });
+  pi.on("agent_start", () => { if (isMyCooking()) touchActivity(health, Date.now()); });
   pi.on("agent_end", (event) => {
-    if (!config.cooking) return;
+    if (!isMyCooking()) return;
     touchActivity(health, Date.now());
     try {
       const last = [...(event.messages ?? [])].reverse().find((m) => m.role === "assistant") as
@@ -2282,14 +2580,14 @@ export default function (pi: ExtensionAPI) {
   // 工具在飞 = 真的在干活（长 bash / 同步 subagent() 都算）。
   // 记 toolCallId + 起始时间：脚本永不结束时 end 永不到来，靠计时才能识别超时（TODO-1）。
   pi.on("tool_execution_start", (event, ctx) => {
-    if (!config.cooking) return;
+    if (!isMyCooking()) return;
     startToolWatch(runningTools, event.toolCallId, event.toolName, Date.now());
     lastCtx = ctx; // 超时 abort 要用一个新鲜的 ctx
     touchActivity(health, Date.now());
     updateWidget(ctx);
   });
   pi.on("tool_execution_end", (event, ctx) => {
-    if (!config.cooking) return;
+    if (!isMyCooking()) return;
     endToolWatch(runningTools, event.toolCallId);
     abortedToolCalls.delete(event.toolCallId); // 已正常结束，不再占着「已中断」名额
     // 本插件自己的表态/呼喊工具不算「真实工作」：否则 agent 只需回一句呼喊
@@ -2300,13 +2598,13 @@ export default function (pi: ExtensionAPI) {
     updateWidget(ctx);
   });
 
-  pi.on("turn_start", () => { if (config.cooking) touchActivity(health, Date.now()); });
+  pi.on("turn_start", () => { if (isMyCooking()) touchActivity(health, Date.now()); });
 
   // ── pi-subagents 子代理活动信号（event-bus，进程内）────────────────────
   // 子代理在跑 = 父 agent 在干活 → 巡检不算它「停住」。事件驱动快且准，
   // /reload 后丢失的历史 run 由 countActiveSubagents 的 registry 探测兜底。
   const subStarted = (payload: unknown) => {
-    if (!config.cooking) return;
+    if (!isMyCooking()) return;
     const id = (payload as { id?: unknown })?.id;
     if (typeof id === "string" && id) activeSubagents.add(id);
     touchActivity(health, Date.now());
@@ -2314,9 +2612,11 @@ export default function (pi: ExtensionAPI) {
   const subComplete = (payload: unknown) => {
     const id = (payload as { id?: unknown })?.id;
     if (typeof id === "string" && id) activeSubagents.delete(id);
-    if (!config.cooking) return;
+    if (!isMyCooking()) return;
     // 子代理结束 = 有产出：真实工作信号（父 agent 会接着处理结果）
     markRealWork(health, Date.now());
+    // 子代理可能在里面交过呼喊请求：完成时立刻取一次，不要等到下一个巡检滴答
+    void pumpRelayQueue(lastCtx ?? ({} as CookingCtx));
   };
   bindSubagentEvents(subStarted, subComplete);
 
@@ -2324,9 +2624,11 @@ export default function (pi: ExtensionAPI) {
   // 回合收尾检测：定时汇报自动停表 + 自动呼喊安全网（agent 在等用户/报错）
   pi.on("agent_settled", async (_event, ctx) => {
     agentActive = false; // 回合结束：进度心跳暂停（新回合开始时恢复）
-    if (!config.cooking) return;
+    if (!isMyCooking()) return;
     lastCtx = ctx;
     touchActivity(health, Date.now()); // 回合结束也算有动静（刚说完话）
+    // 子 Agent 可能在本回合交过呼喊请求：收尾时立刻取一次
+    void pumpRelayQueue(ctx);
     try {
       const entries = ctx.sessionManager.getEntries();
       let lastAssistant: { text: string; stopReason?: string; errorMessage?: string; rawStopReason?: string } | undefined;
@@ -2418,7 +2720,7 @@ export default function (pi: ExtensionAPI) {
 
   // 你直接打字 = 回来了 → 自动退出离开模式并让 agent 汇报
   pi.on("input", async (event, ctx) => {
-    if (!config.cooking) return;
+    if (!isMyCooking()) return;
     if (event.source !== "interactive") return;
     if (event.text.trim().startsWith("/")) return; // 命令已由 command 处理
 

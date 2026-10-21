@@ -88,6 +88,10 @@ export interface Alert {
   category: string;
   repeatCount: number;
   acked: boolean;
+  /** 发起者标签（多 Agent 场景：看出是谁在喊你；旧数据可能没有） */
+  agent?: string;
+  /** 发起者的 Agent 键（会话 id 优先）；会话启动时只清自己的呼喊，不清别人的 */
+  agentKey?: string;
   ttsText?: string; // Agent 自由语音：非空则 TTS 原样念这段，不走模板
 }
 
@@ -112,6 +116,8 @@ export interface Config {
   ntfyTopic: string;
   ntfyServer: string;
   ntfyToken: string; // ntfy 私有 topic 访问 token，支持 ${ENV_VAR} 引用
+  agentAlias: string; // 本会话的呼喊标签（空 = 自动推断：会话名 → 主会话）
+  blockSubagentShout: boolean; // 子 Agent 不许直接呼喊（交给父 Agent 转达），默认开
   remoteStop: boolean; // 呼喊推送带「停止响铃」按钮（本地小端点，仅局域网可达；off/关会话即停服）
   webhookUrl: string; // generic webhook (Bark/Server酱...), receives JSON
   webhookToken: string; // webhook 认证 token，支持 ${ENV_VAR} 引用
@@ -141,6 +147,10 @@ export interface Config {
   healthMaxNudges: number;       // 同一段空闲最多催几次（默认 5），之后升级喊用户一次
   healthMuteEscalation: boolean; // true = 只催不喊（用户说过别喊时自动置位）
   healthMaxNudgesSilence: number; // 只催不喊时的催问上限（默认 30），到了就停止追问但不喊人
+
+  /** 离开中的 Agent（key = 会话 id 或标签）：多个 Agent 各自独立，互不覆写。
+   *  兼容旧配置：这个字段缺失时退回全局布尔 `cooking`（单 Agent 时代的行为）。 */
+  cookingAgents?: Record<string, { since: number; label: string }>;
 
   // TODO-1 长脚本超时拦截：单次工具执行超过阈值 → abort 整轮 + 注入纠偏提示
   toolTimeoutMinutes: number;    // 单次工具执行阈值（分钟，默认 10，0 = 关闭）
@@ -174,6 +184,8 @@ export const DEFAULTS: Config = {
   ntfyTopic: "",
   ntfyServer: "https://ntfy.sh",
   ntfyToken: "",
+  agentAlias: "",
+  blockSubagentShout: true,
   remoteStop: true,
   webhookUrl: "",
   webhookToken: "",
@@ -199,6 +211,7 @@ export const DEFAULTS: Config = {
   healthMaxNudges: 5,
   healthMuteEscalation: false,
   healthMaxNudgesSilence: 30,
+  // 注意：cookingAgents 故意不设默认值 —— 缺失时才能识别为「旧配置」并退回全局 cooking 布尔
   toolTimeoutMinutes: 10,
   toolTimeoutMaxAborts: 3,
   errorRetryMaxAttempts: 3,

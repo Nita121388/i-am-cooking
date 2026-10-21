@@ -165,6 +165,7 @@ npm run typecheck
 | `/i-am-cooking sound` | 自定义呼喊铃声（交互式中文菜单） | `sound` |
 | `/i-am-cooking volume` | 音量控制：查看/手动调整/离开自动拉高（交互式中文菜单） | `volume` |
 | `/i-am-cooking health` | 健康巡检：开关/频率/空闲判定/催问上限/立刻巡检一次（防 agent 中途意外停住） | `health` 或 `health on` / `health now` |
+| `/i-am-cooking agent [名字]` | 查看/设置本会话的呼喊标签。多 Agent 同时开着时，每条呼喊前面都会带它（`【会话名】`）；`reset` 清除自定义名回到自动推断 | `agent` / `agent 主会话` / `agent reset` |
 
 子命令支持 Tab 补全：输入 `/i-am-cooking ` 后按 Tab 弹出选项。
 
@@ -193,6 +194,27 @@ npm run typecheck
 | `ttsText` | ❌ | **自由语音**：TTS 原样念这段，不走默认模板 |
 
 > 这些工具在离开模式关闭时会安全降级（如 `shout_for_user` 会提示"用户就在电脑前"），不会误发呼喊。
+
+### 多个 Agent 同时开着（谁在喊？子 Agent 能不能直接喊？）
+
+**每条呼喊都带 Agent 标签**。五路通道（横幅 / TTS / 弹窗 / 手机推送 / `status`）都能看出是哪个会话在喊：
+
+```
+【会话名】 需要你登录后台确认一下
+【Zen 镜像 · 子Agent】 后台登录过期了，需要你重新登
+```
+
+标签来源优先：`config.agentAlias` > pi 会话显示名 > 子 Agent 的 agent 名 > 会话 id 短码。TTS 会先把名字念出来（厨房里靠耳朵分辨）。
+
+**子 Agent 不能直接喊你**。它可能是你根本没打开的会话（例如 Zen 镜像），它自己响铃，你听到了也回不去那个界面。现在：
+
+1. 子 Agent 调 `shout_for_user` → 不响铃，而是写一条转达请求（`~/.pi/i-am-cooking/tmp/relay/<父会话id>.jsonl`）。
+2. 父 Agent 在**回合收尾 / 健康巡检 / 子代理完成**时取走，作为一条 `[子Agent 转达]` 消息投给自己。
+3. **由父 Agent 判断值不值得此刻喊你**，值得才自己调 `shout_for_user`；能自己处理的就直接处理掉。
+
+子 Agent 拿到的回执会明确说"真正响铃的是父 Agent，不要重复提交"。子 Agent 也不能开关离开模式（那是父会话的事），不会重置共享配置。
+
+**离开状态按会话分开存**（`config.cookingAgents` / `Alert.agentKey`）：多开几个 Agent 时，任何一个启动会话都不会把别人的「离开中」状态和待处理呼喊洗掉。
 
 ### Agent 不能设置什么（安全边界）
 

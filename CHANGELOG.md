@@ -28,6 +28,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - 催问计数不会被 agent 自己的表态类工具（`set_task_state` / `shout_for_user`）洗掉——否则被催一次就清零，永远升不到上限（无限空转烧 token）。
 - 有未处理阻塞呼喊时，只有**真的空闲超阈值**才判 `waiting_user`；刚喊完还在干活不会被提前静默。
 
+### 多 Agent（本版重点）
+- **每条呼喊都带「谁在喊」标签**。同时开着很多个 Agent 时，五路呼喊（横幅 / TTS / 桌面弹窗 / 手机推送 / `status`）之前长得一模一样，看不出是哪个 Agent 发的。现在标签走 `lib/identity.ts`：优先 pi 会话显示名（pi-subagents 给子会话写的 `agent: 任务摘要`），其次 `PI_SUBAGENT_CHILD_AGENT`，再次会话 id 短码；文案形式 `【会话名】` / `【会话名 · 子Agent】`，TTS 会先把名字念出来（厨房里靠耳朵分辨）。可用 `config.agentAlias` 自定义。
+- **子 Agent 不再直接响铃**（`lib/relay.ts`）。子 Agent 是独立进程，可能跑在用户没打开的会话里（例如 Zen 镜像）——它自己响铃，用户听到了也无处回它。现在子 Agent 调 `shout_for_user`（以及报错 / 问号这类自动呼喊）会写一条转达请求到 `~/.pi/i-am-cooking/tmp/relay/<父会话id>.jsonl`，**由父 Agent 在主会话收尾 / 巡检 / 子代理完成时取走**，再以 `[子Agent 转达]` 消息投给父 Agent 自己，让父 Agent 判断值不值得此刻喊人。子 Agent 拿到的回执明确写着「真正响铃的是父 Agent，不要重复提交」。
+- **离开状态按会话分开存**（`config.cookingAgents`）。此前 `config.json` 是所有 pi 会话共享的一份，任何会话 `session_start` 都会把 `cooking` / `alerts` / 偏好整体清掉——另一个正在离开中的 Agent 就被静默「清理」了。现在每个 Agent 的离开状态、待处理呼喊（`Alert.agentKey`）互不影响；会话启动只清自己的。子 Agent **不参与**这套状态：既不开关离开模式，也不重置共享配置。
+- 横幅/状态栏显示本会话标签（`🍳 会话名 · ⚠N 待处理`），`/status` 的待处理列表逐条标出是哪个 Agent 发的。
+
+### 行为变化（需注意）
+- 定时进度汇报在**长工具调用期间不再插话**（统一了「忙」的判定口径，见下一条）。此前会压在投递队列里堆成重复催促。
+- 429 / 5xx / 上下文超限不再按 `urgent` 喊人：分别走退避重试与 `compact()`，退避到上限才升级。只有永久失败（脚本语法 / 路径 / 参数错）和未分类错误仍然直接喊。
+
 ## [0.9.1] - 2026-08-22
 
 ### Fixed

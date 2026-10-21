@@ -2,7 +2,7 @@
 title: i-am-cooking 是怎么运作的
 subtitle: 一个 pi 扩展：你去做饭，agent 继续干活；它真卡住了就大声喊你
 cols: 3
-source: extensions/i-am-cooking/index.ts (2126 行) + 12 个 lib 模块
+source: extensions/i-am-cooking/index.ts (2721 行) + 16 个 lib 模块
 ---
 核心机制只有三件事：**注入规则让 agent 别停下** → **卡住时多路广播喊你** → **定时探活防止它悄悄死掉**。
 
@@ -114,7 +114,7 @@ waiting_user -> (working): 用户开口
 | 多久一次 | 15 分钟 | 5 分钟 |
 | 干什么 | 催 agent 给你发手机消息 | 敲 agent：你还在吗 / 在等什么 |
 | 会喊你吗 | 不会，只推手机 | 催满上限才喊 |
-| 如何判“忙” | 只看这一轮是否结束 | 再看工具、子代理是否在跑 |
+| 如何判“忙” | 统一走 `activitySnapshot(ctx)` | 同一份快照（回合/工具/子代理/队列） |
 | 投递方式 | `steer`（下次 LLM 调用前） | `followUp`（等这一轮结束） |
 
 三处重叠：
@@ -147,14 +147,41 @@ agent 卡在跑很久的命令里时，它催不动。它真正管的是：这�
 | `touchActivity` 不清 `nudges` | 自己注入的巡检消息会触发回合，回合一动就把计数清零 | 只有真工具活动或用户输入才清零 |
 | 有未处理阻塞呼喊 → `waiting_user` | agent 喊完在等你，巡检却当它卡死，重复喊 | 先判空闲时长，再判 `blockingAlerts > 0` → 静默 |
 
+## M 多个 Agent 同时在跑
+
+同时开着好几个 Agent 时会遇到两个问题：**看不出是谁在喊你**，**子 Agent 喊到你也没法回它**。
+
+```flow
+(子 Agent 想喊你) -> 写转达文件: tmp/relay/<父会话id>.jsonl
+写转达文件 -> 父 Agent 取走: 收尾 / 巡检 / 子代理完成
+父 Agent 取走 -> {值不值得吵醒你?}
+{值不值得吵醒你?} -> 父 Agent 自己喊: 带【父会话】标签
+{值不值得吵醒你?} -> 自己处理掉: 不打扰你
+```
+
+三条规则：
+
+1. **每条呼喊都带 Agent 标签**。来源优先级：`config.agentAlias` > pi 会话显示名 > `PI_SUBAGENT_CHILD_AGENT` > 会话 id 短码。文字形式 `【会话名】`，子会话另外标 `· 子Agent`；TTS 会先把名字念出来，手机推送正文前缀也一致。
+2. **子 Agent 不许直接响铃**。它可能是你根本没打开的会话（例如 Zen 镜像），自己响你也回不去。现在它调 `shout_for_user` 只会写一条转达请求，父 Agent 决定要不要真喊。子 Agent 的回执明确写着「真正响铃的是父 Agent，不要重复提交」。
+3. **离开状态按会话分开**。`config.json` 是所有 pi 进程共享的一份，但 `cookingAgents` 按会话 id 记「谁在离开中」，`Alert.agentKey` 记呼喊归属——会话启动只清自己的，不会把另一个 Agent 的待处理呼喊和「离开中」状态洗掉。
+
+```callout warn 子 Agent 也加载了这个插件时会怎样
+pi-subagents 的会话声明 `PI_SUBAGENT_CHILD=1`，插件一看到就：不管理离开模式（不写共享配置）、不跑巡检与进度心跳、所有呼喊改走转达。这样父会话的状态不会被它干扰。
+```
+
 ## I 模块分层
 
 ```tree
 extensions/i-am-cooking
-  index.ts | 2126 行：事件钩子 + 命令 + 9 个工具 + 呼喊编排（唯一接线层）
+  index.ts | 2721 行：事件钩子 + 命令 + 9 个工具 + 呼喊编排（唯一接线层）
   rules.default.md | 出厂规则：自主推进 / 交接要求 / 完成通知 / 巡检义务
   lib
-    health.ts | 纯状态机：decideHealthTick / applyHealthDecision
+    health.ts | 纯状态机：decideHealthTick / applyHealthDecision / activitySnapshot 谓词
+    tool-watch.ts | 工具执行计时与超时判定（TODO-1）
+    errors.ts | 回合异常分类（429/5xx/上下文超限/永久失败）与退避序列
+    end-judge.ts | 收尾判定的判官提示词与结论解析（TODO-2）
+    identity.ts | 多 Agent 身份：谁在喊你 / 子 Agent 判定
+    relay.ts | 子 Agent → 父 Agent 的呼喊转达文件格式与文案
     prefs.ts | 从用户原话识别偏好与自主等级、识别任务收尾
     rules.ts | 规则加载 + 拼装注入的 system prompt（含不可删的底线规则）
     config.ts | 配置读写与默认值
@@ -166,7 +193,7 @@ extensions/i-am-cooking
     shout.ps1 / toast.ps1 / volume.ps1 | Windows 侧 PowerShell 实现
 ```
 
-`lib` 里全是纯函数或窄接口，所以 `tests/` 下 9 个测试文件覆盖了 health / prefs / config / push / tts / audio-lock / remote-stop / rules / topic。
+`lib` 里全是纯函数或窄接口，所以 `tests/` 下 13 个测试文件覆盖了 health / tool-watch / errors / end-judge / identity / relay / prefs / config / push / tts / audio-lock / remote-stop / rules / topic，另有两个「捉住定时器手动驱动」的接线级集成测试（真跑 abort / 退避 / 收尾 / 转达全链路）。
 
 ## J 两条容易忽略的取舍
 
@@ -192,9 +219,9 @@ extensions/i-am-cooking
 
 | 编号 | 缺口 | 现象 | 状态 |
 |---|---|---|---|
-| TODO-1 | 长脚本阻塞主会话 | agent 跑永不结束的脚本，巡检永远不催 | `no` 未修 |
-| TODO-2 | 收尾漏判 | 回合结束没同步 `setPhase(done)`，多催一次 | `no` 未修 |
-| TODO-3 | 两个定时器重叠 | “忙”的判定两套，守卫写两遍 | `warn` 待优化 |
+| TODO-1 | 长脚本阻塞主会话 | agent 跑永不结束的脚本，巡检永远不催 | `yes` 已修（v0.10.0） |
+| TODO-2 | 收尾漏判 | 回合结束没同步 `setPhase(done)`，多催一次 | `yes` 已修（v0.10.0） |
+| TODO-3 | 两个定时器重叠 | “忙”的判定两套，守卫写两遍 | `yes` 已修（v0.10.0） |
 
 ### TODO-1 长脚本阻塞主会话
 
@@ -250,7 +277,7 @@ G 面板说的盲区在 `runningTools` 这条上不成立——那里不是「�
 前提：先补 `reportTimer` 测试，跟 TODO-2 同一件事。
 ```
 
-注意：统一口径会改变行为。进度汇报在长工具调用时不再插话。这是期望的，但要在 CHANGELOG 里写明。
+注意：统一口径会改变行为。进度汇报在长工具调用时不再插话。这是期望的，已在 CHANGELOG 写明。
 
 ## L 异常状态认定表
 
@@ -272,16 +299,16 @@ G 面板说的盲区在 `runningTools` 这条上不成立——那里不是「�
 
 | 现象 | 现在怎么认定 | 实际会怎样 | 处理版本 | 批注 | 文件夹 | 日期 |
 |---|---|---|---|---|---|---|
-| 长脚本永不结束 | `runningTools > 0` → 读作“正在干活” | 巡检每次跳过，一次都不催；主会话彻底死锁 | 未定版（TODO-1） | 暂停，并提示agent 耗时操作需要交给子代理，不要阻塞主会话，并评估脚本是否永远不可能执行结束，是否有更好的执行方法 | extensions/i-am-cooking/index.ts | 2026-10-21 |
-| 单次工具超过阈值 | 不设阈值，无超时概念 | 脚本跑多久都等 | 未定版（TODO-1） | 暂停，并提示agent 耗时操作需要交给子代理，不要阻塞主会话，并评估脚本是否永远不可能执行结束，是否有更好的执行方法 | extensions/i-am-cooking/index.ts | 2026-10-21 |
+| 长脚本永不结束 | 按 `toolCallId` 计时，超阈值即 `abort()` | 巡检不再被“有工具在跑”骗过；超时会中断整轮并注入纠偏 | `v0.10.0`（TODO-1） | 暂停，并提示agent 耗时操作需要交给子代理，不要阻塞主会话，并评估脚本是否永远不可能执行结束，是否有更好的执行方法 | extensions/i-am-cooking/index.ts | 2026-10-21 |
+| 单次工具超过阈值 | `toolTimeoutMinutes`（默认 10） | 超阈值 → abort + 纠偏提示，同会话最多 3 次 | `v0.10.0`（TODO-1） | 暂停，并提示agent 耗时操作需要交给子代理，不要阻塞主会话，并评估脚本是否永远不可能执行结束，是否有更好的执行方法 | extensions/i-am-cooking/index.ts | 2026-10-21 |
 | 一直显示 `working` 但卡住了 | 看 `agentActive` / 工具 / 子代理是否在跑 | 三样都没有才判“空闲”，10 分钟后开始催 | `v0.9.1`（F 面板闸门④⑥） | 暂停，并让agent从暂停出继续 | extensions/i-am-cooking/lib/health.ts | 2026-10-21 |
-| 催 5 次还没动静 | 计数到上限升级 `stalled` | 喊你一次，然后静默 | `v0.9.1` | 如果用户说过不要喊，则继续催，催到上限30次 | extensions/i-am-cooking/lib/health.ts | 2026-10-21 |
+| 催 5 次还没动静 | 计数到上限升级 `stalled` | 喊你一次，然后静默；`别喊了` 时催到 30 次上限即停 | `v0.10.0` | 如果用户说过不要喊，则继续催，催到上限30次 | extensions/i-am-cooking/lib/health.ts | 2026-10-21 |
 | 回合以“？”结尾 | `agent_settled` 里正则匹配 | 判 `waiting_user`，不再追问 | `v0.9.1` | 让agent自主推进，如果需要做决策，按照标准规范的方案选择，并注意文件数据安全 | extensions/i-am-cooking/index.ts | 2026-10-21 |
 | 回合报错中断 | `stopReason === "error"` | 升级喊你（任何等级都喊） | `v0.9.1` | 让agent从暂停出继续 | extensions/i-am-cooking/index.ts | 2026-10-21 |
-| API 限流 429 | **不识别** | 归进“回合报错”，按 urgent 喊你 | 未定版 | 让agent从暂停出继续 | 待定 | 2026-10-21 |
-| 上下文超限 | 不专门识别，靠 `stopReason` | 同上，混在报错里 | 未定版 | 这个pi应该会自动压缩上下文 | 待定 | 2026-10-21 |
-| 收尾措辞不命中正则 | 回合结束只静默 `reportTimer` | 巡检仍判 `working`，多催一次 | 未定版（TODO-2） | 启动另一个agent会话 模型选择 opencode的 free模型 让其判断是否结束，如果结束了 需要标记，已经结束的就不用再进行扫描了；但是注意一个会话可能开始进行最后结束多次，所以要做好状态管理 | extensions/i-am-cooking/lib/prefs.ts | 2026-10-21 |
-| “忙”的判定两套口径 | `reportTimer` 与 `healthTick` 各判各的 | 同一时刻 A 催 B 不催 | 未定版（TODO-3） | 没看懂 | extensions/i-am-cooking/index.ts | 2026-10-21 |
+| API 限流 429 | `lib/errors.ts` 分类（状态码/文本） | 退避重试（1/2/4 分钟，上限 10 分钟），不按 urgent 喊；重试到上限才升级 | `v0.10.0` | 让agent从暂停出继续 | 待定 | 2026-10-21 |
+| 上下文超限 | 同上分类 + 上下文占用 ≥95% | 先 `ctx.compact()` 再退避；仍失败才喊 | `v0.10.0` | 这个pi应该会自动压缩上下文 | 待定 | 2026-10-21 |
+| 收尾措辞不命中正则 | 回合收尾判定 + 同回合幂等签名 | 判定为 done → 停表 + `setPhase(done)`；同一回合不重复扫描 | `v0.10.0`（TODO-2） | 启动另一个agent会话 模型选择 opencode的 free模型 让其判断是否结束，如果结束了 需要标记，已经结束的就不用再进行扫描了；但是注意一个会话可能开始进行最后结束多次，所以要做好状态管理 | extensions/i-am-cooking/lib/prefs.ts | 2026-10-21 |
+| “忙”的判定两套口径 | 统一走 `activitySnapshot(ctx)` | 两条线同一个快照、同一个结论 | `v0.10.0`（TODO-3） | 没看懂 | extensions/i-am-cooking/index.ts | 2026-10-21 |
 
 > **批注不在本页里编辑。** 本页的渲染器会在加载时重渲染面板，内嵌脚本会被清掉。
 > 批注编辑器是独立页面：**[docs/am-annotator.html](am-annotator.html)**（支持按文件夹和日期筛选，改完直接写回 `HOW-IT-WORKS.zh.md`）。
