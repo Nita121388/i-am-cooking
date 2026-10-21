@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - README 新增「本地开发与验证」章节（隔离做法、每次改动跑什么、规则文件只播种一次的坑）。
 - **构建身份：`I_AM_COOKING_DEV=1` 即开发版**。命令注册为 `/i-am-cooking-dev`（`/i-am-cooking` 保留为别名，每次调用都提醒这是 DEV）；状态栏与横幅带 `[DEV]`；`status` 首行显示 `🧪 构建: DEV（非发布版）` vs `🍳 构建: 发布版`；开发版**每次启动**都报一次版本 / 源码路径 / 状态目录，发布版仍是首次使用才提示。起因是实测发现 pi 对工具名做硬性冲突检查——同一会话里发布版与开发版不能共存，后加载的那份整个失效且只留一行启动错误，非常容易误判「我在用发布版」。
 - **`npm run dev` / `scripts/dev.sh` 一键起开发实例**：自动设 `I_AM_COOKING_DEV=1` + `I_AM_COOKING_HOME=~/.pi/iac-dev` + `pi -ne -e <本仓库入口>`，与日常那份彻底隔开，两个进程可同开对比。
+- **健康巡检 E2E 脚本 `scripts/e2e-health.mjs`（`npm run e2e:health`）**：RPC 模式起真实 pi 进程，用小阈值验证「滴答触发 → 注入 `[健康巡检 #N]` → 横幅 `🩺 已催 1/5`」，约 2 分钟、不需要 LLM 凭据。这条链路此前完全无法自动覆盖（单测只到纯逻辑，装载冒烟只到注册）。踩坑记录：rules 文本本身含「健康巡检」四个字，断言必须匹配 `[健康巡检 #N]` 前缀，否则 on 时注入的规则文会被误判成巡检消息、脚本提前退出。
 
 ### Fixed
 - 催问计数不会被 agent 自己的表态类工具（`set_task_state` / `shout_for_user`）洗掉——否则被催一次就清零，永远升不到上限（无限空转烧 token）。

@@ -67,7 +67,7 @@
 
 ## 8b. Health watch
 
-- [ ] `/i-am-cooking health` shows state; `health now` fires a manual check immediately
+- [x] `health now` fires a manual check immediately（改由 `scripts/e2e-health.mjs` 自动验证，见 §11）
 - [ ] Idle agent past threshold → `[健康巡检]` message delivered; banner shows `🩺 已催 1/5`
 - [ ] Agent calls `set_task_state(done)` → banner shows `🩺 已完成`; further checks stay silent
 - [ ] Typing anything → state returns to working; next idle check nudges again
@@ -102,6 +102,32 @@ I_AM_COOKING_HOME=/tmp/iac-dev \
 - [ ] 打 `/i-am-cooking`（别名）会提示「你用的是 DEV 构建」
 - [ ] 发布版实例（直接 `pi`）无任何 DEV 字样，命令仍是 `/i-am-cooking`
 - [ ] `npm test`（含 `tests/load.test.ts` 装载冒烟 + 构建身份切换）与 `npm run typecheck` 全绿
+
+---
+
+## 11. Health watch E2E（自动化，替代 §8b 的人工条目）
+
+`scripts/e2e-health.mjs` 用 RPC 模式起一个真实 pi 进程，验证「定时器滴答 → 注入
+`[健康巡检]` → 横幅显示 `🩺 已催 N/M`」这条只有真跑才能覆盖的链路。
+
+```bash
+node scripts/e2e-health.mjs      # 约 2 分钟，无需 LLM 凭据
+```
+
+- [x] DEV 构建身份标识出现（启动提示带版本 / 源码路径 / 状态目录）
+- [x] 巡检真的按间隔触发（`healthCheckMinutes=1` + `healthIdleMinutes=1` → 观察到「第 1 次追问状态」）
+- [x] `[健康巡检 #N]` 消息真的注入会话（注意：rules 文本里也含「健康巡检」，断言必须用 `#N` 前缀，否则误匹配）
+- [x] 横幅出现 `🍳 离开中 [DEV] · ⚠0 待处理 · 🩺 已催 1/5`
+- [x] 无扩展装载错误（尤其两份同时加载时的工具名冲突）
+
+仍需人工（TUI 才看得见，或需要模型配合）：
+
+- [ ] `set_task_state(done)` → 横幅 `🩺 已完成`，后续巡检静默
+- [ ] 用户开口 → 状态回 `working`，下次空闲再催
+- [ ] 催满 5 次 → 一次 `normal` 呼喊，然后静默
+- [ ] `silence` 偏好下一直催、不升级响铃
+- [ ] 有 async 子代理在跑 → 巡检跳过
+- [ ] 未处理阻塞呼喊 + 长空闲 → 判 `waiting_user`，不催
 
 ---
 

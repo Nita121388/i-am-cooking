@@ -14,7 +14,8 @@
   "scripts": {
     "test": "node --test \"tests/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "dev": "bash scripts/dev.sh"
+    "dev": "bash scripts/dev.sh",
+    "e2e:health": "node scripts/e2e-health.mjs"
   },
   "keywords": [
     "pi-package",
