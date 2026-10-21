@@ -36,11 +36,6 @@ export interface ActivitySnapshot {
   pendingMessages: boolean;
 }
 
-/** 忙 = 回合在跑 或 有工具/子代理在干活。队列不算「忙」，它只是「别插话」。 */
-export function isBusy(s: ActivitySnapshot): boolean {
-  return s.agentBusy || s.runningTools > 0 || s.activeSubagents > 0;
-}
-
 /**
  * 进度心跳这次该不该插话。
  * 与 healthTick 的区别只是方向：心跳要「回合在跑」才有进度可报，巡检要「没在跑」才催。

@@ -2,7 +2,7 @@
  * 配置模型：类型 + 出厂默认值 + 路径常量 + 读写（路径参数化，可测试）。
  * 全局 config 单例仍由入口 index.ts 持有（本模块只提供纯数据结构与文件操作）。
  */
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -223,28 +223,63 @@ export const DEFAULTS: Config = {
 };
 
 /**
- * 读取配置：磁盘文件缺失/损坏 → 返回出厂默认并落盘。
- * 语义与旧入口内实现一致（文件存在则深合并，缺失则写默认）。
+ * 读取配置：磁盘文件缺失 → 返回出厂默认并落盘。
+ *
+ * 解析失败（文件正在被写 / 被截断）**不落盘覆盖**：多 Agent 共享同一份 config.json，
+ * 一个会话读坏了就写回默认值，会把别的会话的离开状态和待处理呼喊全洗掉。
+ * 这里只给内存默认值、先记日志，等下一次成功读写自然恢复。
  */
 export async function readConfig(path: string = CONFIG_PATH): Promise<Config> {
+  let raw: string;
   try {
-    const raw = await readFile(path, "utf8");
-    const cfg = { ...DEFAULTS, ...JSON.parse(raw) as Partial<Config> };
-    cfg.alerts = cfg.alerts ?? [];
-    return cfg;
+    raw = await readFile(path, "utf8");
   } catch {
+    // 文件不存在 / 不可读 → 写一份出厂默认（首次使用场景）
     const fresh = { ...DEFAULTS };
     await writeConfig(fresh, path);
     return fresh;
   }
+  try {
+    const cfg = { ...DEFAULTS, ...JSON.parse(raw) as Partial<Config> };
+    cfg.alerts = cfg.alerts ?? [];
+    return cfg;
+  } catch (e) {
+    // 内容损坏（典型原因：另一个进程正在写）→ **不覆盖**，先给默认值
+    console.error("[i-am-cooking] config.json unreadable (not overwriting):", (e as Error).message);
+    return { ...DEFAULTS, alerts: [] };
+  }
 }
 
-/** 写配置（失败只记日志，不抛——配置保存是 best effort） */
-export async function writeConfig(cfg: Config, path: string = CONFIG_PATH): Promise<void> {
+/**
+ * 写配置。**原子写 + 同路径串行**：
+ *
+ * 1. 先写临时文件再 rename —— rename 在同一文件系统上是原子的，
+ *    读者要么看到旧内容、要么看到新内容，不会读到半截 JSON。
+ * 2. 同一路径的写入串行化 —— 多 Agent 会话 / 多个 fire-and-forget 写入
+ *    同时发生时，不会互相截断（实测不定式写会出现「Unexpected end of JSON input」，
+ *    然后 readConfig 把损坏文件当成缺失、写回默认值，把别人的状态洗掉）。
+ *
+ * 失败只记日志，不抛——配置保存是 best effort。
+ */
+const writeQueues = new Map<string, Promise<void>>();
+let writeSeq = 0;
+
+export function writeConfig(cfg: Config, path: string = CONFIG_PATH): Promise<void> {
+  const prev = writeQueues.get(path) ?? Promise.resolve();
+  const next = prev.then(() => writeConfigAtomic(cfg, path));
+  // 队列不因失败断链：吞掉错误后继续排下一项
+  writeQueues.set(path, next.catch(() => undefined));
+  return next;
+}
+
+async function writeConfigAtomic(cfg: Config, path: string): Promise<void> {
+  const tmp = `${path}.tmp-${process.pid}-${++writeSeq}`;
   try {
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, JSON.stringify(cfg, null, 2), "utf8");
+    await writeFile(tmp, JSON.stringify(cfg, null, 2), "utf8");
+    await rename(tmp, path);
   } catch (e) {
     console.error("[i-am-cooking] save config failed:", e);
+    try { await rm(tmp, { force: true }); } catch { /* ignore */ }
   }
 }

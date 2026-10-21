@@ -7,7 +7,7 @@
 // 与 wiring.test.ts 同套路：捉住 setInterval、假 Date.now，状态目录指到临时目录。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, rm, mkdir, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -110,17 +110,81 @@ async function fire(event: string, payload: any, ctx: any) {
   for (const h of handlers.get(event) ?? []) await h(payload, ctx);
 }
 
+function relayPathFor(sessionId: string): string {
+  return relayFilePath(join(TMP_DIR, "relay"), sessionId);
+}
+
+/** 转达文件是否已存在且非空（子 Agent 写完落盘） */
+let relaySeen = new Set<string>();
+function relayExists(sessionId: string): boolean {
+  if (relaySeen.has(sessionId)) return true;
+  return false;
+}
+/** 后台轮询：把出现过的转达文件记进 relaySeen（真文件 IO，只读不改） */
+async function watchRelay(sessionIds: string[], timeoutMs = 3000): Promise<void> {
+  const deadline = realNow() + timeoutMs;
+  for (;;) {
+    for (const id of sessionIds) {
+      try {
+        const raw = await readFile(relayPathFor(id), "utf8");
+        if (raw.trim()) relaySeen.add(id);
+      } catch { /* 还没写出来 */ }
+    }
+    if (sessionIds.every((id) => relaySeen.has(id))) return;
+    if (realNow() >= deadline) return;
+    await new Promise((r) => realSetTimeout(r, 5));
+  }
+}
+
+/** 模拟子 Agent 写一条转达请求 */
+async function appendRelay(sessionId: string, req: Record<string, unknown>): Promise<void> {
+  const dir = join(TMP_DIR, "relay");
+  await mkdir(dir, { recursive: true });
+  await appendFile(relayPathFor(sessionId), `${JSON.stringify(req)}\n`, "utf8");
+}
+
 /** 断言辅助：从呼喊列表里挑出必需的一条（找不到时给出可读失败信息） */
-function mustFind<T>(list: T[], pred: (x: T) => boolean, what: string): T {
-  const found = list.find(pred);
+function mustFind<T>(list: readonly T[], pred: (x: T) => boolean, what: string): T {
+  const found = (list as readonly T[]).find(pred);
   assert.ok(found, `找不到${what}`);
   return found as T;
 }
 
-function flush(): Promise<void> {
-  // queueAlert / pumpRelayQueue 都是 fire-and-forget，而且里面有 2-3 次真实文件 IO。
-  // 单个 setImmediate 不够（实测转达消息还没投递就断言了），给足 40ms 真实时间。
-  return new Promise((r) => realSetTimeout(r, 40));
+/**
+ * 等 fire-and-forget 的副作用落地。**必须带 predicate**（例如「磁盘上出现这条呼喊」）：
+ * 无条件的固定 sleep 会把 11 个用例拖到 48 秒，而轮询目标通常 <5ms。
+ * 带 predicate 时默认轮询 3 秒，够 config 落盘（writeConfig 是 fs 异步）。
+ */
+async function flush(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = realNow() + timeoutMs;
+  for (;;) {
+    if (predicate()) return;
+    if (realNow() >= deadline) return;
+    await new Promise((r) => realSetTimeout(r, 5));
+  }
+}
+
+/** 等到磁盘上出现一条匹配的呼喊（用于断言「已经入队」的场景） */
+function waitForAlert(pred: (a: any) => boolean): Promise<boolean> {
+  return flushDisk((c) => ((c.alerts ?? []) as any[]).some(pred));
+}
+/** 轮询磁盘 config 直到满足条件（用于验证持久化，而不是内存状态） */
+async function flushDisk(pred: (c: any) => boolean, timeoutMs = 3000): Promise<boolean> {
+  const deadline = realNow() + timeoutMs;
+  for (;;) {
+    try {
+      const c = await readConfig();
+      if (pred(c)) return true;
+    } catch { /* 文件正在写 */ }
+    if (realNow() >= deadline) return false;
+    await new Promise((r) => realSetTimeout(r, 5));
+  }
+}
+
+/** 同步一次磁盘 config 到内存快照 */
+let configSnapshot: any = { alerts: [] as any[] };
+async function refreshConfigSnapshot(): Promise<void> {
+  configSnapshot = await readConfig();
 }
 
 /** 以「父会话」或「子 Agent」身份装载一次扩展（身份靠 env + 会话名决定）。
@@ -152,7 +216,15 @@ async function bootAs(opts: {
 
   const ctx = makeCtx();
   if (!opts.preserveConfig) {
-    await writeConfig({ ...DEFAULTS, ...(opts.config ?? {}) } as any);
+    // 关掉所有真实通道：sound/tts 会 spawn 播放子进程，进程退出要等它们结束（实测多挂 30 秒）
+    await writeConfig({
+      ...DEFAULTS,
+      sound: false,
+      tts: false,
+      toast: false,
+      phonePush: false,
+      ...(opts.config ?? {}),
+    } as any);
   }
   await fire("session_start", { type: "session_start" }, ctx);
   notifies.length = 0;
@@ -165,7 +237,9 @@ async function onCooking(ctx: any) {
   const cmd = commands.get("i-am-cooking");
   assert.ok(cmd, "找不到 /i-am-cooking 命令");
   await cmd.handler("on", ctx);
-  await flush();
+  // 等磁盘落定：writeConfig 是 fire-and-forget，多个写入会乱序；不等就会读到旧值
+  const onOk = await flushDisk((c) => c.cooking === true);
+  assert.ok(onOk, "离开模式应落盘（cooking=true）");
   notifies.length = 0;
   sent.length = 0;
 }
@@ -182,9 +256,10 @@ test("父会话呼喊：message 前缀是本会话的标签", async () => {
   const ctx = await bootAs({ sessionName: "主会话A", sessionId: "session-a" });
   await onCooking(ctx);
   const res = await tools.get("shout_for_user").execute("c1", { message: "方案 A/B 你选哪个", urgency: "normal", category: "decision" }, undefined, undefined, ctx);
-  await flush();
-  const cfg = await readConfig();
-  const alert = cfg.alerts.find((a) => a.category === "decision");
+  await refreshConfigSnapshot();
+  await waitForAlert((a: any) => a.category === "decision");
+  await refreshConfigSnapshot();
+  const alert = (configSnapshot.alerts as any[]).find((a) => a.category === "decision");
   assert.ok(alert, "应该有呼喊入队，实际：" + res.content[0].text);
   assert.match(alert.message, /^【主会话A】 方案 A\/B 你选哪个$/);
   assert.equal(alert.agent, "主会话A", "alert 要记下是谁发的");
@@ -194,7 +269,8 @@ test("两个不同会话喊同样内容：不会因为去重合并成一条（�
   const ctxA = await bootAs({ sessionName: "会话A", sessionId: "session-a" });
   await onCooking(ctxA);
   await tools.get("shout_for_user").execute("c1", { message: "需要你确认", urgency: "normal", category: "decision" }, undefined, undefined, ctxA);
-  await flush();
+  await refreshConfigSnapshot();
+  await waitForAlert((a: any) => a.agent === "会话A");
 
   // A 喊完，磁盘上应有它的呼喊 + 独立离开状态
   const afterA = await readConfig();
@@ -210,10 +286,12 @@ test("两个不同会话喊同样内容：不会因为去重合并成一条（�
   });
   await onCooking(ctxB); // 每个 Agent 独立 on（cookingAgents 按会话分）
   await tools.get("shout_for_user").execute("c2", { message: "需要你确认", urgency: "normal", category: "decision" }, undefined, undefined, ctxB);
-  await flush();
+  await refreshConfigSnapshot();
+  await waitForAlert((a: any) => a.agent === "会话B");
+  await refreshConfigSnapshot();
 
-  const cfg = await readConfig();
-  const mine = cfg.alerts.filter((a) => a.category === "decision" && !a.acked);
+  const cfg = configSnapshot;
+  const mine = (cfg.alerts as any[]).filter((a) => a.category === "decision" && !a.acked);
   assert.equal(mine.length, 2, "两条呼喊都要在，且各自带自己的标签");
   assert.deepEqual(mine.map((a) => a.agent).sort(), ["会话A", "会话B"].sort());
 });
@@ -227,9 +305,10 @@ test("TTS 也带 Agent 名（厨房里靠耳朵分辨是哪个 Agent）", async 
     category: "approval",
     ttsText: "需要你点一下授权",
   }, undefined, undefined, ctx);
-  await flush();
-  const cfg = await readConfig();
-  const alert = mustFind(cfg.alerts, (a) => a.category === "approval", "approval 呼喊");
+  await refreshConfigSnapshot();
+  await waitForAlert((a: any) => a.category === "approval");
+  await refreshConfigSnapshot();
+  const alert = mustFind<any>(configSnapshot.alerts as any[], (a: any) => a.category === "approval", "approval 呼喊");
   assert.equal(alert.ttsText, "调研助手，需要你点一下授权");
 });
 
@@ -249,7 +328,7 @@ test("子 Agent 调 shout_for_user：不入队、不响铃，而是写转达文�
     urgency: "normal",
     category: "credential",
   }, undefined, undefined, ctx);
-  await flush();
+  await watchRelay(["session-root-9"]);
 
   // ① 没有在本地入队（子 Agent 不响铃）
   const cfg = await readConfig();
@@ -290,7 +369,7 @@ test("子 Agent 自动触发类呼喊（报错/问号）也走转达，绝不自
     },
   });
   await fire("agent_settled", { type: "agent_settled" }, ctx2);
-  await flush();
+  await watchRelay(["session-root-8"]);
 
   const cfg = await readConfig();
   assert.equal(cfg.alerts.length, 0, "子 Agent 的报错呼喊不该在本地入队");
@@ -307,7 +386,7 @@ test("子 Agent 不能开启/关闭离开模式（否则会把父会话的共享
   const cmd = commands.get("i-am-cooking");
   assert.ok(cmd);
   await cmd.handler("on", ctx);
-  await flush();
+  await flush(() => notifies.some((n) => /不能开关离开模式/.test(n.message)));
   assert.ok(notifies.some((n) => /子 Agent/.test(n.message) && /不能开关离开模式/.test(n.message)));
   const cfg = await readConfig();
   assert.equal(cfg.cooking, false, "子 Agent 打开离开模式必须被拒绝");
@@ -327,7 +406,7 @@ test("子 Agent 启动不重置共享状态（不能把父会话的待处理呼�
     sessionId: "session-child-6",
     preserveConfig: true, // 不能覆盖掉刚造的共享状态
   });
-  await flush();
+  await flushDisk((c) => c.cooking === true);
 
   const cfg = await readConfig();
   assert.equal(cfg.cooking, true, "子 Agent 启动不该关闭父会话的离开模式");
@@ -340,17 +419,10 @@ test("父 Agent 收尾时会取走转达请求，并作为「由你决定是否�
   const ctx = await bootAs({ sessionName: "主会话", sessionId: "session-root-5" });
   await onCooking(ctx); // 必须真的在离开模式，pump 才会跑
   // 模拟子 Agent 写了请求
-  const dir = join(TMP_DIR, "relay");
-  await mkdir(dir, { recursive: true });
-  const { appendFile } = await import("node:fs/promises");
-  await appendFile(
-    relayFilePath(dir, "session-root-5"),
-    JSON.stringify({ id: "z1", ts: Date.now(), from: "Zen 镜像", fromAgent: "zen-mirror", message: "后台登录过期了，需要你重新登", urgency: "normal", category: "credential" }) + "\n",
-    "utf8",
-  );
+  await appendRelay("session-root-5", { id: "z1", ts: Date.now(), from: "Zen 镜像", fromAgent: "zen-mirror", message: "后台登录过期了，需要你重新登", urgency: "normal", category: "credential" });
 
   await fire("agent_settled", { type: "agent_settled" }, ctx);
-  await flush();
+  await flush(() => sent.some((m) => m.content.includes("子Agent 转达")));
 
   const relayMsg = sent.find((s) => s.content.includes("子Agent 转达"));
   assert.ok(relayMsg, "应把转达请求投给父 Agent，实际发了：" + sent.map((s) => s.content.slice(0, 40)).join(" | "));
@@ -361,27 +433,21 @@ test("父 Agent 收尾时会取走转达请求，并作为「由你决定是否�
   assert.ok(notifies.some((n) => n.message.includes("收到 1 条子 Agent 呼喊转达")));
 
   // 取走后文件被清空 —— 同一请求不会转达两遍
-  const again = await readFile(relayFilePath(dir, "session-root-5"), "utf8");
+  const again = await readFile(relayFilePath(join(TMP_DIR, "relay"), "session-root-5"), "utf8");
   assert.equal(again.trim(), "", "取走后应清空，防止重复转达");
 });
 
 test("父 Agent 不会取走别人的转达（按会话 id 分文件）", async () => {
   const ctx = await bootAs({ sessionName: "主会话", sessionId: "session-root-4" });
   await onCooking(ctx);
-  const dir = join(TMP_DIR, "relay");
-  await mkdir(dir, { recursive: true });
-  const { appendFile } = await import("node:fs/promises");
-  await appendFile(
-    relayFilePath(dir, "some-other-session"),
-    JSON.stringify({ id: "x1", ts: 1, from: "别的会话的子Agent", message: "这条不该被拿走", urgency: "normal", category: "other" }) + "\n",
-    "utf8",
-  );
+  await appendRelay("some-other-session", { id: "x1", ts: 1, from: "别的会话的子Agent", message: "这条不该被拿走", urgency: "normal", category: "other" });
 
   await fire("agent_settled", { type: "agent_settled" }, ctx);
-  await flush();
+  // 负向用例：给 pump 一个 300ms 的窗口，确认它确实什么都没投
+  await flush(() => sent.some((m) => m.content.includes("子Agent 转达")), 300);
 
   assert.ok(!sent.some((s) => s.content.includes("这条不该被拿走")), "别人的转达不能被这个父会话取走");
-  const still = await readFile(relayFilePath(dir, "some-other-session"), "utf8");
+  const still = await readFile(relayFilePath(join(TMP_DIR, "relay"), "some-other-session"), "utf8");
   assert.match(still, /这条不该被拿走/, "别人的请求文件必须原样保留");
 });
 
@@ -397,18 +463,19 @@ test("/i-am-cooking agent <名字>：设置标签后呼喊前缀跟着变", asyn
 
   // 设自定义名
   await cmd.handler("agent 审核助手", ctx);
-  await flush();
+  await flushDisk((c) => c.agentAlias === "审核助手");
   await tools.get("shout_for_user").execute("c1", { message: "请批准", urgency: "normal", category: "approval" }, undefined, undefined, ctx);
-  await flush();
-  const cfg = await readConfig();
+  await refreshConfigSnapshot();
+  await waitForAlert((a: any) => a.category === "approval");
+  await refreshConfigSnapshot();
+  const cfg = configSnapshot;
   assert.equal(cfg.agentAlias, "审核助手");
-  const alert = mustFind(cfg.alerts, (a) => a.category === "approval", "approval 呼喊");
+  const alert = mustFind<any>(configSnapshot.alerts, (a: any) => a.category === "approval", "approval 呼喊");
   assert.match(alert.message, /^【审核助手】 请批准$/);
 
   // reset = 回到自动推断（会话名）
   await cmd.handler("agent reset", ctx);
-  await flush();
-  assert.equal((await readConfig()).agentAlias, "");
+  await flushDisk((c) => c.agentAlias === "");
 });
 
 test("cleanup", async () => {

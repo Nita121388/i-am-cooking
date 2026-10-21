@@ -51,7 +51,7 @@ import { randomUUID } from "node:crypto";
 // 纯逻辑模块（可测试）
 import { suggestTopic } from "./lib/topic.ts";
 import { renderTts as renderTtsImpl } from "./lib/tts.ts";
-import { buildStallAlert, buildHealthPrompt, decideHealthTick, applyHealthDecision, formatHealthLine, formatIdle, markRealWork, markUserInput, newHealthState, setPhase, touchActivity, isBusy, shouldSkipReportTick } from "./lib/health.ts";
+import { buildStallAlert, buildHealthPrompt, decideHealthTick, applyHealthDecision, formatHealthLine, formatIdle, markRealWork, markUserInput, newHealthState, setPhase, touchActivity, shouldSkipReportTick } from "./lib/health.ts";
 import type { ActivitySnapshot, HealthPhase, HealthState } from "./lib/health.ts";
 import { newToolWatch, startToolWatch, endToolWatch, runningToolCount, clearToolWatch, overdueTools, buildToolTimeoutSteer, formatRunningTools } from "./lib/tool-watch.ts";
 import type { ToolWatch } from "./lib/tool-watch.ts";
@@ -186,6 +186,16 @@ function refreshAgentIdentity(ctx?: CookingCtx): AgentIdentity {
   });
   agentIdentity = resolved;
   return resolved;
+}
+
+/**
+ * 子 Agent 是否必须经父 Agent 转达。
+ * `blockSubagentShout: false` 是应急逃生阀：用户明确要子 Agent 自己响铃时才关
+ * （代价是它可能响在一个用户根本没打开的会话里）。
+ */
+function shouldRelayViaParent(): boolean {
+  if (config.blockSubagentShout === false) return false;
+  return mustRelayViaParent(agentIdentity);
 }
 
 /** 当前呼喊标签（横幅 / TTS / 手机 / status 用） */
@@ -1561,7 +1571,7 @@ function queueAlert(message: string, urgency: Urgency, category: string, ctx: Co
   if (!isMyCooking()) return "not-cooking";
   // 子 Agent 进程绝不允许自己响铃/弹窗/推送：用户可能根本没开它那个会话。
   // 所有自行触发的呼喊（自动问号、报错、巡检升级）也一样透传。
-  if (mustRelayViaParent(agentIdentity)) {
+  if (shouldRelayViaParent()) {
     void writeRelayRequest({
       id: randomUUID(),
       ts: Date.now(),
@@ -2185,7 +2195,7 @@ export default function (pi: ExtensionAPI) {
       // queueAlert 已统一拦（自动呼喊、巡检升级也走同一条路）；这里只需要解释清楚
       // 发生了什么、别让它重复提交。
       refreshAgentIdentity(ctx);
-      if (mustRelayViaParent(agentIdentity)) {
+      if (shouldRelayViaParent()) {
         const relayed = await relayAndAck(params.message, params.urgency, cat, params.ttsText);
         return relayed;
       }

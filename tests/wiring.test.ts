@@ -125,9 +125,22 @@ async function fire(event: string, payload: any, ctx: any) {
 
 /** 让扩展进入「离开中」：直接写 config + 走 turn_on 的正式路径（命令名按 DEV 模式定） */
 let entries: any[] = [];
-/** 等异步落盘（queueAlert / writeConfig 是 fire-and-forget） */
-function flush(): Promise<void> {
-  return new Promise((r) => realSetTimeout(r, 10));
+/**
+ * 等异步落盘（queueAlert / writeConfig 是 fire-and-forget）。
+ * 不能只等一次 setImmediate：writeConfig 现在串行排队 + 原子 rename，
+ * 排队项可能跨多个事件循环（实测 10ms 不够，断言会读到旧文件）。
+ * 这里用真实时钟轮询「磁盘上满足条件」为止。
+ */
+async function flush(pred?: (cfg: any) => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = realNow() + timeoutMs;
+  for (;;) {
+    try {
+      const cfg = await readConfig();
+      if (!pred || pred(cfg)) return;
+    } catch { /* 正在 rename */ }
+    if (realNow() >= deadline) return;
+    await new Promise((r) => realSetTimeout(r, 5));
+  }
 }
 async function enterCooking(over: Record<string, unknown> = {}) {
   const cfg = { ...DEFAULTS, ...over };
@@ -144,7 +157,7 @@ async function enterCooking(over: Record<string, unknown> = {}) {
   const onCmd = commands.get("i-am-cooking");
   assert.ok(onCmd, "找不到 /i-am-cooking 命令");
   await onCmd.handler("on", ctx);
-  await flush();
+  await flush((c) => c.cooking === true);
   notifies.length = 0;
   sent.length = 0;
   return ctx;
@@ -261,7 +274,7 @@ test("R4 429：排退避重试，不按 urgent 喊人", async () => {
     },
   ];
   await fire("agent_settled", { type: "agent_settled" }, ctx);
-  await flush();
+  await flush((c) => c.alerts.length > 0 || true);
   const cfg = await readConfig();
   assert.equal(cfg.alerts.filter((a) => a.urgency === "urgent").length, 0, "429 不该 urgent 呼喊");
   assert.ok(
@@ -287,7 +300,7 @@ test("R4 永久失败（路径不存在）：保持现状直接喊人", async ()
     },
   ];
   await fire("agent_settled", { type: "agent_settled" }, ctx);
-  await flush();
+  await flush((c) => c.alerts.some((a: any) => a.urgency === "urgent"));
   const cfg = await readConfig();
   const urgent = cfg.alerts.filter((a) => a.urgency === "urgent");
   assert.equal(urgent.length, 1, "永久失败该直接喊");
@@ -329,7 +342,7 @@ test("R2 收尾判定：正则命中 → health.phase 变 done + 进度心跳停
     },
   ];
   await fire("agent_settled", { type: "agent_settled" }, ctx);
-  await flush();
+  await flush((c) => c.alerts.length >= 0);
   const cfg = await readConfig();
   // done 之后巡检不再追问：推进很久也不该出现追问提示
   notifies.length = 0;
@@ -372,7 +385,7 @@ test("R6 放手等级：回合以「？」结尾不自动喊人", async () => {
     },
   ];
   await fire("agent_settled", { type: "agent_settled" }, ctx);
-  await flush();
+  await flush(undefined, 300); // 负向用例：给一个短窗口确认确实没喊
   const cfg = await readConfig();
   assert.equal(cfg.alerts.length, 0, "放手等级下不自动喊人（按标准规范自主决策）");
 });

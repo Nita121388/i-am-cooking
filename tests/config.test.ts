@@ -1,7 +1,7 @@
 // 配置模型测试：默认值 / 读取深合并 / 缺失兜底 / 写后读回
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { DEFAULTS, isDevMode, readConfig, resolveStateDir, writeConfig } from "../extensions/i-am-cooking/lib/config.ts";
@@ -48,6 +48,40 @@ test("alerts 缺失时兜底为空数组", async () => {
   await writeConfig({ ...DEFAULTS, alerts: undefined as never } as Config, p);
   const cfg = await readConfig(p);
   assert.deepEqual(cfg.alerts, []);
+});
+
+test("损坏的 config.json **不会被默认值覆盖**（多 Agent 共享时不能被洗掉）", async () => {
+  const p = await freshConfigPath();
+  // 模拟「另一个进程写到一半」的半截 JSON
+  await writeFile(p, '{"cooking": true, "alerts": [', "utf8");
+  const cfg = await readConfig(p);
+  assert.equal(cfg.cooking, false, "解析失败时给内存默认值");
+  // 关键：文件内容必须原样保留，不能被写回默认值 —— 否则别的会话的状态就没了
+  const raw = await readFile(p, "utf8");
+  assert.equal(raw, '{"cooking": true, "alerts": [', "损坏文件不该被静默覆盖");
+});
+
+test("并发写同一份 config：不会互相截断，最后一次一定完整可读", async () => {
+  const p = await freshConfigPath();
+  // 20 个 fire-and-forget 写入同时排队（真实场景：多个 Agent 会话同时写）
+  const writes = Array.from({ length: 20 }, (_, i) =>
+    writeConfig({ ...DEFAULTS, beeps: i + 1, shoutPhrase: `第${i + 1}次` }, p),
+  );
+  await Promise.all(writes);
+  const cfg = await readConfig(p);
+  assert.equal(cfg.shoutPhrase, "第20次", "最后排队的写入应生效");
+  assert.equal(cfg.beeps, 20);
+  // 文件必须是完整 JSON（没有残留的半截文件）
+  const raw = await readFile(p, "utf8");
+  assert.doesNotThrow(() => JSON.parse(raw));
+});
+
+test("原子写：不会在目标路径留下 .tmp 残片", async () => {
+  const p = await freshConfigPath();
+  await writeConfig({ ...DEFAULTS, beeps: 7 }, p);
+  const { readdir } = await import("node:fs/promises");
+  const files = await readdir(join(p, ".."));
+  assert.ok(!files.some((f) => f.includes(".tmp-")), "临时文件应被 rename 掉，实际：" + files.join(","));
 });
 
 // ── 状态目录隔离：dev / release / 多实例各用一份 ──

@@ -7,7 +7,6 @@ import {
   buildStallAlert,
   decideHealthTick,
   formatIdle,
-  isBusy,
   markRealWork,
   markUserInput,
   newHealthState,
@@ -201,18 +200,6 @@ test("静默模式 exhausted 后用户开口 → 回 working、重新计数、�
 });
 
 // ── R3：统一的「忙」判定（reportTimer 与 healthTick 共用一份数）────────
-
-test("isBusy：回合/工具/子代理任一在跑就算忙，队列不算忙", () => {
-  assert.equal(isBusy({ agentBusy: false, runningTools: 0, activeSubagents: 0, pendingMessages: false }), false);
-  assert.equal(isBusy({ agentBusy: true, runningTools: 0, activeSubagents: 0, pendingMessages: false }), true);
-  assert.equal(isBusy({ agentBusy: false, runningTools: 1, activeSubagents: 0, pendingMessages: false }), true);
-  assert.equal(isBusy({ agentBusy: false, runningTools: 0, activeSubagents: 2, pendingMessages: false }), true);
-  assert.equal(
-    isBusy({ agentBusy: false, runningTools: 0, activeSubagents: 0, pendingMessages: true }),
-    false,
-    "队列里压着话不叫忙，它只是别插话",
-  );
-});
 
 test("shouldSkipReportTick：休息/长工具/队列有货都跳过，只有工作回合的空隙才发", () => {
   const base = { agentBusy: true, runningTools: 0, activeSubagents: 0, pendingMessages: false };
